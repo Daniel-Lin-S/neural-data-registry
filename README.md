@@ -31,35 +31,16 @@ export NDR_DATA_ROOT=/data/neural_data
 export NDR_DATABASE_URL=sqlite:////data/neural_data/registry/registry.db
 ```
 
-These values can also be placed in a `.env` file in the working directory. For a
-long-running service, configure them in the service manager or deployment
-environment. If `NDR_DATABASE_URL` is omitted, the application uses
-`$NDR_DATA_ROOT/registry/registry.db`.
+These values can also be placed in a `.env` file in the working directory. For a long-running service, configure them in the service manager or deployment environment. If `NDR_DATABASE_URL` is omitted, the application uses `$NDR_DATA_ROOT/registry/registry.db`.
 
 ## Installation
 
 ```bash
+pip install -e .
+
+# install with development tools (debugging etc.)
 pip install -e '.[dev]'
 ```
-
-
-## Run the API and CLI
-
-Configure the managed data root, then start the installed API:
-
-```bash
-export NDR_DATA_ROOT=/data/neural_data
-export NDR_DATABASE_URL=sqlite:////data/neural_data/registry/registry.db
-
-uvicorn neural_data_registry.main:app --host 127.0.0.1 --port 8000
-```
-
-The REST API is then available at `http://127.0.0.1:8000/docs`. In a separate
-terminal using the same environment variables, use the installed CLI.
-
-`POST /ingest/local` exposes the same local-ingestion function for controlled
-API clients. API calls return `409 Conflict` for a duplicate name or URL, with
-the existing dataset ID and managed storage path in the error message.
 
 ## CLI commands
 

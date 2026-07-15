@@ -108,7 +108,7 @@ def test_all_core_api_routes(config, tmp_path):
     client = TestClient(create_app(config))
     assert client.get("/health").json() == {"status": "ok"}
     source = mock_dataset(tmp_path, "api-source")
-    created = client.post("/ingest/local", json={"source": str(source), "name": "THINGS-MEG", "provider": "openneuro", "url": "https://openneuro.org/datasets/ds004212", "version": "3.0.0", "modalities": ["MEG"]})
+    created = client.post("/ingest/local", json={"source": str(source), "name": "THINGS-MEG", "provider": "openneuro", "url": "https://openneuro.org/datasets/ds004212", "version": "3.0.0", "modalities": ["meg"]})
     assert created.status_code == 201
     item = created.json()
     assert client.get("/datasets", params={"query": "THINGS"}).json() == [item]
@@ -130,4 +130,4 @@ def test_cli_query_and_list(config, tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "session", lambda: session(config))
     runner = CliRunner()
     assert runner.invoke(cli.app, ["query", "THINGS-MEG"]).exit_code == 0
-    assert "THINGS-MEG" in runner.invoke(cli.app, ["list", "--modality", "MEG"]).output
+    assert "THINGS-MEG" in runner.invoke(cli.app, ["list", "--modality", "meg"]).output

@@ -51,7 +51,8 @@ class Modality(str, Enum):
 
     Notes
     -----
-    ``ephys`` means electrophysiology; ``fnris`` means functional
+    ``ephys`` means electrophysiology;
+    ``fnris`` means functional
     near-infrared spectroscopy.
     """
     EEG = "eeg"

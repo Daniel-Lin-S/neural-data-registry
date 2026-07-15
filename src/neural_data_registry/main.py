@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 
 from neural_data_registry.config import Settings
 from neural_data_registry.db.models import Dataset
-from neural_data_registry.enums import Provider, StorageMode
+from neural_data_registry.enums import Modality, Provider, StorageMode
 from neural_data_registry.service import dataset_dict, download, find_datasets, ingest_local, session
 
 
@@ -17,7 +17,7 @@ class LocalIngestionRequest(BaseModel):
     provider: Provider = Provider.LOCAL
     url: str | None = None
     version: str | None = None
-    modalities: list[str] = Field(default_factory=list)
+    modalities: list[Modality] = Field(default_factory=list)
     storage_mode: StorageMode = StorageMode.REFERENCE
 
 

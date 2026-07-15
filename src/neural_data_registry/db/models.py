@@ -24,7 +24,11 @@ class Dataset(Base):
     size_bytes: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[DatasetStatus] = mapped_column(SqlEnum(DatasetStatus, native_enum=False), default=DatasetStatus.INGESTING)
     storage_path: Mapped[str | None] = mapped_column(Text, nullable=True)
-    storage_mode: Mapped[StorageMode] = mapped_column(SqlEnum(StorageMode, native_enum=False), default=StorageMode.REFERENCE)
+    storage_mode: Mapped[StorageMode] = mapped_column(
+        SqlEnum(StorageMode, native_enum=False),
+        default=StorageMode.REFERENCE,
+        server_default=StorageMode.REFERENCE.name,
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     aliases: Mapped[list["DatasetAlias"]] = relationship(back_populates="dataset", cascade="all, delete-orphan")
 

@@ -3,11 +3,14 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from sqlalchemy import inspect
 from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
 from neural_data_registry import cli
 from neural_data_registry.config import Settings, get_settings
+from neural_data_registry.db.models import Base, Dataset, IngestionJob
+from neural_data_registry.db.session import create_database, get_session_factory
 from neural_data_registry.enums import Provider
 from neural_data_registry.main import create_app
 from neural_data_registry.service import dataset_dict, find_datasets, ingest_local, session
@@ -131,3 +134,36 @@ def test_cli_query_and_list(config, tmp_path, monkeypatch):
     runner = CliRunner()
     assert runner.invoke(cli.app, ["query", "THINGS-MEG"]).exit_code == 0
     assert "THINGS-MEG" in runner.invoke(cli.app, ["list", "--modality", "meg"]).output
+
+
+def test_create_database_reconciles_missing_columns_across_registry(config):
+    """Synchronize old SQLite tables with all columns in the current models."""
+    create_database(config)
+    engine = get_session_factory(config.resolved_database_url).kw["bind"]
+    with engine.begin() as connection:
+        connection.exec_driver_sql("ALTER TABLE datasets DROP COLUMN storage_mode")
+        connection.exec_driver_sql("ALTER TABLE ingestion_jobs DROP COLUMN message")
+        connection.exec_driver_sql(
+            "INSERT INTO datasets "
+            "(id, name, provider, version, modalities, size_bytes, status) "
+            "VALUES ('legacy-id', 'Legacy dataset', 'LOCAL', 'unknown', '', 0, 'AVAILABLE')"
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO ingestion_jobs (id, dataset_id, status, mode) "
+            "VALUES ('legacy-job', 'legacy-id', 'SUCCEEDED', 'local')"
+        )
+
+    create_database(config)
+
+    inspector = inspect(engine)
+    for table in Base.metadata.sorted_tables:
+        actual = {column["name"] for column in inspector.get_columns(table.name)}
+        assert actual == set(table.columns.keys())
+
+    with session(config) as db:
+        dataset = db.get(Dataset, "legacy-id")
+        assert dataset is not None
+        assert dataset.storage_mode.value == "reference"
+        job = db.get(IngestionJob, "legacy-job")
+        assert job is not None
+        assert job.message is None

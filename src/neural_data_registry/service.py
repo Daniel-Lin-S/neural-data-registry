@@ -13,8 +13,8 @@ from neural_data_registry.db.session import create_database, get_session_factory
 from neural_data_registry.enums import DatasetStatus, JobStatus, Modality, Provider, StorageMode, normalize_modalities
 from neural_data_registry.provider import download_from_url, provider_for_url
 from neural_data_registry.storage import dataset_destination, directory_size, ensure_layout, ingestion_lock, move_into_managed_storage, safe_component
-def _append_download_log(path: Path, message: str) -> None:
-    """Append one timestamped download event to a persistent workspace log."""
+def _append_ingestion_log(path: Path, message: str) -> None:
+    """Append one timestamped ingestion event to a persistent workspace log."""
     path.parent.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
     with path.open("a", encoding="utf-8") as stream:
@@ -192,10 +192,20 @@ def ingest_local(source: Path, name: str, provider: Provider, url: str | None, v
         _preflight_dataset_identity(name, source_reference, config)
     normalized_modalities = normalize_modalities(modalities)
     with ingestion_lock("registry-intake", config):
-        return _ingest_local_locked(
-            source, name, provider, source_reference, version, normalized_modalities,
-            config, storage_mode, has_remote_url=url is not None,
-        )
+        _preflight_dataset_identity(name, source_reference, config)
+        ensure_layout(config)
+        log_path = config.logs_dir / f"ingest-{safe_component(name)}-{safe_component(version)}.log"
+        _append_ingestion_log(log_path, f"START provider={provider.value} version={version} source={source}")
+        try:
+            item = _ingest_local_locked(
+                source, name, provider, source_reference, version, normalized_modalities,
+                config, storage_mode, has_remote_url=url is not None,
+            )
+            _append_ingestion_log(log_path, f"SUCCEEDED dataset_id={item.id} storage_path={item.storage_path}")
+            return item
+        except Exception as exc:
+            _append_ingestion_log(log_path, f"FAILED {type(exc).__name__}: {exc}")
+            raise
 def resolve_download_version(url: str, requested: str | None = None) -> str:
     """Resolve an explicit version or an OpenNeuro version embedded in the URL."""
     if requested is not None:
@@ -249,7 +259,7 @@ def download(
         resumable = (source / ".git").exists()
         source.mkdir(parents=True, exist_ok=True)
         action = "resume" if resumable else ("retry" if was_present else "new")
-        _append_download_log(log_path, f"START provider={provider.value} version={resolved_version} workspace={source} action={action}")
+        _append_ingestion_log(log_path, f"START provider={provider.value} version={resolved_version} workspace={source} action={action}")
         try:
             download_from_url(
                 url,
@@ -262,10 +272,10 @@ def download(
                 source, name, provider, url, resolved_version, normalized_modalities,
                 config, StorageMode.MOVE, has_remote_url=True,
             )
-            _append_download_log(log_path, f"SUCCEEDED dataset_id={item.id} storage_path={item.storage_path}")
+            _append_ingestion_log(log_path, f"SUCCEEDED dataset_id={item.id} storage_path={item.storage_path}")
             return item
         except Exception as exc:
-            _append_download_log(log_path, f"FAILED {type(exc).__name__}: {exc}")
+            _append_ingestion_log(log_path, f"FAILED {type(exc).__name__}: {exc}")
             raise RuntimeError(f"Download failed; workspace retained at {source}. Details were written to {log_path}. {exc}") from exc
 
 def _dataset_output_columns(*, cli: bool = False):

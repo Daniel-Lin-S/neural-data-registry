@@ -5,9 +5,12 @@ from typing import Sequence
 
 
 class Provider(str, Enum):
-    """Supported dataset providers (openneuro, dandi, nemar, and local)."""
+    """Supported dataset providers (openneuro, dandi, nemar, physionet, neurovault, kaggle, and local)."""
     OPENNEURO = "openneuro"
     DANDI = "dandi"
+    PHYSIONET = "physionet"
+    KAGGLE = "kaggle"
+    NEUROVAULT = "neurovault"
     NEMAR = "nemar"
     LOCAL = "local"
 

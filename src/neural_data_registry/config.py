@@ -18,6 +18,11 @@ class Settings(BaseSettings):
         SQLAlchemy URL; defaults to SQLite below ``data_root``.
     lock_timeout_seconds : int
         Timeout reserved for ingestion coordination.
+    download_proxy : str or None, optional
+        Proxy URL used for provider downloads. Existing standard proxy
+        environment variables are inherited when this is omitted.
+    download_mirror : str or None, optional
+        Optional provider download mirror URL or URL template.
     """
     model_config = SettingsConfigDict(env_file=".env", env_prefix="NDR_", extra="ignore")
 
@@ -27,7 +32,14 @@ class Settings(BaseSettings):
         description="SQLAlchemy database URL. Defaults to sqlite under <data_root>/registry/registry.db",
     )
     lock_timeout_seconds: int = 1800
-
+    download_proxy: str | None = Field(
+        default=None,
+        description="Proxy URL for provider downloads",
+    )
+    download_mirror: str | None = Field(
+        default=None,
+        description="Provider download mirror URL or template",
+    )
     @property
     def datasets_dir(self) -> Path:
         return self.data_root / "datasets"
@@ -36,9 +48,6 @@ class Settings(BaseSettings):
     def incoming_dir(self) -> Path:
         return self.data_root / "incoming"
 
-    @property
-    def staging_dir(self) -> Path:
-        return self.data_root / "staging"
 
     @property
     def quarantine_dir(self) -> Path:

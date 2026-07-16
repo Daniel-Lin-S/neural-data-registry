@@ -22,6 +22,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+download = [
+  "datalad>=1.0.0",
+  "git-annex>=10.20230126"
+]
 dev = [
   "pytest>=8.3.0",
   "httpx>=0.27.0"

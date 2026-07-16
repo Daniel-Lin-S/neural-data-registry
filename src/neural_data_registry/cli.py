@@ -81,7 +81,7 @@ def list_datasets(modality: Modality | None = typer.Option(None, "--modality", h
     """
     with session() as db: display(find_datasets(db, modality=modality.value if modality else None, provider=provider.value if provider else None))
 @app.command("ingest-local")
-def ingest_local_command(source: Path = typer.Argument(..., help="Existing local dataset directory to register."), name: str = typer.Option(..., "--name", help="Canonical dataset name to register."), provider: Provider = typer.Option(Provider.LOCAL, "--provider", help="Dataset provider: openneuro, dandi, nemar, or local."), url: str | None = typer.Option(None, "--url", help="Optional canonical source URL for the dataset."), version: str | None = typer.Option(None, "--version", help="Optional dataset version; defaults to unknown for unversioned local data."), modality: list[Modality] = typer.Option([], "--modality", help="Dataset modality (eeg, meg, ieeg, fmri, fnris, pet, smri, dmri, ephys, or other); repeat for multiple modalities."), storage_mode: StorageMode = typer.Option(StorageMode.REFERENCE, "--storage-mode", help="Reference files in place (default) or move into managed storage.")):
+def ingest_local_command(source: Path = typer.Argument(..., help="Existing local dataset directory to register."), name: str = typer.Option(..., "--name", help="Canonical dataset name to register."), provider: Provider = typer.Option(Provider.LOCAL, "--provider", help="Dataset provider: openneuro, dandi, nemar, physionet, neurovault, kaggle, or local."), url: str | None = typer.Option(None, "--url", help="Optional canonical source URL for the dataset."), version: str | None = typer.Option(None, "--version", help="Optional dataset version; defaults to unknown for unversioned local data."), modality: list[Modality] = typer.Option([], "--modality", help="Dataset modality (eeg, meg, ieeg, fmri, fnris, pet, smri, dmri, ephys, or other); repeat for multiple modalities."), storage_mode: StorageMode = typer.Option(StorageMode.REFERENCE, "--storage-mode", help="Reference files in place (default) or move into managed storage.")):
     """Register an already-downloaded local dataset.
 
     SOURCE must be a directory. By default, its files remain in place and
@@ -103,11 +103,16 @@ def ingest_local_command(source: Path = typer.Argument(..., help="Existing local
         )
     )
 @app.command()
-def download(url: str = typer.Option(..., "--url", help="Provider dataset URL; the provider is detected from its host."), version: str = typer.Option("latest", "--version", help="Version to download, or 'latest' (the default).")):
+def download(url: str = typer.Option(..., "--url", help="Provider dataset URL; the provider is detected from its host."), name: str = typer.Option(..., "--name", help="Dataset name to register."), modality: list[Modality] = typer.Option(..., "--modality", help="Dataset modality; repeat for multiple modalities."), version: str | None = typer.Option(None, "--version", help="Version or branch; required unless an OpenNeuro URL contains /versions/x.y.z."), proxy: str | None = typer.Option(None, "--proxy", help="Proxy URL for this download."), mirror: str | None = typer.Option(None, "--mirror", help="Mirror URL, URL base, or template containing {dataset_id}.")):
     """Download a supported provider dataset and ingest it automatically.
 
-    The URL identifies the provider. OpenNeuro downloads require git. Failed
-    downloads are moved to NDR_DATA_ROOT/quarantine; successful records are
-    printed as JSON.
+    NAME and at least one --modality are required so the registry record has
+    explicit metadata. Install the package with the download extra to enable
+    DataLad-backed downloads. Failed downloads remain in NDR_DATA_ROOT/incoming.
     """
-    console.print_json(data=dataset_dict(download_dataset(url, version)))
+    try:
+        item = download_dataset(url, version, name=name, modalities=[item.value for item in modality], proxy=proxy, mirror=mirror)
+    except RuntimeError as exc:
+        console.print(f"[red]Download failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    console.print_json(data=dataset_dict(item))

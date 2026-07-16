@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 from sqlalchemy import inspect
@@ -13,6 +14,9 @@ from neural_data_registry.db.models import Base, Dataset, IngestionJob
 from neural_data_registry.db.session import create_database, get_session_factory
 from neural_data_registry.enums import Provider, StorageMode
 from neural_data_registry.main import create_app
+from neural_data_registry.provider import base as provider_base
+from neural_data_registry.service import download as download_dataset, resolve_download_version
+from neural_data_registry.storage import ensure_layout
 from neural_data_registry.service import dataset_dict, find_datasets, ingest_local, session
 
 
@@ -88,6 +92,89 @@ def test_rejects_repeated_url_with_existing_managed_path(config, tmp_path):
     with pytest.raises(RuntimeError, match="source URL/path is already registered") as error:
         ingest_local(mock_dataset(tmp_path, "different-source"), "Other name", Provider.OPENNEURO, "https://openneuro.org/datasets/ds004212", "4.0.0", [], config)
     assert existing.storage_path in str(error.value)
+
+
+def test_ingest_preflights_conflicts_before_validating_the_source(config, tmp_path):
+    """A duplicate name or URL stops local intake before source-file work."""
+    existing = ingest_mock(config, tmp_path)
+    missing_source = tmp_path / "must-not-be-processed"
+
+    with pytest.raises(RuntimeError, match="dataset name is already registered"):
+        ingest_local(
+            missing_source, existing.name, Provider.LOCAL, None, "1.0.0", [], config
+        )
+    with pytest.raises(RuntimeError, match="source URL/path is already registered"):
+        ingest_local(
+            missing_source,
+            "Different dataset",
+            Provider.LOCAL,
+            existing.source_url,
+            "1.0.0",
+            [],
+            config,
+        )
+    assert not missing_source.exists()
+
+
+@pytest.mark.parametrize(
+    ("name", "url", "reason"),
+    [
+        (
+            "THINGS-MEG",
+            "https://openneuro.org/datasets/ds999999/versions/1.0.0",
+            "dataset name",
+        ),
+        (
+            "Different dataset",
+            "https://openneuro.org/datasets/ds004212",
+            "source URL/path",
+        ),
+    ],
+)
+def test_download_preflights_name_and_url_before_provider_work(
+    config, tmp_path, monkeypatch, name, url, reason
+):
+    """Duplicate downloads do not create a workspace, log, or provider request."""
+    ingest_mock(config, tmp_path)
+    calls = []
+    monkeypatch.setattr(
+        "neural_data_registry.service.download_from_url",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    with pytest.raises(RuntimeError, match=reason):
+        download_dataset(url, "1.0.0", config, name=name, modalities=["meg"])
+
+    assert calls == []
+    assert list(config.incoming_dir.iterdir()) == []
+    assert list(config.logs_dir.glob("download-*.log")) == []
+
+
+def test_download_api_conflict_is_preflighted(config, tmp_path, monkeypatch):
+    """The public download endpoint returns a conflict before provider work."""
+    existing = ingest_mock(config, tmp_path)
+    calls = []
+    monkeypatch.setattr(
+        "neural_data_registry.service.download_from_url",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    response = TestClient(create_app(config)).post(
+        "/download",
+        json={
+            "url": existing.source_url,
+            "version": "1.0.0",
+            "name": "Different dataset",
+            "modalities": ["meg"],
+        },
+    )
+
+    assert response.status_code == 409
+    assert "source URL/path is already registered" in response.json()["detail"]
+    assert calls == []
+    assert list(config.incoming_dir.iterdir()) == []
+
+
 
 
 def test_rejects_missing_local_source(config, tmp_path):
@@ -264,3 +351,168 @@ def test_legacy_dataset_fields_are_preserved_but_do_not_block_new_rows(
     assert "reference" not in result.output
     assert "retired_required_field" not in result.output
     assert "legacy-secret" not in result.output
+
+
+def test_layout_consolidates_download_workspace_in_incoming(config):
+    """Create one not-ready workspace and do not recreate the staging tree."""
+    ensure_layout(config)
+    assert config.incoming_dir.is_dir()
+    assert not (config.data_root / "staging").exists()
+
+
+def test_datalad_download_uses_mirror_proxy_and_fetches_content(tmp_path, monkeypatch):
+    """Use DataLad clone/get with the requested branch, mirror, and proxy."""
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return Mock()
+
+    monkeypatch.setattr(
+        provider_base.shutil,
+        "which",
+        lambda name: f"/usr/bin/{name}" if name in {"datalad", "git-annex"} else None,
+    )
+    monkeypatch.setattr(provider_base.subprocess, "run", fake_run)
+    destination = tmp_path / "incoming" / "dataset"
+    provider_base.download_from_url(
+        "https://openneuro.org/datasets/ds004212",
+        "3.0.0",
+        destination,
+        proxy="https://proxy.example:8080",
+        mirror="https://mirror.example/{dataset_id}.git",
+    )
+
+    assert calls[0][0] == [
+        "/usr/bin/datalad",
+        "clone",
+        "https://mirror.example/ds004212.git",
+        str(destination),
+        "--branch",
+        "3.0.0",
+    ]
+    assert calls[1][0] == [
+        "/usr/bin/datalad",
+        "get",
+        "--recursive",
+        ".",
+    ]
+    assert calls[1][1]["cwd"] == destination
+    for _, kwargs in calls:
+        assert kwargs["env"]["HTTPS_PROXY"] == "https://proxy.example:8080"
+        assert kwargs["env"]["https_proxy"] == "https://proxy.example:8080"
+
+
+def test_failed_download_remains_in_incoming(config, monkeypatch):
+    """Retain a partial download in incoming instead of moving it to quarantine."""
+    attempts = []
+
+    def fail_download(url, version, destination, **kwargs):
+        attempts.append(destination)
+        (destination / "partial-file").write_text("partial")
+        raise RuntimeError("download failed")
+
+    monkeypatch.setattr("neural_data_registry.service.download_from_url", fail_download)
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="download failed"):
+            download_dataset(
+                "https://openneuro.org/datasets/ds004212",
+                "3.0.0",
+                config,
+                name="THINGS-MEG",
+                modalities=["meg"],
+            )
+
+    partial = config.incoming_dir / "download-openneuro-ds004212-3.0.0"
+    log_path = config.logs_dir / f"{partial.name}.log"
+    assert attempts == [partial, partial]
+    assert (partial / "partial-file").is_file()
+    assert "FAILED RuntimeError: download failed" in log_path.read_text()
+    assert not any(config.quarantine_dir.iterdir())
+
+
+@pytest.mark.parametrize(
+    ("url", "provider"),
+    [
+        ("https://physionet.org/content/example/1.0.0/", Provider.PHYSIONET),
+        ("https://neurovault.org/collections/1234/", Provider.NEUROVAULT),
+        ("https://www.kaggle.com/datasets/example/dataset", Provider.KAGGLE),
+    ],
+)
+def test_new_providers_are_recognized_but_not_downloaded(url, provider):
+    """Recognize new provider URLs while keeping automatic downloads disabled."""
+    assert provider_base.provider_for_url(url) is provider
+    with pytest.raises(provider_base.ProviderDownloadError, match="not configured"):
+        provider_base.download_from_url(url, "1.0.0", Path("/tmp/incoming"))
+
+
+def test_download_requires_explicit_metadata(config):
+    """Reject downloads that would otherwise create blank registry metadata."""
+    with pytest.raises(ValueError, match="dataset name"):
+        download_dataset(
+            "https://openneuro.org/datasets/ds004212",
+            "1.0.0",
+            config,
+            name=" ",
+            modalities=["meg"],
+        )
+    with pytest.raises(ValueError, match="At least one modality"):
+        download_dataset(
+            "https://openneuro.org/datasets/ds004212",
+            "1.0.0",
+            config,
+            name="THINGS-MEG",
+            modalities=[],
+        )
+
+
+def test_download_version_is_inferred_or_required():
+    """Infer OpenNeuro numeric versions and require versions elsewhere."""
+    assert resolve_download_version(
+        "https://openneuro.org/datasets/ds007338/versions/1.0.0"
+    ) == "1.0.0"
+    assert resolve_download_version(
+        "https://openneuro.org/datasets/ds007338/versions/1.0.0",
+        "main",
+    ) == "main"
+    with pytest.raises(ValueError, match="version is required"):
+        resolve_download_version("https://dandiarchive.org/dandiset/000001/1.0.0")
+
+def test_datalad_resume_skips_clone(tmp_path, monkeypatch):
+    """Resume an existing DataLad workspace with get instead of cloning again."""
+    destination = tmp_path / "incoming" / "dataset"
+    (destination / ".git").mkdir(parents=True)
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return Mock()
+
+    monkeypatch.setattr(
+        provider_base.shutil,
+        "which",
+        lambda name: f"/usr/bin/{name}" if name in {"datalad", "git-annex"} else None,
+    )
+    monkeypatch.setattr(provider_base.subprocess, "run", fake_run)
+    provider_base.download_from_url(
+        "https://openneuro.org/datasets/ds004212", "3.0.0", destination
+    )
+    assert [command for command, _ in calls] == [
+        ["/usr/bin/datalad", "get", "--recursive", "."]
+    ]
+    assert calls[0][1]["cwd"] == destination
+
+
+def test_datalad_requires_git_annex(tmp_path, monkeypatch):
+    """Report the missing system git-annex dependency before cloning."""
+    monkeypatch.setattr(
+        provider_base,
+        "_find_command",
+        lambda name: "/usr/bin/datalad" if name == "datalad" else None,
+    )
+    with pytest.raises(provider_base.ProviderDownloadError, match="git-annex"):
+        provider_base.download_from_url(
+            "https://openneuro.org/datasets/ds004212",
+            "3.0.0",
+            tmp_path / "incoming" / "dataset",
+        )

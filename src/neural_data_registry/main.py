@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 from neural_data_registry.config import Settings
 from neural_data_registry.db.models import Dataset
 from neural_data_registry.enums import Modality, Provider, StorageMode
-from neural_data_registry.service import dataset_dict, download, find_datasets, ingest_local, session
+from neural_data_registry.service import DatasetConflictError, dataset_dict, download, find_datasets, ingest_local, session
 
 
 class LocalIngestionRequest(BaseModel):
@@ -25,7 +25,11 @@ class LocalIngestionRequest(BaseModel):
 class DownloadRequest(BaseModel):
     """Request body for downloading and registering a provider dataset."""
     url: str
-    version: str = "latest"
+    version: str | None = None
+    name: str = Field(min_length=1)
+    modalities: list[Modality] = Field(min_length=1)
+    proxy: str | None = None
+    mirror: str | None = None
 
 
 def create_app(config: Settings | None = None) -> FastAPI:
@@ -72,11 +76,14 @@ def create_app(config: Settings | None = None) -> FastAPI:
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return dataset_dict(item)
-
     @api.post("/download", status_code=202)
     def download_dataset(request: DownloadRequest) -> dict:
         try:
-            return dataset_dict(download(request.url, request.version, config))
+            return dataset_dict(download(request.url, request.version, config, name=request.name, modalities=request.modalities, proxy=request.proxy, mirror=request.mirror))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except DatasetConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 

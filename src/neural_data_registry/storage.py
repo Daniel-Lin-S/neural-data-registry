@@ -15,7 +15,7 @@ def ensure_layout(config: Settings | None = None) -> None:
         Registry configuration.
     """
     config = config or get_settings()
-    for path in (config.datasets_dir, config.incoming_dir, config.staging_dir, config.quarantine_dir, config.registry_dir, config.logs_dir, config.ingestion_lock_dir): path.mkdir(parents=True, exist_ok=True)
+    for path in (config.datasets_dir, config.incoming_dir, config.quarantine_dir, config.registry_dir, config.logs_dir, config.ingestion_lock_dir): path.mkdir(parents=True, exist_ok=True)
 
 def directory_size(path: Path) -> int:
     return sum(item.stat().st_size for item in path.rglob("*") if item.is_file())

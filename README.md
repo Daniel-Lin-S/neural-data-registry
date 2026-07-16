@@ -48,31 +48,34 @@ All commands read `NDR_DATA_ROOT` and operate on the same registry database.
 
 ### `brainctl query`
 
-Searches registered datasets by a name/alias fragment or an exact source URL.
+Queries the storage path of a registered dataset by its ID (internal to this registry), canonical name, or source URL and prints only its absolute storage path. The three forms are equivalent:
 
 ```bash
-brainctl query "THINGS-MEG"
-brainctl query --url "https://openneuro.org/datasets/ds004212"
+brainctl query --name THINGS-MEG
+brainctl query --url "https://openneuro.org/datasets/ds004212/versions/3.0.0"  # remote URL
+brainctl query 220cb6c2-cc2f-409d-be24-5abb018da87d  # internal ID
 ```
 
-`QUERY` is a case-insensitive name fragment. `--url` performs an exact source-URL
-lookup. Provide at least one of them. Results are shown as a table with dataset
-ID, name, provider, version, modalities, size, and status.
+IDs, names, and source URLs are unique. Query does not list or summarize records; use `brainctl list` for that.
 
 ### `brainctl list`
 
-Lists all registered datasets, optionally narrowed to one modality.
+Lists all registered datasets as a structured summary, optionally narrowed to one modality or provider.
 
 ```bash
 brainctl list --modality MEG
+brainctl list --provider openneuro
 ```
 
-`--modality` accepts a value such as `MEG`, `EEG`, or `fMRI`; omitting it lists
-every registry record. The output table has the same fields as `query`.
+`--modality` accepts a value such as `MEG`, `EEG`, or `fMRI`; `--provider` accepts
+`openneuro`, `dandi`, `nemar`, or `local`. Omitting both lists every registry record.
+The summary includes dataset ID, name, provider, version, modalities, size, and status.
 
 ### `brainctl ingest-local`
 
-Registers a dataset that has already been downloaded to a local directory. Usage example:
+Registers a dataset that has already been downloaded to a local directory, or a dataset that is uploaded manually. IMPORTANT: please use to check whether your dataset already exists using `brainctl query` before ingesting.
+
+Usage example:
 
 ```bash
 brainctl ingest-local /data/legacy/things-meg \
@@ -84,14 +87,17 @@ brainctl ingest-local /data/legacy/things-meg \
 ```
 
 `SOURCE` must be an existing directory. `--name` and `--version` are required.
-`--provider` accepts `openneuro`, `dandi`, `nemar`, or `local`; it defaults to `local`. `--url` records the canonical remote URL when one exists.
-Repeat `--modality` to register multiple modalities. By default (`--storage-mode reference`), the command leaves `SOURCE` where it is and records its absolute path. Use `--storage-mode move` to relocate `SOURCE` into `$NDR_DATA_ROOT/datasets`. Both modes write a manifest and print the new record as JSON.
+`--provider` accepts `openneuro`, `dandi`, `nemar`, or `local`; it defaults to `local`.
+`--url` records the canonical remote URL when one exists.
+Repeat `--modality` to register multiple modalities.
+By default (`--storage-mode reference`), the command leaves `SOURCE` where it is and records its absolute path. Use `--storage-mode move` to relocate `SOURCE` into `$NDR_DATA_ROOT/datasets`.
+
 It rejects a duplicate canonical name or source URL and reports the existing storage path.
 
 ### `brainctl download`
 
 Detects the provider from a dataset URL, downloads into staging, and ingests the
-result automatically.
+result automatically. IMPORTANT: please use to check whether your dataset already exists using `brainctl query` before downloading.
 
 ```bash
 brainctl download --url "https://openneuro.org/datasets/ds004212" --version latest

@@ -129,11 +129,15 @@ def test_all_core_api_routes(config, tmp_path):
 
 def test_cli_query_and_list(config, tmp_path, monkeypatch):
     """Verify query and modality-list CLI commands render registered datasets."""
-    ingest_mock(config, tmp_path)
+    item = ingest_mock(config, tmp_path)
     monkeypatch.setattr(cli, "session", lambda: session(config))
     monkeypatch.setattr(cli, "console", cli.Console(width=160))
     runner = CliRunner()
-    assert runner.invoke(cli.app, ["query", "THINGS-MEG"]).exit_code == 0
+    query_result = runner.invoke(cli.app, ["query", "THINGS-MEG"])
+    assert query_result.exit_code == 0
+    assert query_result.output.strip() == str(Path(item.storage_path).resolve())
+    assert runner.invoke(cli.app, ["query", item.id]).output.strip() == str(Path(item.storage_path).resolve())
+    assert runner.invoke(cli.app, ["query", "--url", item.source_url]).output.strip() == str(Path(item.storage_path).resolve())
     result = runner.invoke(
         cli.app, ["list", "--modality", "meg"], terminal_width=160
     )

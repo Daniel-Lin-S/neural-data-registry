@@ -11,6 +11,7 @@ from neural_data_registry.service import (
     download as download_dataset,
     find_datasets,
     ingest_local,
+    resolve_dataset,
     session,
 )
 
@@ -56,28 +57,29 @@ def display(items):
 
 @app.command()
 def query(
-    query: Annotated[str | None, typer.Argument(help="Dataset name or alias fragment to search for.")] = None,
-    name: str | None = typer.Option(None, "--name", help="Dataset name or alias fragment to search for."),
+    query: Annotated[str | None, typer.Argument(help="Exact dataset ID, name, or source URL.")] = None,
+    name: str | None = typer.Option(None, "--name", help="Exact dataset name to look up."),
     url: str | None = typer.Option(None, "--url", help="Exact source URL to look up.")
 ):
-    """Search datasets by name or exact source URL.
-
-    Provide a positional name fragment, or use --url or --name. Results show the dataset
-    ID, provider, version, modalities, size, and registry status.
-    """
-    search_query = query or name
-    if not search_query and not url:
-        raise typer.BadParameter("Provide a name query (positional or --name) or --url")
-    with session() as db:
-        display(find_datasets(db, query=search_query, url=url))
+    """Print the absolute storage path for one dataset."""
+    try:
+        with session() as db:
+            item = resolve_dataset(db, query, name=name, url=url)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if item is None:
+        raise typer.BadParameter("No dataset matched the supplied ID, name, or URL")
+    if not item.storage_path:
+        raise typer.BadParameter("The matched dataset has no storage path")
+    console.print(Path(item.storage_path).expanduser().resolve())
 @app.command("list")
-def list_datasets(modality: Modality | None = typer.Option(None, "--modality", help="Restrict results to a modality, such as meg or eeg.")):
+def list_datasets(modality: Modality | None = typer.Option(None, "--modality", help="Restrict results to a modality, such as meg or eeg."), provider: Provider | None = typer.Option(None, "--provider", help="Restrict results to a provider.")):
     """List registered datasets, optionally filtered by modality.
 
     The table contains dataset ID, name, provider, version, modalities, size,
     and current status.
     """
-    with session() as db: display(find_datasets(db, modality=modality.value if modality else None))
+    with session() as db: display(find_datasets(db, modality=modality.value if modality else None, provider=provider.value if provider else None))
 @app.command("ingest-local")
 def ingest_local_command(source: Path = typer.Argument(..., help="Existing local dataset directory to register."), name: str = typer.Option(..., "--name", help="Canonical dataset name to register."), provider: Provider = typer.Option(Provider.LOCAL, "--provider", help="Dataset provider: openneuro, dandi, nemar, or local."), url: str | None = typer.Option(None, "--url", help="Optional canonical source URL for the dataset."), version: str | None = typer.Option(None, "--version", help="Optional dataset version; defaults to unknown for unversioned local data."), modality: list[Modality] = typer.Option([], "--modality", help="Dataset modality (eeg, meg, ieeg, fmri, fnris, pet, smri, dmri, ephys, or other); repeat for multiple modalities."), storage_mode: StorageMode = typer.Option(StorageMode.REFERENCE, "--storage-mode", help="Reference files in place (default) or move into managed storage.")):
     """Register an already-downloaded local dataset.

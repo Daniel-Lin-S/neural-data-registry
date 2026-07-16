@@ -35,9 +35,9 @@ def create_app(config: Settings | None = None) -> FastAPI:
         return {"status": "ok"}
 
     @api.get("/datasets")
-    def datasets(query: str | None = None, url: str | None = None, modality: str | None = None) -> list[dict]:
+    def datasets(query: str | None = None, url: str | None = None, modality: str | None = None, provider: str | None = None) -> list[dict]:
         with session(config) as db:
-            return [dataset_dict(item) for item in find_datasets(db, query, url, modality)]
+            return [dataset_dict(item) for item in find_datasets(db, query, url, modality, provider)]
 
     @api.get("/datasets/{dataset_id}")
     def dataset(dataset_id: str) -> dict:

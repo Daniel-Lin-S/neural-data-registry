@@ -3,7 +3,7 @@ from datetime import datetime
 from enum import Enum
 import json, shutil
 from pathlib import Path
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 from neural_data_registry.config import Settings, get_settings
 from neural_data_registry.db.models import Dataset, DatasetAlias, IngestionJob
@@ -16,13 +16,34 @@ def session(config: Settings | None = None) -> Session:
     config = config or get_settings()
     create_database(config)
     return get_session_factory(config.resolved_database_url)()
-def find_datasets(db: Session, query: str | None = None, url: str | None = None, modality: str | None = None) -> list[Dataset]:
+def find_datasets(db: Session, query: str | None = None, url: str | None = None, modality: str | None = None, provider: str | None = None) -> list[Dataset]:
     stmt = select(Dataset).order_by(Dataset.created_at.desc())
     if url: stmt = stmt.outerjoin(DatasetAlias).where(or_(Dataset.source_url == url, DatasetAlias.value == url))
     if query:
         needle = f"%{query}%"; stmt = stmt.outerjoin(DatasetAlias).where(or_(Dataset.name.ilike(needle), DatasetAlias.value.ilike(needle)))
     if modality: stmt = stmt.where(Dataset.modalities.ilike(f"%{modality}%"))
+    if provider:
+        provider_value = Provider(provider).name if isinstance(provider, str) else provider
+        stmt = stmt.where(Dataset.provider == provider_value)
     return list(db.scalars(stmt.distinct()))
+
+def resolve_dataset(db: Session, identifier: str | None = None, *, name: str | None = None, url: str | None = None) -> Dataset | None:
+    """Resolve one dataset by its unique ID, name, or source URL."""
+    values = [value for value in (identifier, name, url) if value]
+    if len(values) != 1:
+        raise ValueError("Provide exactly one dataset id, name, or URL")
+    value = values[0]
+    if identifier:
+        conditions = [Dataset.id == value, func.lower(Dataset.name) == value.casefold(), Dataset.source_url == value]
+    elif name:
+        conditions = [func.lower(Dataset.name) == value.casefold()]
+    else:
+        conditions = [Dataset.source_url == value]
+    matches = list(db.scalars(select(Dataset).where(or_(*conditions))))
+    if len(matches) > 1:
+        raise ValueError(f"Dataset identifier is ambiguous: {value}")
+    return matches[0] if matches else None
+
 
 def ingest_local(source: Path, name: str, provider: Provider, url: str | None, version: str | None, modalities: list[str], config: Settings | None = None, storage_mode: StorageMode = StorageMode.REFERENCE) -> Dataset:
     config = config or get_settings()

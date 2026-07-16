@@ -5,7 +5,14 @@ import typer
 from rich.console import Console
 from rich.table import Table
 from neural_data_registry.enums import Modality, Provider, StorageMode
-from neural_data_registry.service import dataset_dict, download as download_dataset, find_datasets, ingest_local, session
+from neural_data_registry.service import (
+    dataset_dict,
+    dataset_output_fields,
+    download as download_dataset,
+    find_datasets,
+    ingest_local,
+    session,
+)
 
 app = typer.Typer(help="Search, list, ingest, and download managed neuroscience datasets.", add_completion=False)
 console = Console()
@@ -19,26 +26,31 @@ def format_size(size_bytes: int) -> str:
         size /= 1024.0
     return f"{size:.1f} PB"
 
+def _format_dataset_cell(field: str, value) -> str:
+    if field == "size_bytes":
+        return format_size(value or 0)
+    if isinstance(value, list):
+        return ", ".join(str(item) for item in value) or "-"
+    if value is None or value == "":
+        return "-"
+    return str(value)
+
+
 def display(items):
-    table = Table(title="Datasets", show_lines=True)
-    table.add_column("Dataset ID", overflow="fold")
-    table.add_column("Name", overflow="fold")
-    table.add_column("Provider", overflow="fold")
-    table.add_column("Version", overflow="fold")
-    table.add_column("Modalities", overflow="fold")
-    table.add_column("Size", justify="right", no_wrap=True)
-    table.add_column("Status", overflow="fold")
-    
+    table = Table(title="Datasets", show_lines=True, padding=(0, 0))
+    fields = dataset_output_fields(cli=True)
+    for field, label in fields:
+        table.add_column(
+            label,
+            overflow="fold",
+            justify="right" if field == "size_bytes" else "left",
+            no_wrap=field == "size_bytes",
+        )
+
     for item in items:
         row = dataset_dict(item)
         table.add_row(
-            row["dataset_id"], 
-            row["name"], 
-            row["provider"], 
-            row["version"], 
-            ", ".join(row["modalities"]) or "-", 
-            format_size(row["size_bytes"]), 
-            row["status"]
+            *[_format_dataset_cell(field, row.get(field)) for field, _ in fields]
         )
     console.print(table)
 

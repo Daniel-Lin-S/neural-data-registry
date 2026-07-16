@@ -11,7 +11,7 @@ from neural_data_registry import cli
 from neural_data_registry.config import Settings, get_settings
 from neural_data_registry.db.models import Base, Dataset, IngestionJob
 from neural_data_registry.db.session import create_database, get_session_factory
-from neural_data_registry.enums import Provider
+from neural_data_registry.enums import Provider, StorageMode
 from neural_data_registry.main import create_app
 from neural_data_registry.service import dataset_dict, find_datasets, ingest_local, session
 
@@ -131,9 +131,16 @@ def test_cli_query_and_list(config, tmp_path, monkeypatch):
     """Verify query and modality-list CLI commands render registered datasets."""
     ingest_mock(config, tmp_path)
     monkeypatch.setattr(cli, "session", lambda: session(config))
+    monkeypatch.setattr(cli, "console", cli.Console(width=160))
     runner = CliRunner()
     assert runner.invoke(cli.app, ["query", "THINGS-MEG"]).exit_code == 0
-    assert "THINGS-MEG" in runner.invoke(cli.app, ["list", "--modality", "meg"]).output
+    result = runner.invoke(
+        cli.app, ["list", "--modality", "meg"], terminal_width=160
+    )
+    assert result.exit_code == 0
+    assert "THINGS-MEG" in result.output
+    assert "Storage Mode" in result.output
+    assert "reference" in result.output
 
 
 def test_create_database_reconciles_missing_columns_across_registry(config):
@@ -167,3 +174,89 @@ def test_create_database_reconciles_missing_columns_across_registry(config):
         job = db.get(IngestionJob, "legacy-job")
         assert job is not None
         assert job.message is None
+
+
+def test_legacy_dataset_fields_are_preserved_but_do_not_block_new_rows(
+    config, tmp_path, monkeypatch
+):
+    """Retain retired SQL data without exposing or requiring its old field."""
+    config.registry_dir.mkdir(parents=True)
+    engine = get_session_factory(config.resolved_database_url).kw["bind"]
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            """
+            CREATE TABLE datasets (
+                id VARCHAR(36) NOT NULL PRIMARY KEY,
+                name VARCHAR(255) NOT NULL,
+                provider VARCHAR(9) NOT NULL,
+                source_url VARCHAR(2048),
+                modalities TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                status VARCHAR(11) NOT NULL,
+                storage_path TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL,
+                retired_required_field TEXT NOT NULL
+            )
+            """
+        )
+        connection.exec_driver_sql(
+            """
+            INSERT INTO datasets (
+                id, name, provider, source_url, modalities,
+                size_bytes, status, storage_path, retired_required_field
+            ) VALUES (
+                'old-dataset', 'Old dataset', 'LOCAL', 'file:///old',
+                'meg', 7, 'AVAILABLE', '/old', 'legacy-secret'
+            )
+            """
+        )
+
+    create_database(config)
+
+    columns = {
+        column["name"]: column for column in inspect(engine).get_columns("datasets")
+    }
+    assert "storage_mode" in columns
+    assert columns["retired_required_field"]["nullable"] is True
+
+    with session(config) as db:
+        old_dataset = db.get(Dataset, "old-dataset")
+        assert old_dataset is not None
+        old_data = dataset_dict(old_dataset)
+        assert old_data["version"] == "unknown"
+        assert old_data["storage_mode"] == "reference"
+        assert "retired_required_field" not in old_data
+
+    source = mock_dataset(tmp_path, "new-source")
+    new_dataset = ingest_local(
+        source,
+        "New dataset",
+        Provider.LOCAL,
+        None,
+        "1",
+        ["meg"],
+        config,
+        storage_mode=StorageMode.REFERENCE,
+    )
+
+    with engine.connect() as connection:
+        old_retired, new_retired = connection.exec_driver_sql(
+            """
+            SELECT
+                MAX(CASE WHEN id = 'old-dataset' THEN retired_required_field END),
+                MAX(CASE WHEN id = ? THEN retired_required_field END)
+            FROM datasets
+            """,
+            (new_dataset.id,),
+        ).one()
+    assert old_retired == "legacy-secret"
+    assert new_retired is None
+
+    monkeypatch.setattr(cli, "session", lambda: session(config))
+    monkeypatch.setattr(cli, "console", cli.Console(width=160))
+    result = CliRunner().invoke(cli.app, ["list"], terminal_width=160)
+    assert result.exit_code == 0
+    assert "Storage Mode" in result.output
+    assert "reference" in result.output
+    assert "retired_required_field" not in result.output
+    assert "legacy-secret" not in result.output

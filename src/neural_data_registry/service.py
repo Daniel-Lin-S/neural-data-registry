@@ -1,4 +1,6 @@
 from __future__ import annotations
+from datetime import datetime
+from enum import Enum
 import json, shutil
 from pathlib import Path
 from sqlalchemy import or_, select
@@ -77,5 +79,40 @@ def download(url: str, version: str, config: Settings | None = None) -> Dataset:
         if source.exists(): shutil.move(str(source), str(config.quarantine_dir / source.name))
         raise
 
+def _dataset_output_columns(*, cli: bool = False):
+    for column in Dataset.__table__.columns:
+        if not column.info.get("serialize", True):
+            continue
+        if cli and column.info.get("cli_hidden", False):
+            continue
+        output_name = column.info.get("output_name", column.name)
+        label = column.info.get(
+            "label", output_name.replace("_", " ").title()
+        )
+        yield column, output_name, label
+
+
+def dataset_output_fields(*, cli: bool = False) -> list[tuple[str, str]]:
+    """Return current model fields and labels exposed to registry consumers."""
+    return [
+        (output_name, label)
+        for _, output_name, label in _dataset_output_columns(cli=cli)
+    ]
+
+
+def _serialize_dataset_value(column, value):
+    if column.name == "modalities":
+        return [item for item in (value or "").split(",") if item]
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return value
+
+
 def dataset_dict(item: Dataset) -> dict:
-    return {"dataset_id": item.id, "name": item.name, "provider": item.provider.value, "version": item.version, "source_url": item.source_url, "modalities": [x for x in item.modalities.split(",") if x], "size_bytes": item.size_bytes, "status": item.status.value, "storage_mode": item.storage_mode.value, "storage_path": item.storage_path}
+    """Serialize fields from the current Dataset model, excluding retired columns."""
+    return {
+        output_name: _serialize_dataset_value(column, getattr(item, column.name))
+        for column, output_name, _ in _dataset_output_columns()
+    }

@@ -11,7 +11,7 @@ The application expects this directory structure under a configured root path:
 {NDR_DATA_ROOT}/
   datasets/      # Prepared datasets ready for use
   incoming/      # Manual uploads (not ready for use)
-  staging/       # Temporary workspace used during ingestion
+  staging/       # Temporary workspace used during ingestion or automatic download
   quarantine/    # Failed or suspicious ingestion attempts
   registry/      # Registry database backups and dataset manifests
   logs/          # Records of ingestion operations

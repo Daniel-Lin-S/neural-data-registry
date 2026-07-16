@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel, Field
 
 from neural_data_registry.config import Settings
@@ -65,7 +65,9 @@ def create_app(config: Settings | None = None) -> FastAPI:
             return dataset_dict(item)
 
     @api.post("/ingest/local", status_code=201)
-    def ingest_local_dataset(request: LocalIngestionRequest) -> dict:
+    def ingest_local_dataset(request: LocalIngestionRequest, response: Response) -> dict:
+        if request.storage_mode is StorageMode.COPY:
+            response.headers["Warning"] = "299 - \"copy mode uses additional disk space; use only when SOURCE may be cleaned in the future\""
         try:
             item = ingest_local(
                 request.source, request.name, request.provider, request.url,

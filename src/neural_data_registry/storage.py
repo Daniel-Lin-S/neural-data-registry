@@ -34,6 +34,12 @@ def dataset_destination(dataset_id: str, name: str, version: str, config: Settin
     """Build the managed storage path for a dataset without creating it."""
     config = config or get_settings()
     return config.datasets_dir / f"{safe_component(name)}-{safe_component(version)}-{dataset_id}"
+def copy_into_managed_storage(source: Path, destination: Path) -> None:
+    """Copy a source directory into managed storage, preserving the source."""
+    if destination.exists(): raise IngestionConflictError(f"Managed destination already exists: {destination}")
+    if not source.is_dir(): raise ValueError(f"Source must be an existing directory: {source}")
+    destination.parent.mkdir(parents=True, exist_ok=True); shutil.copytree(source, destination)
+
 def move_into_managed_storage(source: Path, destination: Path) -> None:
     """Explicitly move a source directory into managed storage."""
     if destination.exists(): raise IngestionConflictError(f"Managed destination already exists: {destination}")

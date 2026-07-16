@@ -81,7 +81,7 @@ def list_datasets(modality: Modality | None = typer.Option(None, "--modality", h
     """
     with session() as db: display(find_datasets(db, modality=modality.value if modality else None, provider=provider.value if provider else None))
 @app.command("ingest-local")
-def ingest_local_command(source: Path = typer.Argument(..., help="Existing local dataset directory to register."), name: str = typer.Option(..., "--name", help="Canonical dataset name to register."), provider: Provider = typer.Option(Provider.OTHER, "--provider", help="Dataset provider: openneuro, dandi, nemar, physionet, neurovault, kaggle, or other."), url: str | None = typer.Option(None, "--url", help="Optional canonical source URL for the dataset."), version: str | None = typer.Option(None, "--version", help="Optional dataset version; defaults to unknown for unversioned local data."), modality: list[Modality] = typer.Option([], "--modality", help="Dataset modality (eeg, meg, ieeg, fmri, fnris, pet, smri, dmri, ephys, or other); repeat for multiple modalities."), storage_mode: StorageMode = typer.Option(StorageMode.REFERENCE, "--storage-mode", help="Reference files in place (default) or move into managed storage.")):
+def ingest_local_command(source: Path = typer.Argument(..., help="Existing local dataset directory to register."), name: str = typer.Option(..., "--name", help="Canonical dataset name to register."), provider: Provider = typer.Option(Provider.OTHER, "--provider", help="Dataset provider: openneuro, dandi, nemar, physionet, neurovault, kaggle, or other."), url: str | None = typer.Option(None, "--url", help="Optional canonical source URL for the dataset."), version: str | None = typer.Option(None, "--version", help="Optional dataset version; defaults to unknown for unversioned local data."), modality: list[Modality] = typer.Option([], "--modality", help="Dataset modality (eeg, meg, ieeg, fmri, fnris, pet, smri, dmri, ephys, or other); repeat for multiple modalities."), storage_mode: StorageMode = typer.Option(StorageMode.REFERENCE, "--storage-mode", help="Reference files in place (default), move into managed storage, or copy into managed storage (leaves a duplicate; use only when SOURCE may be cleaned later).")):
     """Register an already-downloaded local dataset.
 
     SOURCE must be a directory. By default, its files remain in place and
@@ -89,6 +89,8 @@ def ingest_local_command(source: Path = typer.Argument(..., help="Existing local
     files under NDR_DATA_ROOT/datasets. Duplicate names or source URLs are
     rejected with the existing storage path. The created record is printed as JSON.
     """
+    if storage_mode is StorageMode.COPY:
+        console.print("[yellow]Warning: copy mode uses additional disk space because SOURCE and the managed copy are both retained. Use it only when SOURCE may be cleaned in the future.[/yellow]")
     console.print_json(
         data=dataset_dict(
             ingest_local(
@@ -115,4 +117,6 @@ def download(url: str = typer.Option(..., "--url", help="Provider dataset URL; t
     except RuntimeError as exc:
         console.print(f"[red]Download failed:[/red] {exc}")
         raise typer.Exit(code=1) from exc
+    if storage_mode is StorageMode.COPY:
+        console.print("[yellow]Warning: copy mode uses additional disk space because SOURCE and the managed copy are both retained. Use it only when SOURCE may be cleaned in the future.[/yellow]")
     console.print_json(data=dataset_dict(item))

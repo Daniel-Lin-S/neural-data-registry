@@ -39,9 +39,12 @@ class StorageMode(str, Enum):
         Keep files at their original path and record that path.
     move : str
         Move files into the registry's managed datasets directory.
+    copy : str
+        Copy files into managed storage while preserving the original source.
     """
     REFERENCE = "reference"
     MOVE = "move"
+    COPY = "copy"
 
 
 

@@ -98,7 +98,7 @@ brainctl ingest-local /data/legacy/things-meg \
 `--provider` accepts `openneuro`, `dandi`, `nemar`, `physionet`, `neurovault`, `kaggle`, or `other`; it defaults to `other`.
 `--url` records the canonical remote URL when one exists.
 Repeat `--modality` to register multiple modalities.
-By default (`--storage-mode reference`), the command leaves `SOURCE` where it is and records its absolute path. Use `--storage-mode move` to relocate `SOURCE` into `$NDR_DATA_ROOT/datasets`. (DO NOT use `move` mode if your source location is still used by other codes)
+By default (`--storage-mode reference`), the command leaves `SOURCE` where it is and records its absolute path. Use `--storage-mode move` to relocate `SOURCE` into `$NDR_DATA_ROOT/datasets`. Use `--storage-mode copy` to preserve `SOURCE` while creating a managed duplicate; this consumes additional disk space and should only be used when `SOURCE` may be cleaned in the future. (DO NOT use `move` mode if your source location is still used by other codes)
 Before validating or moving `SOURCE`, it rejects a duplicate canonical name or
 source URL/path and reports the existing storage path.
 
@@ -119,12 +119,11 @@ brainctl download --url "https://openneuro.org/datasets/ds007338/versions/1.0.0"
 `--url` is required. `--version` is optional only when an OpenNeuro URL contains a version such as `/versions/1.0.0`; otherwise provide it manually. An explicit `--version` may name a provider branch or tag.
 
 Install `neural-data-registry[download]` to enable downloads. Automatic downloads currently support OpenNeuro; DANDI, NEMAR, PhysioNet, NeuroVault, and Kaggle URLs are recognised but their download clients are not configured yet.
-Each attempt appends a log to `$NDR_DATA_ROOT/logs/download-*.log`, including the
-full DataLad stdout and stderr on failure. Rerun the same command to resume a valid
-partial DataLad workspace in `incoming`; an empty workspace is retried as a new clone.
 
+Each attempt appends a log to `$NDR_DATA_ROOT/logs/download-*.log`, including the full DataLad stdout and stderr on failure. Rerun the same command to resume a valid partial DataLad workspace in `incoming`; an empty workspace is retried as a new clone.
 
-The download command does not infer these fields from the provider URL: `--name` and at least one repeated `--modality` are required. The API uses required `name` and `modalities` fields for the same reason, so registered downloaded datasets always carry explicit metadata.
+The API uses required `name` and `modalities` fields for the same reason, so registered downloaded datasets always carry explicit metadata.
+
 Use `--proxy https://proxy.example:8080` to configure a download proxy. Use `--mirror https://mirror.example/{dataset_id}.git` (or a mirror base URL) to select a mirror URL. The API accepts the same `proxy` and `mirror` fields, and deployment defaults can be set with `NDR_DOWNLOAD_PROXY` and `NDR_DOWNLOAD_MIRROR`.
 
 ## API

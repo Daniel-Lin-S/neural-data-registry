@@ -12,7 +12,7 @@ from neural_data_registry.db.models import Dataset, DatasetAlias, IngestionJob
 from neural_data_registry.db.session import create_database, get_session_factory
 from neural_data_registry.enums import DatasetStatus, JobStatus, Modality, Provider, StorageMode, normalize_modalities
 from neural_data_registry.provider import download_from_url, provider_for_url
-from neural_data_registry.storage import dataset_destination, directory_size, ensure_layout, ingestion_lock, move_into_managed_storage, safe_component
+from neural_data_registry.storage import copy_into_managed_storage, dataset_destination, directory_size, ensure_layout, ingestion_lock, move_into_managed_storage, safe_component
 def _append_ingestion_log(path: Path, message: str) -> None:
     """Append one timestamped ingestion event to a persistent workspace log."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -165,6 +165,9 @@ def _ingest_local_locked(
         elif storage_mode == StorageMode.MOVE:
             managed_path = dataset_destination(item.id, name, version, config)
             move_into_managed_storage(source, managed_path)
+        elif storage_mode == StorageMode.COPY:
+            managed_path = dataset_destination(item.id, name, version, config)
+            copy_into_managed_storage(source, managed_path)
         else:
             raise ValueError(f"Unsupported storage mode: {storage_mode}")
         item.storage_path = str(managed_path)

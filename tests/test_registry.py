@@ -139,8 +139,8 @@ def test_cli_query_and_list(config, tmp_path, monkeypatch):
     )
     assert result.exit_code == 0
     assert "THINGS-MEG" in result.output
-    assert "Storage Mode" in result.output
-    assert "reference" in result.output
+    assert "Storage Mode" not in result.output
+    assert "reference" not in result.output
 
 
 def test_create_database_reconciles_missing_columns_across_registry(config):
@@ -256,7 +256,7 @@ def test_legacy_dataset_fields_are_preserved_but_do_not_block_new_rows(
     monkeypatch.setattr(cli, "console", cli.Console(width=160))
     result = CliRunner().invoke(cli.app, ["list"], terminal_width=160)
     assert result.exit_code == 0
-    assert "Storage Mode" in result.output
-    assert "reference" in result.output
+    assert "Storage Mode" not in result.output
+    assert "reference" not in result.output
     assert "retired_required_field" not in result.output
     assert "legacy-secret" not in result.output

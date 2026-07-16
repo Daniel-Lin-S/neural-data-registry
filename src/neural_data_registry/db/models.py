@@ -39,6 +39,7 @@ class Dataset(Base):
         SqlEnum(StorageMode, native_enum=False),
         default=StorageMode.REFERENCE,
         server_default=StorageMode.REFERENCE.name,
+        info={"cli_hidden": True},
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), info={"serialize": False}

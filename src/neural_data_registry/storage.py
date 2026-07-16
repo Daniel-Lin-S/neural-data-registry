@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, re, shutil
+import fcntl, os, re, shutil
 from contextlib import contextmanager
 from pathlib import Path
 from neural_data_registry.config import Settings, get_settings
@@ -15,7 +15,7 @@ def ensure_layout(config: Settings | None = None) -> None:
         Registry configuration.
     """
     config = config or get_settings()
-    for path in (config.datasets_dir, config.incoming_dir, config.quarantine_dir, config.registry_dir, config.logs_dir, config.ingestion_lock_dir): path.mkdir(parents=True, exist_ok=True)
+    for path in (config.datasets_dir, config.incoming_dir, config.quarantine_dir, config.registry_dir, config.logs_dir, config.ingestion_lock_dir, config.health_cooldown_dir): path.mkdir(parents=True, exist_ok=True)
 
 def directory_size(path: Path) -> int:
     return sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
@@ -29,6 +29,25 @@ def ingestion_lock(key: str, config: Settings | None = None):
     except FileExistsError as exc: raise IngestionConflictError(f"An ingestion for {key!r} is already running") from exc
     try: yield
     finally: shutil.rmtree(path, ignore_errors=True)
+
+
+@contextmanager
+def process_lock(key: str, config: Settings | None = None):
+    """Try to hold a process-safe registry lock without blocking."""
+    config = config or get_settings()
+    ensure_layout(config)
+    path = config.ingestion_lock_dir / f"{safe_component(key)}.process.lock"
+    with path.open("a+") as stream:
+        try:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
 
 def dataset_destination(dataset_id: str, name: str, version: str, config: Settings | None = None) -> Path:
     """Build the managed storage path for a dataset without creating it."""

@@ -6,6 +6,7 @@ from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel, Field
 
 from neural_data_registry.config import Settings
+from neural_data_registry.health import request_health_check
 from neural_data_registry.db.models import Dataset
 from neural_data_registry.enums import Modality, Provider, StorageMode
 from neural_data_registry.service import DatasetConflictError, dataset_dict, download, find_datasets, ingest_local, session
@@ -52,9 +53,9 @@ def create_app(config: Settings | None = None) -> FastAPI:
         return {"status": "ok"}
 
     @api.get("/datasets")
-    def datasets(query: str | None = None, url: str | None = None, modality: str | None = None, provider: str | None = None) -> list[dict]:
+    def datasets(query: str | None = None, url: str | None = None, modality: str | None = None, provider: str | None = None, show_all: bool = False) -> list[dict]:
         with session(config) as db:
-            return [dataset_dict(item) for item in find_datasets(db, query, url, modality, provider)]
+            return [dataset_dict(item) for item in find_datasets(db, query, url, modality, provider, show_all=show_all)]
 
     @api.get("/datasets/{dataset_id}")
     def dataset(dataset_id: str) -> dict:
@@ -62,7 +63,15 @@ def create_app(config: Settings | None = None) -> FastAPI:
             item = db.get(Dataset, dataset_id)
             if not item:
                 raise HTTPException(status_code=404, detail="Dataset not found")
-            return dataset_dict(item)
+        report = request_health_check(dataset_id, config)
+        with session(config) as db:
+            item = db.get(Dataset, dataset_id)
+            data = dataset_dict(item)
+        if report.warning:
+            data["health_warning"] = report.warning
+        if report.repair_in_progress:
+            data["repair_in_progress"] = True
+        return data
 
     @api.post("/ingest/local", status_code=201)
     def ingest_local_dataset(request: LocalIngestionRequest, response: Response) -> dict:

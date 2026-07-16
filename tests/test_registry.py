@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
 from unittest.mock import Mock
 
 import pytest
@@ -9,14 +10,20 @@ from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
 from neural_data_registry import cli
+from neural_data_registry import health as health_service
 from neural_data_registry.config import Settings, get_settings
-from neural_data_registry.db.models import Base, Dataset, IngestionJob
+from neural_data_registry.db.models import Base, Dataset, HealthCheckHistory, IngestionJob
 from neural_data_registry.db.session import create_database, get_session_factory
-from neural_data_registry.enums import Provider, StorageMode
+from neural_data_registry.enums import DatasetStatus, Provider, StorageMode
+from neural_data_registry.health import (
+    maybe_launch_cooldown_check,
+    request_health_check,
+    run_health_checks,
+)
 from neural_data_registry.main import create_app
 from neural_data_registry.provider import base as provider_base
 from neural_data_registry.service import download as download_dataset, resolve_download_version
-from neural_data_registry.storage import ensure_layout
+from neural_data_registry.storage import ensure_layout, process_lock
 from neural_data_registry.service import dataset_dict, find_datasets, ingest_local, session
 
 
@@ -218,6 +225,12 @@ def test_cli_query_and_list(config, tmp_path, monkeypatch):
     """Verify query and modality-list CLI commands render registered datasets."""
     item = ingest_mock(config, tmp_path)
     monkeypatch.setattr(cli, "session", lambda: session(config))
+    monkeypatch.setattr(cli, "maybe_launch_cooldown_check", lambda: False)
+    monkeypatch.setattr(
+        cli,
+        "request_health_check",
+        lambda dataset_id: request_health_check(dataset_id, config),
+    )
     monkeypatch.setattr(cli, "console", cli.Console(width=160))
     runner = CliRunner()
     query_result = runner.invoke(cli.app, ["query", "THINGS-MEG"])
@@ -516,3 +529,315 @@ def test_datalad_requires_git_annex(tmp_path, monkeypatch):
             "3.0.0",
             tmp_path / "incoming" / "dataset",
         )
+
+
+def register_dataset_path(config: Settings, path: Path, *, name: str = "Health fixture") -> Dataset:
+    """Register a row at an arbitrary path without mutating test data."""
+    create_database(config)
+    with session(config) as db:
+        item = Dataset(
+            name=name,
+            provider=Provider.LOCAL,
+            version="1",
+            modalities="meg",
+            size_bytes=0,
+            status=DatasetStatus.AVAILABLE,
+            storage_path=str(path),
+            storage_mode=StorageMode.REFERENCE,
+        )
+        db.add(item)
+        db.commit()
+        db.refresh(item)
+        return item
+
+
+def test_missing_health_check_logs_history_filters_and_recovers(config, tmp_path):
+    """Mark an absent path missing, warn through GET, and recover automatically."""
+    path = tmp_path / "later-restored"
+    item = register_dataset_path(config, path)
+
+    report = request_health_check(item.id, config)
+
+    assert report.status is DatasetStatus.MISSING
+    assert "does not exist" in report.warning
+    with session(config) as db:
+        stored = db.get(Dataset, item.id)
+        assert stored.status is DatasetStatus.MISSING
+        assert find_datasets(db) == []
+        assert [entry.id for entry in find_datasets(db, show_all=True)] == [item.id]
+        histories = db.query(HealthCheckHistory).filter_by(dataset_id=item.id).all()
+        assert histories[-1].result == "missing"
+        assert histories[-1].resulting_status is DatasetStatus.MISSING
+
+    log_path = config.logs_dir / "critical_errors.log"
+    assert item.id in log_path.read_text()
+    assert '"result": "missing"' in log_path.read_text()
+    assert '"status": "missing"' in (
+        config.registry_dir / f"{item.id}.json"
+    ).read_text()
+
+    client = TestClient(create_app(config))
+    assert client.get("/datasets").json() == []
+    shown = client.get("/datasets", params={"show_all": True}).json()
+    assert shown[0]["status"] == "missing"
+    response = client.get(f"/datasets/{item.id}")
+    assert response.status_code == 200
+    assert response.json()["status"] == "missing"
+    assert "health_warning" in response.json()
+
+    path.mkdir()
+    (path / "data.bin").write_bytes(b"restored")
+    recovered = request_health_check(item.id, config)
+    assert recovered.status is DatasetStatus.AVAILABLE
+    with session(config) as db:
+        assert db.get(Dataset, item.id).status is DatasetStatus.AVAILABLE
+        assert (
+            db.query(HealthCheckHistory).filter_by(dataset_id=item.id).count()
+            == 3
+        )
+
+
+def test_hidden_repository_metadata_does_not_count_as_payload(config, tmp_path):
+    """A directory containing only hidden metadata is still missing."""
+    path = tmp_path / "metadata-only"
+    (path / ".git" / "annex").mkdir(parents=True)
+    item = register_dataset_path(config, path, name="Metadata only")
+
+    report = request_health_check(item.id, config)
+
+    assert report.status is DatasetStatus.MISSING
+    assert "no non-hidden payload" in report.warning
+
+
+def test_datalad_check_repairs_missing_annex_content(config, tmp_path, monkeypatch):
+    """Verify, retrieve, and recheck a damaged DataLad checkout."""
+    source = mock_dataset(tmp_path, "datalad-repair")
+    (source / ".git" / "annex").mkdir(parents=True)
+    item = ingest_local(
+        source,
+        "Repairable DataLad",
+        Provider.OPENNEURO,
+        "https://openneuro.org/datasets/ds000001",
+        "1",
+        ["meg"],
+        config,
+    )
+    repaired = False
+    calls = []
+
+    def fake_run(command, **kwargs):
+        nonlocal repaired
+        calls.append(command)
+        if command[:2] == ["/usr/bin/datalad", "get"]:
+            repaired = True
+        missing = (
+            command[:2] == ["/usr/bin/git-annex", "find"] and not repaired
+        )
+        return subprocess.CompletedProcess(
+            command, 0, stdout="meg.fif\n" if missing else "", stderr=""
+        )
+
+    monkeypatch.setattr(
+        provider_base, "_find_command", lambda name: f"/usr/bin/{name}"
+    )
+    monkeypatch.setattr(health_service.subprocess, "run", fake_run)
+
+    assert run_health_checks([item.id], config) is True
+
+    assert ["/usr/bin/datalad", "get", "--recursive", "."] in calls
+    with session(config) as db:
+        stored = db.get(Dataset, item.id)
+        history = (
+            db.query(HealthCheckHistory)
+            .filter_by(dataset_id=item.id)
+            .order_by(HealthCheckHistory.started_at.desc())
+            .first()
+        )
+        assert stored.status is DatasetStatus.AVAILABLE
+        assert history.result == "healthy"
+        assert history.repair_attempted is True
+        assert history.repair_succeeded is True
+
+
+def test_datalad_network_failure_does_not_hide_known_local_damage(
+    config, tmp_path, monkeypatch
+):
+    """Keep locally missing content broken when its attempted retrieval fails."""
+    source = mock_dataset(tmp_path, "datalad-network-failure")
+    (source / ".git" / "annex").mkdir(parents=True)
+    item = ingest_local(
+        source,
+        "Broken DataLad",
+        Provider.OPENNEURO,
+        "https://openneuro.org/datasets/ds000002",
+        "1",
+        ["meg"],
+        config,
+    )
+
+    def fake_run(command, **kwargs):
+        if command[:2] == ["/usr/bin/datalad", "get"]:
+            return subprocess.CompletedProcess(
+                command, 1, stdout="", stderr="temporary network failure"
+            )
+        if command[:2] == ["/usr/bin/git-annex", "find"]:
+            return subprocess.CompletedProcess(
+                command, 0, stdout="meg.fif\n", stderr=""
+            )
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(
+        provider_base, "_find_command", lambda name: f"/usr/bin/{name}"
+    )
+    monkeypatch.setattr(health_service.subprocess, "run", fake_run)
+
+    run_health_checks([item.id], config)
+
+    with session(config) as db:
+        stored = db.get(Dataset, item.id)
+        history = db.query(HealthCheckHistory).filter_by(dataset_id=item.id).one()
+        assert stored.status is DatasetStatus.BROKEN
+        assert history.result == "broken"
+        assert history.repair_attempted is True
+        assert history.repair_succeeded is False
+        assert "network failure" in history.message
+    assert "network failure" in (
+        config.logs_dir / "critical_errors.log"
+    ).read_text()
+
+
+def test_query_defers_datalad_repair_to_background(config, tmp_path, monkeypatch):
+    """Return promptly and expose repair state without running DataLad inline."""
+    source = mock_dataset(tmp_path, "datalad-background")
+    (source / ".git" / "annex").mkdir(parents=True)
+    item = ingest_local(
+        source,
+        "Background DataLad",
+        Provider.OPENNEURO,
+        "https://openneuro.org/datasets/ds000003",
+        "1",
+        ["meg"],
+        config,
+    )
+    with session(config) as db:
+        stored = db.get(Dataset, item.id)
+        stored.status = DatasetStatus.BROKEN
+        db.commit()
+
+    launches = []
+    monkeypatch.setattr(
+        health_service,
+        "launch_health_worker",
+        lambda config, **kwargs: launches.append(kwargs) or True,
+    )
+    monkeypatch.setattr(
+        health_service.subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail("DataLad ran in the query process"),
+    )
+
+    report = request_health_check(item.id, config)
+
+    assert report.status is DatasetStatus.BROKEN
+    assert report.repair_in_progress is True
+    assert "try again later" in report.warning.lower()
+    assert launches[0]["dataset_id"] == item.id
+    with session(config) as db:
+        history = db.get(HealthCheckHistory, report.history_id)
+        assert history.result == "running"
+
+
+def test_global_health_worker_lock_skips_overlapping_check(config, tmp_path):
+    """Only one process may run deep checks at a time."""
+    path = mock_dataset(tmp_path, "lock-source")
+    item = register_dataset_path(config, path, name="Lock fixture")
+
+    with process_lock("registry-health-worker", config) as acquired:
+        assert acquired is True
+        assert run_health_checks([item.id], config) is False
+
+
+def test_first_invocation_health_scan_obeys_environment_cooldown(
+    config, tmp_path, monkeypatch
+):
+    """Launch one all-dataset worker per virtual environment per cooldown."""
+    launches = []
+    monkeypatch.setenv("VIRTUAL_ENV", str(tmp_path / "venv"))
+    monkeypatch.setattr(
+        health_service,
+        "launch_health_worker",
+        lambda config, **kwargs: launches.append(kwargs) or True,
+    )
+
+    assert maybe_launch_cooldown_check(config) is True
+    assert maybe_launch_cooldown_check(config) is False
+    assert launches == [{"all_datasets": True}]
+
+
+def test_cli_list_show_all_and_one_shot_health_command(
+    config, tmp_path, monkeypatch
+):
+    """Hide unhealthy rows by default and expose explicit health commands."""
+    item = register_dataset_path(config, tmp_path / "absent", name="Hidden missing")
+    request_health_check(item.id, config)
+    monkeypatch.setattr(cli, "session", lambda: session(config))
+    monkeypatch.setattr(cli, "maybe_launch_cooldown_check", lambda: False)
+    monkeypatch.setattr(cli, "console", cli.Console(width=160))
+    checked = []
+    monkeypatch.setattr(
+        cli, "run_health_checks", lambda ids=None: checked.append(ids) or True
+    )
+    runner = CliRunner()
+
+    hidden = runner.invoke(cli.app, ["list"], terminal_width=160)
+    shown = runner.invoke(cli.app, ["list", "--show-all"], terminal_width=160)
+    one_shot = runner.invoke(cli.app, ["health-check", item.id])
+
+    assert "Hidden missing" not in hidden.output
+    assert "Hidden missing" in shown.output
+    assert "missing" in shown.output
+    assert one_shot.exit_code == 0
+    assert "Health check found problems" in one_shot.output
+    assert "Hidden missing" in one_shot.output
+    assert "critical_errors.log" in one_shot.output
+    assert checked == [[item.id]]
+    assert cli._interval_seconds("24h") == 86400
+
+
+def test_annex_command_error_preserves_available_status(
+    config, tmp_path, monkeypatch
+):
+    """Do not classify command or repository failures as broken datasets."""
+    source = mock_dataset(tmp_path, "datalad-command-error")
+    (source / ".git" / "annex").mkdir(parents=True)
+    item = ingest_local(
+        source,
+        "DataLad command error",
+        Provider.OPENNEURO,
+        "https://openneuro.org/datasets/ds000004",
+        "1",
+        ["meg"],
+        config,
+    )
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        return subprocess.CompletedProcess(
+            command, 128, stdout="", stderr="fatal: damaged git metadata"
+        )
+
+    monkeypatch.setattr(
+        provider_base, "_find_command", lambda name: f"/usr/bin/{name}"
+    )
+    monkeypatch.setattr(health_service.subprocess, "run", fake_run)
+
+    run_health_checks([item.id], config)
+
+    assert calls == [["/usr/bin/git-annex", "find", "--not", "--in=here"]]
+    with session(config) as db:
+        stored = db.get(Dataset, item.id)
+        history = db.query(HealthCheckHistory).filter_by(dataset_id=item.id).one()
+        assert stored.status is DatasetStatus.AVAILABLE
+        assert history.result == "error"
+        assert history.resulting_status is DatasetStatus.AVAILABLE

@@ -1,9 +1,17 @@
 from __future__ import annotations
+import time
 from pathlib import Path
 from typing import Annotated
 import typer
 from rich.console import Console
 from rich.table import Table
+from neural_data_registry.config import get_settings
+from neural_data_registry.db.models import Dataset, HealthCheckHistory
+from neural_data_registry.health import (
+    maybe_launch_cooldown_check,
+    request_health_check,
+    run_health_checks,
+)
 from neural_data_registry.enums import Modality, Provider, StorageMode
 from neural_data_registry.service import (
     dataset_dict,
@@ -17,6 +25,18 @@ from neural_data_registry.service import (
 
 app = typer.Typer(help="Search, list, ingest, and download managed neuroscience datasets.", add_completion=False)
 console = Console()
+
+
+@app.callback()
+def startup_health_check(ctx: typer.Context) -> None:
+    """Launch the cooldown-limited health scan on normal CLI invocations."""
+    if ctx.invoked_subcommand in {"health-check", "health-scheduler"}:
+        return
+    try:
+        maybe_launch_cooldown_check()
+    except Exception:
+        # A best-effort startup check must not block normal registry commands.
+        return
 
 def format_size(size_bytes: int) -> str:
     """Convert bytes to a human-readable string."""
@@ -55,6 +75,32 @@ def display(items):
         )
     console.print(table)
 
+
+def _health_problems(dataset_ids: list[str]):
+    """Return the latest problem result for each dataset in a health run."""
+    if not dataset_ids:
+        return []
+    with session() as db:
+        datasets = {
+            item.id: item
+            for item in db.query(Dataset).filter(Dataset.id.in_(dataset_ids)).all()
+        }
+        histories = (
+            db.query(HealthCheckHistory)
+            .filter(HealthCheckHistory.dataset_id.in_(dataset_ids))
+            .order_by(HealthCheckHistory.started_at.desc(), HealthCheckHistory.id.desc())
+            .all()
+        )
+    latest = {}
+    for history in histories:
+        latest.setdefault(history.dataset_id, history)
+    return [
+        (datasets[dataset_id], history)
+        for dataset_id, history in latest.items()
+        if history.result in {"missing", "broken", "error"}
+        and dataset_id in datasets
+    ]
+
 @app.command()
 def query(
     query: Annotated[str | None, typer.Argument(help="Exact dataset ID, name, or source URL.")] = None,
@@ -69,17 +115,34 @@ def query(
         raise typer.BadParameter(str(exc)) from exc
     if item is None:
         raise typer.BadParameter("No dataset matched the supplied ID, name, or URL")
+    report = request_health_check(item.id)
+    if report.warning:
+        typer.echo(f"Warning: {report.warning}", err=True)
     if not item.storage_path:
         raise typer.BadParameter("The matched dataset has no storage path")
     console.print(Path(item.storage_path).expanduser().resolve())
+
+
 @app.command("list")
-def list_datasets(modality: Modality | None = typer.Option(None, "--modality", help="Restrict results to a modality, such as meg or eeg."), provider: Provider | None = typer.Option(None, "--provider", help="Restrict results to a provider.")):
+def list_datasets(
+    modality: Modality | None = typer.Option(None, "--modality", help="Restrict results to a modality, such as meg or eeg."),
+    provider: Provider | None = typer.Option(None, "--provider", help="Restrict results to a provider."),
+    show_all: bool = typer.Option(False, "--show-all", help="Include missing and broken datasets."),
+):
     """List registered datasets, optionally filtered by modality.
 
     The table contains dataset ID, name, provider, version, modalities, size,
     and current status.
     """
-    with session() as db: display(find_datasets(db, modality=modality.value if modality else None, provider=provider.value if provider else None))
+    with session() as db:
+        display(
+            find_datasets(
+                db,
+                modality=modality.value if modality else None,
+                provider=provider.value if provider else None,
+                show_all=show_all,
+            )
+        )
 @app.command("ingest-local")
 def ingest_local_command(source: Path = typer.Argument(..., help="Existing local dataset directory to register."), name: str = typer.Option(..., "--name", help="Canonical dataset name to register."), provider: Provider = typer.Option(Provider.OTHER, "--provider", help="Dataset provider: openneuro, dandi, nemar, physionet, neurovault, kaggle, or other."), url: str | None = typer.Option(None, "--url", help="Optional canonical source URL for the dataset."), version: str | None = typer.Option(None, "--version", help="Optional dataset version; defaults to unknown for unversioned local data."), modality: list[Modality] = typer.Option([], "--modality", help="Dataset modality (eeg, meg, ieeg, fmri, fnris, pet, smri, dmri, ephys, or other); repeat for multiple modalities."), storage_mode: StorageMode = typer.Option(StorageMode.REFERENCE, "--storage-mode", help="Reference files in place (default), move into managed storage, or copy into managed storage (leaves a duplicate; use only when SOURCE may be cleaned later).")):
     """Register an already-downloaded local dataset.
@@ -120,3 +183,67 @@ def download(url: str = typer.Option(..., "--url", help="Provider dataset URL; t
     if storage_mode is StorageMode.COPY:
         console.print("[yellow]Warning: copy mode uses additional disk space because SOURCE and the managed copy are both retained. Use it only when SOURCE may be cleaned in the future.[/yellow]")
     console.print_json(data=dataset_dict(item))
+
+
+def _interval_seconds(value: str) -> float:
+    """Parse scheduler intervals such as 30m, 24h, or 1d."""
+    units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    normalized = value.strip().lower()
+    if len(normalized) < 2 or normalized[-1] not in units:
+        raise typer.BadParameter("Interval must end in s, m, h, or d (for example 24h)")
+    try:
+        seconds = float(normalized[:-1]) * units[normalized[-1]]
+    except ValueError as exc:
+        raise typer.BadParameter(f"Invalid interval: {value}") from exc
+    if seconds <= 0:
+        raise typer.BadParameter("Interval must be greater than zero")
+    return seconds
+
+
+@app.command("health-check")
+def health_check_command(
+    dataset: Annotated[str | None, typer.Argument(help="Dataset ID, name, or URL.")] = None,
+    all_datasets: bool = typer.Option(False, "--all", help="Check every registered dataset."),
+):
+    """Run a one-shot health check, including DataLad repair when needed."""
+    if all_datasets == (dataset is not None):
+        raise typer.BadParameter("Provide exactly one DATASET or --all")
+    dataset_ids = None
+    if dataset is not None:
+        with session() as db:
+            item = resolve_dataset(db, dataset)
+        if item is None:
+            raise typer.BadParameter("No dataset matched the supplied identifier")
+        dataset_ids = [item.id]
+    else:
+        with session() as db:
+            dataset_ids = [item.id for item in db.query(Dataset).all()]
+    if not run_health_checks(dataset_ids):
+        console.print("[yellow]Skipped: another health worker is already running.[/yellow]")
+        raise typer.Exit(code=2)
+    problems = _health_problems(dataset_ids)
+    if not problems:
+        console.print("[green]Health check completed.[/green]")
+        return
+    console.print("[red]Health check found problems:[/red]")
+    for item, history in problems:
+        detail = history.message or "No further details were recorded."
+        console.print(f"[red]- {item.name} ({history.result}): {detail}[/red]")
+    log_path = get_settings().logs_dir / "critical_errors.log"
+    console.print(f"[red]See the critical error log: {log_path}[/red]")
+
+
+@app.command("health-scheduler")
+def health_scheduler_command(
+    interval: str = typer.Option("24h", "--interval", help="Delay between checks, such as 30m, 24h, or 1d."),
+):
+    """Run opt-in periodic all-dataset health checks until interrupted."""
+    seconds = _interval_seconds(interval)
+    console.print(f"Health scheduler started; interval={interval}.")
+    try:
+        while True:
+            if not run_health_checks():
+                console.print("[yellow]Skipped: another health worker is running.[/yellow]")
+            time.sleep(seconds)
+    except KeyboardInterrupt:
+        console.print("Health scheduler stopped.")

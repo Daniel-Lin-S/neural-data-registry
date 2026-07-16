@@ -13,12 +13,15 @@ class Provider(str, Enum):
     NEUROVAULT = "neurovault"
     NEMAR = "nemar"
     OTHER = "other"
+    LOCAL = "local"
 
 
 class DatasetStatus(str, Enum):
     """Lifecycle state of a registered dataset."""
     INGESTING = "ingesting"
     AVAILABLE = "available"
+    MISSING = "missing"
+    BROKEN = "broken"
     QUARANTINED = "quarantined"
     DEPRECATED = "deprecated"
 

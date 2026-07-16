@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import uuid4
 
-from sqlalchemy import DateTime, Enum as SqlEnum, ForeignKey, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import Boolean, DateTime, Enum as SqlEnum, ForeignKey, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from neural_data_registry.enums import DatasetStatus, JobStatus, Provider, StorageMode
@@ -75,3 +75,31 @@ class IngestionJob(Base):
     mode: Mapped[str] = mapped_column(String(32))
     message: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class HealthCheckHistory(Base):
+    """Audit record for one requested dataset health check."""
+
+    __tablename__ = "health_check_history"
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid4())
+    )
+    dataset_id: Mapped[str] = mapped_column(
+        ForeignKey("datasets.id"), index=True
+    )
+    result: Mapped[str] = mapped_column(String(32), default="running")
+    previous_status: Mapped[DatasetStatus] = mapped_column(
+        SqlEnum(DatasetStatus, native_enum=False)
+    )
+    resulting_status: Mapped[DatasetStatus | None] = mapped_column(
+        SqlEnum(DatasetStatus, native_enum=False), nullable=True
+    )
+    message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    repair_attempted: Mapped[bool] = mapped_column(Boolean, default=False)
+    repair_succeeded: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )

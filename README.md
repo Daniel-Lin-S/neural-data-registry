@@ -76,8 +76,35 @@ brainctl list --provider openneuro
 
 `--modality` accepts a value such as `MEG`, `EEG`, or `fMRI`;
 `--provider` accepts
-`openneuro`, `dandi`, `nemar`, `physionet`, `neurovault`, `kaggle`, or `other`. Omitting both lists every registry record.
-The summary includes dataset ID, name, provider, version, modalities, size, and status.
+`openneuro`, `dandi`, `nemar`, `physionet`, `neurovault`, `kaggle`, or `other`.
+Missing and broken datasets are hidden by default; use `brainctl list --show-all`
+to include every status. The summary includes dataset ID, name, provider, version,
+modalities, size, and status.
+
+### Health checks
+
+Run a synchronous one-shot check for one dataset or the entire registry:
+
+```bash
+brainctl health-check THINGS-MEG
+brainctl health-check --all
+```
+
+For opt-in recurring checks, run the long-lived scheduler:
+
+```bash
+brainctl health-scheduler --interval 24h
+```
+
+Intervals accept `s`, `m`, `h`, or `d` suffixes. The scheduler is not started or installed as a service automatically. Normal `brainctl` usage launches an all-dataset background scan at most once every 24 hours per virtual environment.
+
+Every check is stored in the SQL `health_check_history` table. Only missing, broken, or operational-error results are appended to `$NDR_DATA_ROOT/logs/critical_errors.log`. One global process lock prevents overlapping deep checks.
+
+For DataLad datasets, only files reported by `git annex find --not --in=here`
+cause a `BROKEN` status. Repository, tool, command, remote, and network errors
+are recorded but do not change the dataset status by themselves.
+
+Checks are automatically performed when `brainctl query` is called or `GET /datasets/{id}` is called.
 
 ### `brainctl ingest-local`
 

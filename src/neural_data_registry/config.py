@@ -40,6 +40,14 @@ class Settings(BaseSettings):
         default=None,
         description="Provider download mirror URL or template",
     )
+    health_check_cooldown_seconds: int = Field(
+        default=86400,
+        description="Minimum delay between first-invocation all-dataset checks",
+    )
+    health_command_timeout_seconds: int = Field(
+        default=1800,
+        description="Timeout for each background DataLad health command",
+    )
     @property
     def datasets_dir(self) -> Path:
         return self.data_root / "datasets"
@@ -64,6 +72,10 @@ class Settings(BaseSettings):
     @property
     def ingestion_lock_dir(self) -> Path:
         return self.registry_dir / "locks"
+
+    @property
+    def health_cooldown_dir(self) -> Path:
+        return self.registry_dir / "health-cooldowns"
 
     @property
     def resolved_database_url(self) -> str:

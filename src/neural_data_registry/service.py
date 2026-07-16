@@ -38,7 +38,7 @@ def session(config: Settings | None = None) -> Session:
     config = config or get_settings()
     create_database(config)
     return get_session_factory(config.resolved_database_url)()
-def find_datasets(db: Session, query: str | None = None, url: str | None = None, modality: str | None = None, provider: str | None = None) -> list[Dataset]:
+def find_datasets(db: Session, query: str | None = None, url: str | None = None, modality: str | None = None, provider: str | None = None, *, show_all: bool = False) -> list[Dataset]:
     """Return registered datasets matching the supplied filters.
 
     Parameters
@@ -54,6 +54,10 @@ def find_datasets(db: Session, query: str | None = None, url: str | None = None,
         Matching rows ordered newest first.
     """
     stmt = select(Dataset).order_by(Dataset.created_at.desc())
+    if not show_all:
+        stmt = stmt.where(
+            Dataset.status.notin_((DatasetStatus.MISSING, DatasetStatus.BROKEN))
+        )
     if url: stmt = stmt.outerjoin(DatasetAlias).where(or_(Dataset.source_url == url, DatasetAlias.value == url))
     if query:
         needle = f"%{query}%"; stmt = stmt.outerjoin(DatasetAlias).where(or_(Dataset.name.ilike(needle), DatasetAlias.value.ilike(needle)))

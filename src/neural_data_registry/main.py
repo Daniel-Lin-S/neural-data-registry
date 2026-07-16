@@ -15,7 +15,7 @@ class LocalIngestionRequest(BaseModel):
     """Request body for registering a local dataset."""
     source: Path
     name: str = Field(min_length=1)
-    provider: Provider = Provider.LOCAL
+    provider: Provider = Provider.OTHER
     url: str | None = None
     version: str | None = None
     modalities: list[Modality] = Field(default_factory=list)

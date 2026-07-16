@@ -70,7 +70,7 @@ def test_local_ingestion_references_mock_dataset_by_default(config, tmp_path):
 def test_local_ingestion_can_move_mock_dataset(config, tmp_path):
     """Ensure explicit move mode relocates files into the managed datasets tree."""
     source = mock_dataset(tmp_path, "move-source")
-    item = ingest_local(source, "MOVE-MEG", Provider.LOCAL, None, "1.0.0", ["MEG"], config, storage_mode="move")
+    item = ingest_local(source, "MOVE-MEG", Provider.OTHER, None, "1.0.0", ["MEG"], config, storage_mode="move")
     assert item.storage_mode.value == "move"
     assert not source.exists()
     assert Path(item.storage_path).is_relative_to(config.datasets_dir)
@@ -81,7 +81,7 @@ def test_rejects_repeated_name_with_existing_managed_path(config, tmp_path):
     """Reject a second dataset using the same name and point to the existing copy."""
     existing = ingest_mock(config, tmp_path)
     with pytest.raises(RuntimeError, match="dataset name is already registered") as error:
-        ingest_local(mock_dataset(tmp_path, "different-source"), "things-meg", Provider.LOCAL, None, "1.0.0", [], config)
+        ingest_local(mock_dataset(tmp_path, "different-source"), "things-meg", Provider.OTHER, None, "1.0.0", [], config)
     assert existing.id in str(error.value)
     assert existing.storage_path in str(error.value)
 
@@ -101,13 +101,13 @@ def test_ingest_preflights_conflicts_before_validating_the_source(config, tmp_pa
 
     with pytest.raises(RuntimeError, match="dataset name is already registered"):
         ingest_local(
-            missing_source, existing.name, Provider.LOCAL, None, "1.0.0", [], config
+            missing_source, existing.name, Provider.OTHER, None, "1.0.0", [], config
         )
     with pytest.raises(RuntimeError, match="source URL/path is already registered"):
         ingest_local(
             missing_source,
             "Different dataset",
-            Provider.LOCAL,
+            Provider.OTHER,
             existing.source_url,
             "1.0.0",
             [],
@@ -180,7 +180,7 @@ def test_download_api_conflict_is_preflighted(config, tmp_path, monkeypatch):
 def test_rejects_missing_local_source(config, tmp_path):
     """Reject ingestion requests whose declared local source does not exist."""
     with pytest.raises(ValueError, match="not a directory"):
-        ingest_local(tmp_path / "missing", "Missing", Provider.LOCAL, None, "1.0.0", [], config)
+        ingest_local(tmp_path / "missing", "Missing", Provider.OTHER, None, "1.0.0", [], config)
 
 
 def test_queries_by_name_url_and_modality(config, tmp_path):
@@ -322,7 +322,7 @@ def test_legacy_dataset_fields_are_preserved_but_do_not_block_new_rows(
     new_dataset = ingest_local(
         source,
         "New dataset",
-        Provider.LOCAL,
+        Provider.OTHER,
         None,
         "1",
         ["meg"],

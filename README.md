@@ -74,8 +74,9 @@ brainctl list --modality MEG
 brainctl list --provider openneuro
 ```
 
-`--modality` accepts a value such as `MEG`, `EEG`, or `fMRI`; `--provider` accepts
-`openneuro`, `dandi`, `nemar`, `physionet`, `neurovault`, `kaggle`, or `local`. Omitting both lists every registry record.
+`--modality` accepts a value such as `MEG`, `EEG`, or `fMRI`;
+`--provider` accepts
+`openneuro`, `dandi`, `nemar`, `physionet`, `neurovault`, `kaggle`, or `other`. Omitting both lists every registry record.
 The summary includes dataset ID, name, provider, version, modalities, size, and status.
 
 ### `brainctl ingest-local`
@@ -94,7 +95,7 @@ brainctl ingest-local /data/legacy/things-meg \
 ```
 
 `SOURCE` must be an existing directory. `--name` and `--version` are required.
-`--provider` accepts `openneuro`, `dandi`, `nemar`, `physionet`, `neurovault`, `kaggle`, or `local`; it defaults to `local`.
+`--provider` accepts `openneuro`, `dandi`, `nemar`, `physionet`, `neurovault`, `kaggle`, or `other`; it defaults to `other`.
 `--url` records the canonical remote URL when one exists.
 Repeat `--modality` to register multiple modalities.
 By default (`--storage-mode reference`), the command leaves `SOURCE` where it is and records its absolute path. Use `--storage-mode move` to relocate `SOURCE` into `$NDR_DATA_ROOT/datasets`. (DO NOT use `move` mode if your source location is still used by other codes)

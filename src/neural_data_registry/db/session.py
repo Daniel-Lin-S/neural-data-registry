@@ -9,11 +9,19 @@ from .models import Base
 
 @lru_cache(maxsize=8)
 def get_session_factory(database_url: str | None = None) -> sessionmaker[Session]:
+    """Return a cached SQLAlchemy session factory for a database URL."""
     url = database_url or get_settings().resolved_database_url
     engine = create_engine(url, connect_args={"check_same_thread": False} if url.startswith("sqlite") else {})
     return sessionmaker(engine, expire_on_commit=False)
 
 def create_database(config: Settings | None = None) -> None:
+    """Create or reconcile the registry schema without dropping stored fields.
+
+    Parameters
+    ----------
+    config : Settings or None, optional
+        Registry configuration.
+    """
     config = config or get_settings()
     config.registry_dir.mkdir(parents=True, exist_ok=True)
     factory = get_session_factory(config.resolved_database_url)
@@ -109,7 +117,12 @@ def _table_has_rows(connection: Connection, table_name: str) -> bool:
 
 
 def _rebuild_sqlite_table(connection: Connection, table, existing_columns) -> None:
-    """Relax retired fields to nullable while retaining their stored values."""
+    """Rebuild SQLite while preserving every existing column and value.
+
+    SQLite has limited ALTER TABLE support. The compatibility rebuild copies
+    all reflected columns, including columns no longer represented by the ORM,
+    so reconciliation never silently removes existing metadata.
+    """
     metadata = MetaData()
     for foreign_key in table.foreign_keys:
         foreign_key.column.table.to_metadata(metadata)

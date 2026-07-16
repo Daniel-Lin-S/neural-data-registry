@@ -1,6 +1,7 @@
 from __future__ import annotations
 from datetime import datetime
 from enum import Enum
+from typing import Sequence
 import json, shutil
 from pathlib import Path
 from sqlalchemy import func, or_, select
@@ -8,15 +9,41 @@ from sqlalchemy.orm import Session
 from neural_data_registry.config import Settings, get_settings
 from neural_data_registry.db.models import Dataset, DatasetAlias, IngestionJob
 from neural_data_registry.db.session import create_database, get_session_factory
-from neural_data_registry.enums import DatasetStatus, JobStatus, Provider, StorageMode, normalize_modalities
+from neural_data_registry.enums import DatasetStatus, JobStatus, Modality, Provider, StorageMode, normalize_modalities
 from neural_data_registry.provider import download_from_url, provider_for_url
 from neural_data_registry.storage import dataset_destination, directory_size, ensure_layout, ingestion_lock, move_into_managed_storage
 
 def session(config: Settings | None = None) -> Session:
+    """Open a session for the configured SQL database.
+
+    Parameters
+    ----------
+    config : Settings or None, optional
+        Registry configuration.
+
+    Returns
+    -------
+    sqlalchemy.orm.Session
+        Caller-owned database session.
+    """
     config = config or get_settings()
     create_database(config)
     return get_session_factory(config.resolved_database_url)()
 def find_datasets(db: Session, query: str | None = None, url: str | None = None, modality: str | None = None, provider: str | None = None) -> list[Dataset]:
+    """Return registered datasets matching the supplied filters.
+
+    Parameters
+    ----------
+    db : sqlalchemy.orm.Session
+        Open registry session.
+    query, url, modality, provider : str or None
+        Optional dataset search filters.
+
+    Returns
+    -------
+    list[Dataset]
+        Matching rows ordered newest first.
+    """
     stmt = select(Dataset).order_by(Dataset.created_at.desc())
     if url: stmt = stmt.outerjoin(DatasetAlias).where(or_(Dataset.source_url == url, DatasetAlias.value == url))
     if query:
@@ -45,7 +72,25 @@ def resolve_dataset(db: Session, identifier: str | None = None, *, name: str | N
     return matches[0] if matches else None
 
 
-def ingest_local(source: Path, name: str, provider: Provider, url: str | None, version: str | None, modalities: list[str], config: Settings | None = None, storage_mode: StorageMode = StorageMode.REFERENCE) -> Dataset:
+def ingest_local(source: Path, name: str, provider: Provider, url: str | None, version: str | None, modalities: Sequence[str | Modality], config: Settings | None = None, storage_mode: StorageMode = StorageMode.REFERENCE) -> Dataset:
+    """Register a local dataset as a new append-only registry row.
+
+    Parameters
+    ----------
+    source : pathlib.Path
+        Existing local dataset directory.
+    name, provider, url, version, modalities : object
+        Dataset identity and metadata.
+    config : Settings or None, optional
+        Registry configuration.
+    storage_mode : StorageMode
+        Reference the source or explicitly move it into managed storage.
+
+    Returns
+    -------
+    Dataset
+        The newly committed dataset row.
+    """
     config = config or get_settings()
     version = version or "unknown"
     modalities = normalize_modalities(modalities)
@@ -85,11 +130,27 @@ def ingest_local(source: Path, name: str, provider: Provider, url: str | None, v
             item.status = DatasetStatus.AVAILABLE
             job.status = JobStatus.SUCCEEDED
             db.commit(); db.refresh(item); (config.registry_dir / f"{item.id}.json").write_text(json.dumps(dataset_dict(item), indent=2), encoding="utf-8"); return item
-        except Exception as exc:
+        except Exception:
             db.rollback(); raise
         finally: db.close()
 
 def download(url: str, version: str, config: Settings | None = None) -> Dataset:
+    """Download and register one provider dataset.
+
+    Parameters
+    ----------
+    url : str
+        Supported provider URL.
+    version : str
+        Provider version or branch.
+    config : Settings or None, optional
+        Registry configuration.
+
+    Returns
+    -------
+    Dataset
+        Newly registered row.
+    """
     config = config or get_settings()
     provider = provider_for_url(url); source = config.staging_dir / f"download-{provider.value}-{version}"
     if source.exists(): raise RuntimeError(f"Staging directory already exists: {source}")
@@ -131,8 +192,20 @@ def _serialize_dataset_value(column, value):
     return value
 
 
-def dataset_dict(item: Dataset) -> dict:
-    """Serialize fields from the current Dataset model, excluding retired columns."""
+def dataset_dict(item: Dataset) -> dict[str, object]:
+    """Serialize current dataset fields without mutating the database.
+
+    Parameters
+    ----------
+    item : Dataset
+        Dataset row to serialize.
+
+    Returns
+    -------
+    dict[str, object]
+        Public current-model fields. Retired SQL columns remain stored but
+        are intentionally not exposed.
+    """
     return {
         output_name: _serialize_dataset_value(column, getattr(item, column.name))
         for column, output_name, _ in _dataset_output_columns()

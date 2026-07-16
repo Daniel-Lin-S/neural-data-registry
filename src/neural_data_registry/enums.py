@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from enum import Enum
+from typing import Sequence
 
 
 class Provider(str, Enum):
@@ -40,11 +41,6 @@ class StorageMode(str, Enum):
     MOVE = "move"
 
 
-class IngestMode(str, Enum):
-    """Supported ingestion workflows."""
-    LOCAL = "local"
-    DOWNLOAD = "download"
-
 
 class Modality(str, Enum):
     """Controlled modality vocabulary.
@@ -67,7 +63,7 @@ class Modality(str, Enum):
     OTHER = "other"
 
 
-def normalize_modalities(values: list[str | Modality]) -> list[str]:
+def normalize_modalities(values: Sequence[str | Modality]) -> list[str]:
     """Validate modality names and return unique lowercase values."""
     allowed = {item.value for item in Modality}
     normalized = {value.value if isinstance(value, Modality) else str(value).strip().lower() for value in values}

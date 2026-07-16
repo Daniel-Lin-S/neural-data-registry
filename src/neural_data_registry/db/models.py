@@ -9,10 +9,18 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from neural_data_registry.enums import DatasetStatus, JobStatus, Provider, StorageMode
 
 
-class Base(DeclarativeBase): pass
+class Base(DeclarativeBase):
+    """Base class for all registry database models."""
 
 
 class Dataset(Base):
+    """A dataset registered in the registry.
+
+    Notes
+    -----
+    Dataset rows are append-only in the service layer; no delete operation is
+    exposed, so registered data remains auditable for its lifetime.
+    """
     __tablename__ = "datasets"
     __table_args__ = (UniqueConstraint("provider", "source_url", "version", name="uq_dataset_source_version"),)
     id: Mapped[str] = mapped_column(
@@ -48,6 +56,7 @@ class Dataset(Base):
 
 
 class DatasetAlias(Base):
+    """An alternate identifier that resolves to a registered dataset."""
     __tablename__ = "dataset_aliases"
     __table_args__ = (UniqueConstraint("value", name="uq_dataset_alias_value"),)
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -58,6 +67,7 @@ class DatasetAlias(Base):
 
 
 class IngestionJob(Base):
+    """The audit record for one dataset ingestion attempt."""
     __tablename__ = "ingestion_jobs"
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
     dataset_id: Mapped[str | None] = mapped_column(ForeignKey("datasets.id"), nullable=True)

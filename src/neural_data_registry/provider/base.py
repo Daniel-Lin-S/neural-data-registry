@@ -6,6 +6,7 @@ from neural_data_registry.enums import Provider
 
 class ProviderDownloadError(RuntimeError): pass
 def provider_for_url(url: str) -> Provider:
+    """Identify the supported provider represented by a dataset URL."""
     host = urlparse(url).netloc.lower()
     if host.endswith("openneuro.org"): return Provider.OPENNEURO
     if host.endswith("dandiarchive.org"): return Provider.DANDI
@@ -13,6 +14,7 @@ def provider_for_url(url: str) -> Provider:
     raise ProviderDownloadError(f"Cannot identify a supported provider from URL: {url}")
 
 def download_from_url(url: str, version: str, destination: Path) -> Provider:
+    """Download a provider dataset into a staging destination."""
     provider = provider_for_url(url)
     if provider is not Provider.OPENNEURO: raise ProviderDownloadError(f"Automatic downloads for {provider.value} are not configured yet")
     match = re.search(r"/datasets/(ds\d+)", url)

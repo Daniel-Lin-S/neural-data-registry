@@ -12,6 +12,7 @@ from neural_data_registry.service import dataset_dict, download, find_datasets, 
 
 
 class LocalIngestionRequest(BaseModel):
+    """Request body for registering a local dataset."""
     source: Path
     name: str = Field(min_length=1)
     provider: Provider = Provider.LOCAL
@@ -22,12 +23,24 @@ class LocalIngestionRequest(BaseModel):
 
 
 class DownloadRequest(BaseModel):
+    """Request body for downloading and registering a provider dataset."""
     url: str
     version: str = "latest"
 
 
 def create_app(config: Settings | None = None) -> FastAPI:
-    """Create the API application, optionally with an isolated configuration."""
+    """Create the registry API application.
+
+    Parameters
+    ----------
+    config : Settings or None, optional
+        Configuration for the application and database.
+
+    Returns
+    -------
+    fastapi.FastAPI
+        Configured API application.
+    """
     api = FastAPI(title="Neural Data Registry", version="0.1.0")
 
     @api.get("/health")

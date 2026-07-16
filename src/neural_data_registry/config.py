@@ -8,6 +8,17 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
+    """Deployment settings for the registry.
+
+    Parameters
+    ----------
+    data_root : pathlib.Path
+        Root directory containing managed storage and the registry database.
+    database_url : str or None, optional
+        SQLAlchemy URL; defaults to SQLite below ``data_root``.
+    lock_timeout_seconds : int
+        Timeout reserved for ingestion coordination.
+    """
     model_config = SettingsConfigDict(env_file=".env", env_prefix="NDR_", extra="ignore")
 
     data_root: Path = Field(description="Root folder for managed dataset platform")

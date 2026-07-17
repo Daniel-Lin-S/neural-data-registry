@@ -1,5 +1,5 @@
 from __future__ import annotations
-import fcntl, os, re, shutil
+import fcntl, os, re, shutil, stat
 from contextlib import contextmanager
 from pathlib import Path
 from neural_data_registry.config import Settings, get_settings
@@ -18,7 +18,30 @@ def ensure_layout(config: Settings | None = None) -> None:
     for path in (config.datasets_dir, config.incoming_dir, config.quarantine_dir, config.registry_dir, config.logs_dir, config.ingestion_lock_dir, config.health_cooldown_dir): path.mkdir(parents=True, exist_ok=True)
 
 def directory_size(path: Path) -> int:
-    return sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
+    """Return logical file bytes below *path*, counting each inode once.
+
+    ``Path.stat`` follows file symlinks, which lets a DataLad checkout count
+    annexed content as payload. Tracking the resolved device/inode prevents
+    that content from being counted again through both its working-tree link
+    and its ``.git/annex/objects`` path. Dangling links are not payload.
+    """
+    total = 0
+    seen: set[tuple[int, int]] = set()
+    for item in path.rglob("*"):
+        try:
+            item_stat = item.stat()
+        except FileNotFoundError:
+            # A dangling link (or a file removed during traversal) contributes
+            # no readable payload.
+            continue
+        if not stat.S_ISREG(item_stat.st_mode):
+            continue
+        identity = (item_stat.st_dev, item_stat.st_ino)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        total += item_stat.st_size
+    return total
 def safe_component(value: str) -> str: return re.sub(r"[^a-zA-Z0-9._-]+", "-", value).strip(".-").lower() or "dataset"
 
 @contextmanager

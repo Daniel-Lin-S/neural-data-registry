@@ -18,7 +18,7 @@ from neural_data_registry.db.models import Dataset, HealthCheckHistory
 from neural_data_registry.db.session import create_database, get_session_factory
 from neural_data_registry.enums import DatasetStatus
 from neural_data_registry.provider import base as provider_base
-from neural_data_registry.storage import ensure_layout, process_lock
+from neural_data_registry.storage import directory_size, ensure_layout, process_lock
 
 
 @dataclass(frozen=True)
@@ -129,6 +129,50 @@ def _missing_reason(item: Dataset, path: Path | None) -> str | None:
     return None
 
 
+def _finish_healthy_with_size(
+    db,
+    item: Dataset,
+    history: HealthCheckHistory,
+    path: Path,
+    *,
+    message: str,
+    status: DatasetStatus,
+    config: Settings,
+    repair_attempted: bool = False,
+    repair_succeeded: bool | None = None,
+) -> HealthCheckReport:
+    """Persist a verified dataset's logical size before marking it healthy."""
+    try:
+        item.size_bytes = directory_size(path)
+    except OSError as exc:
+        error = f"Dataset size calculation failed: {exc}"
+        _finish_history(
+            db,
+            item,
+            history,
+            result="error",
+            message=error,
+            config=config,
+            repair_attempted=repair_attempted,
+            repair_succeeded=repair_succeeded,
+            log_problem=True,
+        )
+        return HealthCheckReport(item.id, item.status, history.id, warning=error)
+
+    _finish_history(
+        db,
+        item,
+        history,
+        result="healthy",
+        message=message,
+        status=status,
+        repair_attempted=repair_attempted,
+        repair_succeeded=repair_succeeded,
+        config=config,
+    )
+    return HealthCheckReport(item.id, item.status, history.id)
+
+
 def _load_history(db, item: Dataset, history_id: str | None) -> HealthCheckHistory:
     if history_id is None:
         return _new_history(item, db)
@@ -143,6 +187,7 @@ def _quick_check(
     config: Settings,
     *,
     history_id: str | None = None,
+    refresh_size: bool = False,
 ) -> tuple[HealthCheckReport, bool]:
     """Run path checks and return whether DataLad verification remains."""
     create_database(config)
@@ -182,6 +227,19 @@ def _quick_check(
                 if item.status in (DatasetStatus.MISSING, DatasetStatus.BROKEN)
                 else item.status
             )
+            if refresh_size:
+                return (
+                    _finish_healthy_with_size(
+                        db,
+                        item,
+                        history,
+                        path,
+                        message="Dataset path contains payload files.",
+                        status=status,
+                        config=config,
+                    ),
+                    False,
+                )
             _finish_history(
                 db,
                 item,
@@ -353,16 +411,15 @@ def _complete_datalad_check(
             return HealthCheckReport(item.id, item.status, history.id, warning=message)
 
         if not missing_files:
-            _finish_history(
+            return _finish_healthy_with_size(
                 db,
                 item,
                 history,
-                result="healthy",
+                path,
                 message="git-annex reports all annexed content is present locally.",
                 status=DatasetStatus.AVAILABLE,
                 config=config,
             )
-            return HealthCheckReport(item.id, item.status, history.id)
 
         examples = ", ".join(missing_files[:5])
         missing_message = f"Annexed content is not present locally: {examples}"
@@ -439,18 +496,17 @@ def _complete_datalad_check(
             return HealthCheckReport(item.id, item.status, history.id, warning=message)
 
         if not remaining:
-            _finish_history(
+            return _finish_healthy_with_size(
                 db,
                 item,
                 history,
-                result="healthy",
+                path,
                 message="DataLad repaired all locally missing annexed content.",
                 status=DatasetStatus.AVAILABLE,
                 repair_attempted=True,
                 repair_succeeded=True,
                 config=config,
             )
-            return HealthCheckReport(item.id, item.status, history.id)
 
         remaining_examples = ", ".join(remaining[:5])
         message = (
@@ -606,7 +662,9 @@ def run_health_checks(
                 db.close()
 
         for dataset_id in dataset_ids:
-            report, needs_datalad = _quick_check(dataset_id, config)
+            report, needs_datalad = _quick_check(
+                dataset_id, config, refresh_size=True
+            )
             if needs_datalad:
                 _complete_datalad_check(dataset_id, report.history_id, config)
         return True

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import subprocess
 from unittest.mock import Mock
 
@@ -28,7 +29,7 @@ from neural_data_registry.service import (
     resolve_dataset,
     resolve_download_version,
 )
-from neural_data_registry.storage import ensure_layout, process_lock
+from neural_data_registry.storage import directory_size, ensure_layout, process_lock
 from neural_data_registry.service import dataset_dict, find_datasets, ingest_local, session
 
 
@@ -987,4 +988,114 @@ def test_annex_command_error_preserves_available_status(
         history = db.query(HealthCheckHistory).filter_by(dataset_id=item.id).one()
         assert stored.status is DatasetStatus.AVAILABLE
         assert history.result == "error"
+
         assert history.resulting_status is DatasetStatus.AVAILABLE
+
+def test_directory_size_deduplicates_symlink_targets_and_ignores_broken_links(tmp_path):
+    """Count readable logical payload once even when it has multiple paths."""
+    source = tmp_path / "linked-payload"
+    source.mkdir()
+    annex = source / ".git" / "annex" / "objects"
+    annex.mkdir(parents=True)
+    payload = annex / "payload.bin"
+    payload.write_bytes(b"annex payload")
+    (source / "visible.bin").symlink_to(payload)
+    (source / "second.bin").write_bytes(b"other payload")
+    (source / "broken.bin").symlink_to(source / "missing.bin")
+
+    assert directory_size(source) == len(b"annex payload") + len(b"other payload")
+
+
+def test_ingestion_persists_inode_deduplicated_logical_size(config, tmp_path):
+    """Ingestion stores each git-annex payload once, not once per symlink."""
+    source = mock_dataset(tmp_path, "deduplicated-ingest")
+    annex = source / ".git" / "annex" / "objects"
+    annex.mkdir(parents=True)
+    payload = annex / "payload.bin"
+    payload.write_bytes(b"annex payload")
+    (source / "visible.bin").symlink_to(payload)
+
+    item = ingest_local(
+        source, "Deduplicated ingest", Provider.OTHER, None, "1", ["meg"], config
+    )
+
+    assert item.size_bytes == directory_size(source)
+
+
+def test_worker_health_check_refreshes_stale_size_and_manifest(config, tmp_path):
+    """Deep health checks backfill logical sizes for registered datasets."""
+    source = mock_dataset(tmp_path, "size-backfill")
+    item = ingest_local(source, "Size backfill", Provider.OTHER, None, "1", ["meg"], config)
+    expected_size = directory_size(source)
+    with session(config) as db:
+        stored = db.get(Dataset, item.id)
+        stored.size_bytes = 1
+        db.commit()
+
+    assert run_health_checks([item.id], config) is True
+    with session(config) as db:
+        stored = db.get(Dataset, item.id)
+        assert stored.size_bytes == expected_size
+    manifest = json.loads((config.registry_dir / f"{item.id}.json").read_text())
+    assert manifest["size_bytes"] == expected_size
+
+
+def test_query_time_health_check_does_not_recalculate_size(config, tmp_path, monkeypatch):
+    """Fast query checks retain their status-only behavior."""
+    source = mock_dataset(tmp_path, "query-size")
+    item = ingest_local(source, "Query size", Provider.OTHER, None, "1", ["meg"], config)
+
+    def fail_size_scan(path):
+        raise AssertionError(f"unexpected size scan for {path}")
+
+    monkeypatch.setattr(health_service, "directory_size", fail_size_scan)
+    report = request_health_check(item.id, config)
+    assert report.status is DatasetStatus.AVAILABLE
+
+
+def test_health_size_failure_preserves_existing_size_and_availability(config, tmp_path, monkeypatch):
+    """A failed worker scan reports an error without mutating dataset availability."""
+    source = mock_dataset(tmp_path, "size-failure")
+    item = ingest_local(source, "Size failure", Provider.OTHER, None, "1", ["meg"], config)
+    with session(config) as db:
+        stored = db.get(Dataset, item.id)
+        stored.size_bytes = 123
+        db.commit()
+
+    def fail_size_scan(path):
+        raise OSError("read failure")
+
+    monkeypatch.setattr(health_service, "directory_size", fail_size_scan)
+    assert run_health_checks([item.id], config) is True
+    with session(config) as db:
+        stored = db.get(Dataset, item.id)
+        history = db.query(HealthCheckHistory).filter_by(dataset_id=item.id).one()
+        assert stored.size_bytes == 123
+        assert stored.status is DatasetStatus.AVAILABLE
+        assert history.result == "error"
+    manifest = json.loads((config.registry_dir / f"{item.id}.json").read_text())
+    assert manifest["size_bytes"] == 123
+
+
+def test_successful_datalad_health_check_refreshes_size(config, tmp_path, monkeypatch):
+    """Verified DataLad datasets receive the same worker-only size refresh."""
+    source = mock_dataset(tmp_path, "datalad-size")
+    (source / ".git" / "annex").mkdir(parents=True)
+    item = ingest_local(source, "DataLad size", Provider.OPENNEURO, "https://openneuro.org/datasets/ds000005", "1", ["meg"], config)
+    expected_size = directory_size(source)
+    with session(config) as db:
+        stored = db.get(Dataset, item.id)
+        stored.size_bytes = 1
+        db.commit()
+
+    def fake_run(command, **kwargs):
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(provider_base, "_find_command", lambda name: "/usr/bin/git-annex")
+    monkeypatch.setattr(health_service.subprocess, "run", fake_run)
+    assert run_health_checks([item.id], config) is True
+    with session(config) as db:
+        stored = db.get(Dataset, item.id)
+        history = db.query(HealthCheckHistory).filter_by(dataset_id=item.id).one()
+        assert stored.size_bytes == expected_size
+        assert history.result == "healthy"

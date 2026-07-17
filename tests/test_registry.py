@@ -22,7 +22,12 @@ from neural_data_registry.health import (
 )
 from neural_data_registry.main import create_app
 from neural_data_registry.provider import base as provider_base
-from neural_data_registry.service import download as download_dataset, resolve_download_version
+from neural_data_registry.service import (
+    add_name_aliases,
+    download as download_dataset,
+    resolve_dataset,
+    resolve_download_version,
+)
 from neural_data_registry.storage import ensure_layout, process_lock
 from neural_data_registry.service import dataset_dict, find_datasets, ingest_local, session
 
@@ -200,6 +205,103 @@ def test_queries_by_name_url_and_modality(config, tmp_path):
         assert find_datasets(db, query="absent") == []
 
 
+
+def test_name_aliases_are_searchable_and_protected_during_local_intake(config, tmp_path):
+    """Record intake aliases, resolve them, and reserve them as dataset names."""
+    item = ingest_local(
+        mock_dataset(tmp_path, "alias-source"),
+        "THINGS-MEG",
+        Provider.OPENNEURO,
+        "https://openneuro.org/datasets/ds004212",
+        "3.0.0",
+        ["meg"],
+        config,
+        name_aliases=["THINGS", "THINGS vision"],
+    )
+
+    assert dataset_dict(item)["aliases"] == ["THINGS", "THINGS vision"]
+    with session(config) as db:
+        assert [row.id for row in find_datasets(db, query="vision")] == [item.id]
+        assert resolve_dataset(db, name="things") is not None
+        assert resolve_dataset(db, "THINGS vision").id == item.id
+
+    duplicate_source = tmp_path / "must-not-be-read"
+    with pytest.raises(RuntimeError, match="dataset name is already registered"):
+        ingest_local(
+            duplicate_source,
+            "things",
+            Provider.OTHER,
+            None,
+            "1",
+            [],
+            config,
+        )
+    assert not duplicate_source.exists()
+
+
+def test_existing_dataset_alias_command_and_list_search(config, tmp_path, monkeypatch):
+    """Add aliases after registration and use them through brainctl list."""
+    item = ingest_mock(config, tmp_path)
+    updated = add_name_aliases(item.id, ["Things dataset", "Visual things"], config)
+    assert dataset_dict(updated)["aliases"] == ["Things dataset", "Visual things"]
+
+    monkeypatch.setattr(cli, "session", lambda: session(config))
+    monkeypatch.setattr(cli, "add_name_aliases", lambda identifier, aliases: add_name_aliases(identifier, aliases, config))
+    monkeypatch.setattr(cli, "maybe_launch_cooldown_check", lambda: False)
+    monkeypatch.setattr(cli, "console", cli.Console(width=160))
+    runner = CliRunner()
+
+    result = runner.invoke(cli.app, ["list", "--query", "visual"], terminal_width=160)
+    assert result.exit_code == 0
+    assert "THINGS-MEG" in result.output
+
+    added = runner.invoke(cli.app, ["alias", item.id, "--alias", "MEG things"])
+    assert added.exit_code == 0
+    assert "MEG things" in added.output
+    with session(config) as db:
+        assert resolve_dataset(db, "meg THINGS").id == item.id
+
+
+def test_aliases_can_be_provided_to_download(config, monkeypatch):
+    """Persist aliases supplied before a download begins."""
+    def fake_download(url, version, destination, **kwargs):
+        (destination / "meg.fif").write_bytes(b"mock meg data")
+
+    monkeypatch.setattr("neural_data_registry.service.download_from_url", fake_download)
+    item = download_dataset(
+        "https://openneuro.org/datasets/ds004212",
+        "3.0.0",
+        config,
+        name="THINGS-MEG",
+        modalities=["meg"],
+        name_aliases=["THINGS", "Object vision"],
+    )
+
+    assert dataset_dict(item)["aliases"] == ["Object vision", "THINGS"]
+    with session(config) as db:
+        assert [row.id for row in find_datasets(db, query="object")] == [item.id]
+
+
+def test_aliases_are_accepted_by_intake_api(config, tmp_path):
+    """Keep API and CLI/local intake metadata equivalent."""
+    source = mock_dataset(tmp_path, "api-alias-source")
+    response = TestClient(create_app(config)).post(
+        "/ingest/local",
+        json={
+            "source": str(source),
+            "name": "API aliases",
+            "version": "1",
+            "modalities": ["meg"],
+            "aliases": ["API alias"],
+        },
+    )
+
+    assert response.status_code == 201
+    assert response.json()["aliases"] == ["API alias"]
+    found = TestClient(create_app(config)).get("/datasets", params={"query": "alias"})
+    assert [row["dataset_id"] for row in found.json()] == [response.json()["dataset_id"]]
+
+
 def test_all_core_api_routes(config, tmp_path):
     """Exercise health, dataset lookup, local-ingest, duplicate, and error API responses."""
     client = TestClient(create_app(config))
@@ -364,6 +466,51 @@ def test_legacy_dataset_fields_are_preserved_but_do_not_block_new_rows(
     assert "reference" not in result.output
     assert "retired_required_field" not in result.output
     assert "legacy-secret" not in result.output
+
+
+
+def test_aliases_upgrade_a_legacy_dataset_without_removing_metadata(config):
+    """Create the alias table for an old registry while preserving its values."""
+    config.registry_dir.mkdir(parents=True)
+    engine = get_session_factory(config.resolved_database_url).kw["bind"]
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            """
+            CREATE TABLE datasets (
+                id VARCHAR(36) NOT NULL PRIMARY KEY,
+                name VARCHAR(255) NOT NULL,
+                provider VARCHAR(9) NOT NULL,
+                source_url VARCHAR(2048),
+                version VARCHAR(128) NOT NULL DEFAULT 'unknown',
+                modalities TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                status VARCHAR(11) NOT NULL,
+                storage_path TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP NOT NULL
+            )
+            """
+        )
+        connection.exec_driver_sql(
+            """
+            INSERT INTO datasets (
+                id, name, provider, source_url, version, modalities,
+                size_bytes, status, storage_path
+            ) VALUES (
+                'legacy-alias-id', 'Legacy alias dataset', 'LOCAL',
+                'file:///legacy', '1', 'meg', 7, 'AVAILABLE', '/legacy'
+            )
+            """
+        )
+
+    create_database(config)
+    updated = add_name_aliases("legacy-alias-id", ["Legacy MEG"], config)
+
+    assert dataset_dict(updated)["aliases"] == ["Legacy MEG"]
+    with session(config) as db:
+        legacy = resolve_dataset(db, "legacy meg")
+        assert legacy is not None
+        assert legacy.source_url == "file:///legacy"
+        assert legacy.storage_path == "/legacy"
 
 
 def test_layout_consolidates_download_workspace_in_incoming(config):

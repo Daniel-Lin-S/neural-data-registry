@@ -20,6 +20,7 @@ class LocalIngestionRequest(BaseModel):
     url: str | None = None
     version: str | None = None
     modalities: list[Modality] = Field(default_factory=list)
+    aliases: list[str] = Field(default_factory=list)
     storage_mode: StorageMode = StorageMode.REFERENCE
 
 
@@ -29,6 +30,7 @@ class DownloadRequest(BaseModel):
     version: str | None = None
     name: str = Field(min_length=1)
     modalities: list[Modality] = Field(min_length=1)
+    aliases: list[str] = Field(default_factory=list)
     proxy: str | None = None
     mirror: str | None = None
 
@@ -81,6 +83,7 @@ def create_app(config: Settings | None = None) -> FastAPI:
             item = ingest_local(
                 request.source, request.name, request.provider, request.url,
                 request.version, request.modalities, config, request.storage_mode,
+                name_aliases=request.aliases,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -90,7 +93,7 @@ def create_app(config: Settings | None = None) -> FastAPI:
     @api.post("/download", status_code=202)
     def download_dataset(request: DownloadRequest) -> dict:
         try:
-            return dataset_dict(download(request.url, request.version, config, name=request.name, modalities=request.modalities, proxy=request.proxy, mirror=request.mirror))
+            return dataset_dict(download(request.url, request.version, config, name=request.name, modalities=request.modalities, proxy=request.proxy, mirror=request.mirror, name_aliases=request.aliases))
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except DatasetConflictError as exc:

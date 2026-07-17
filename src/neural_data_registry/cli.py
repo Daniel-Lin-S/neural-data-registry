@@ -14,6 +14,7 @@ from neural_data_registry.health import (
 )
 from neural_data_registry.enums import Modality, Provider, StorageMode
 from neural_data_registry.service import (
+    add_name_aliases,
     dataset_dict,
     dataset_output_fields,
     download as download_dataset,
@@ -125,6 +126,7 @@ def query(
 
 @app.command("list")
 def list_datasets(
+    query: str | None = typer.Option(None, "--query", "-q", help="Search canonical dataset names and user aliases."),
     modality: Modality | None = typer.Option(None, "--modality", help="Restrict results to a modality, such as meg or eeg."),
     provider: Provider | None = typer.Option(None, "--provider", help="Restrict results to a provider."),
     show_all: bool = typer.Option(False, "--show-all", help="Include missing and broken datasets."),
@@ -138,13 +140,14 @@ def list_datasets(
         display(
             find_datasets(
                 db,
+                query=query,
                 modality=modality.value if modality else None,
                 provider=provider.value if provider else None,
                 show_all=show_all,
             )
         )
 @app.command("ingest-local")
-def ingest_local_command(source: Path = typer.Argument(..., help="Existing local dataset directory to register."), name: str = typer.Option(..., "--name", help="Canonical dataset name to register."), provider: Provider = typer.Option(Provider.OTHER, "--provider", help="Dataset provider: openneuro, dandi, nemar, physionet, neurovault, kaggle, or other."), url: str | None = typer.Option(None, "--url", help="Optional canonical source URL for the dataset."), version: str | None = typer.Option(None, "--version", help="Optional dataset version; defaults to unknown for unversioned local data."), modality: list[Modality] = typer.Option([], "--modality", help="Dataset modality (eeg, meg, ieeg, fmri, fnris, pet, smri, dmri, ephys, or other); repeat for multiple modalities."), storage_mode: StorageMode = typer.Option(StorageMode.REFERENCE, "--storage-mode", help="Reference files in place (default), move into managed storage, or copy into managed storage (leaves a duplicate; use only when SOURCE may be cleaned later).")):
+def ingest_local_command(source: Path = typer.Argument(..., help="Existing local dataset directory to register."), name: str = typer.Option(..., "--name", help="Canonical dataset name to register."), alias: list[str] = typer.Option([], "--alias", help="Searchable alternate dataset name; repeat for multiple aliases."), provider: Provider = typer.Option(Provider.OTHER, "--provider", help="Dataset provider: openneuro, dandi, nemar, physionet, neurovault, kaggle, or other."), url: str | None = typer.Option(None, "--url", help="Optional canonical source URL for the dataset."), version: str | None = typer.Option(None, "--version", help="Optional dataset version; defaults to unknown for unversioned local data."), modality: list[Modality] = typer.Option([], "--modality", help="Dataset modality (eeg, meg, ieeg, fmri, fnris, pet, smri, dmri, ephys, or other); repeat for multiple modalities."), storage_mode: StorageMode = typer.Option(StorageMode.REFERENCE, "--storage-mode", help="Reference files in place (default), move into managed storage, or copy into managed storage (leaves a duplicate; use only when SOURCE may be cleaned later).")):
     """Register an already-downloaded local dataset.
 
     SOURCE must be a directory. By default, its files remain in place and
@@ -164,11 +167,12 @@ def ingest_local_command(source: Path = typer.Argument(..., help="Existing local
                 version,
                 [item.value for item in modality],
                 storage_mode=storage_mode,
+                name_aliases=alias,
             )
         )
     )
 @app.command()
-def download(url: str = typer.Option(..., "--url", help="Provider dataset URL; the provider is detected from its host."), name: str = typer.Option(..., "--name", help="Dataset name to register."), modality: list[Modality] = typer.Option(..., "--modality", help="Dataset modality; repeat for multiple modalities."), version: str | None = typer.Option(None, "--version", help="Version or branch; required unless an OpenNeuro URL contains /versions/x.y.z."), proxy: str | None = typer.Option(None, "--proxy", help="Proxy URL for this download."), mirror: str | None = typer.Option(None, "--mirror", help="Mirror URL, URL base, or template containing {dataset_id}.")):
+def download(url: str = typer.Option(..., "--url", help="Provider dataset URL; the provider is detected from its host."), name: str = typer.Option(..., "--name", help="Dataset name to register."), alias: list[str] = typer.Option([], "--alias", help="Searchable alternate dataset name; repeat for multiple aliases."), modality: list[Modality] = typer.Option(..., "--modality", help="Dataset modality; repeat for multiple modalities."), version: str | None = typer.Option(None, "--version", help="Version or branch; required unless an OpenNeuro URL contains /versions/x.y.z."), proxy: str | None = typer.Option(None, "--proxy", help="Proxy URL for this download."), mirror: str | None = typer.Option(None, "--mirror", help="Mirror URL, URL base, or template containing {dataset_id}.")):
     """Download a supported provider dataset and ingest it automatically.
 
     NAME and at least one --modality are required so the registry record has
@@ -176,12 +180,23 @@ def download(url: str = typer.Option(..., "--url", help="Provider dataset URL; t
     DataLad-backed downloads. Failed downloads remain in NDR_DATA_ROOT/incoming.
     """
     try:
-        item = download_dataset(url, version, name=name, modalities=[item.value for item in modality], proxy=proxy, mirror=mirror)
+        item = download_dataset(url, version, name=name, modalities=[item.value for item in modality], proxy=proxy, mirror=mirror, name_aliases=alias)
     except RuntimeError as exc:
         console.print(f"[red]Download failed:[/red] {exc}")
         raise typer.Exit(code=1) from exc
-    if storage_mode is StorageMode.COPY:
-        console.print("[yellow]Warning: copy mode uses additional disk space because SOURCE and the managed copy are both retained. Use it only when SOURCE may be cleaned in the future.[/yellow]")
+    console.print_json(data=dataset_dict(item))
+
+
+@app.command("alias")
+def add_alias_command(
+    dataset: Annotated[str, typer.Argument(help="Dataset ID, canonical name, existing alias, or source URL.")],
+    alias: list[str] = typer.Option(..., "--alias", help="Searchable alternate dataset name; repeat for multiple aliases."),
+):
+    """Add searchable name aliases to an existing dataset."""
+    try:
+        item = add_name_aliases(dataset, alias)
+    except (ValueError, RuntimeError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
     console.print_json(data=dataset_dict(item))
 
 

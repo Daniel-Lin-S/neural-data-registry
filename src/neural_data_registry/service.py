@@ -13,6 +13,11 @@ from neural_data_registry.db.session import create_database, get_session_factory
 from neural_data_registry.enums import DatasetStatus, JobStatus, Modality, Provider, StorageMode, normalize_modalities
 from neural_data_registry.provider import download_from_url, provider_for_url
 from neural_data_registry.storage import copy_into_managed_storage, dataset_destination, directory_size, ensure_layout, ingestion_lock, move_into_managed_storage, safe_component
+
+
+CANONICAL_NAME_ALIAS_KIND = "name"
+USER_NAME_ALIAS_KIND = "name_alias"
+NAME_ALIAS_KINDS = (CANONICAL_NAME_ALIAS_KIND, USER_NAME_ALIAS_KIND)
 def _append_ingestion_log(path: Path, message: str) -> None:
     """Append one timestamped ingestion event to a persistent workspace log."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -39,47 +44,60 @@ def session(config: Settings | None = None) -> Session:
     create_database(config)
     return get_session_factory(config.resolved_database_url)()
 def find_datasets(db: Session, query: str | None = None, url: str | None = None, modality: str | None = None, provider: str | None = None, *, show_all: bool = False) -> list[Dataset]:
-    """Return registered datasets matching the supplied filters.
-
-    Parameters
-    ----------
-    db : sqlalchemy.orm.Session
-        Open registry session.
-    query, url, modality, provider : str or None
-        Optional dataset search filters.
-
-    Returns
-    -------
-    list[Dataset]
-        Matching rows ordered newest first.
-    """
+    """Return registered datasets matching the supplied filters."""
     stmt = select(Dataset).order_by(Dataset.created_at.desc())
     if not show_all:
         stmt = stmt.where(
             Dataset.status.notin_((DatasetStatus.MISSING, DatasetStatus.BROKEN))
         )
-    if url: stmt = stmt.outerjoin(DatasetAlias).where(or_(Dataset.source_url == url, DatasetAlias.value == url))
+    if url:
+        stmt = stmt.outerjoin(DatasetAlias).where(
+            or_(
+                Dataset.source_url == url,
+                and_(DatasetAlias.kind.in_(("url", "path")), DatasetAlias.value == url),
+            )
+        )
     if query:
-        needle = f"%{query}%"; stmt = stmt.outerjoin(DatasetAlias).where(or_(Dataset.name.ilike(needle), DatasetAlias.value.ilike(needle)))
-    if modality: stmt = stmt.where(Dataset.modalities.ilike(f"%{modality}%"))
+        needle = f"%{query}%"
+        stmt = stmt.outerjoin(DatasetAlias).where(
+            or_(
+                Dataset.name.ilike(needle),
+                and_(DatasetAlias.kind.in_(NAME_ALIAS_KINDS), DatasetAlias.value.ilike(needle)),
+            )
+        )
+    if modality:
+        stmt = stmt.where(Dataset.modalities.ilike(f"%{modality}%"))
     if provider:
         provider_value = Provider(provider).name if isinstance(provider, str) else provider
         stmt = stmt.where(Dataset.provider == provider_value)
     return list(db.scalars(stmt.distinct()))
 
+
 def resolve_dataset(db: Session, identifier: str | None = None, *, name: str | None = None, url: str | None = None) -> Dataset | None:
-    """Resolve one dataset by its unique ID, name, or source URL."""
+    """Resolve one dataset by its unique ID, canonical name, alias, or source URL."""
     values = [value for value in (identifier, name, url) if value]
     if len(values) != 1:
         raise ValueError("Provide exactly one dataset id, name, or URL")
     value = values[0]
     if identifier:
-        conditions = [Dataset.id == value, func.lower(Dataset.name) == value.casefold(), Dataset.source_url == value]
+        conditions = [
+            Dataset.id == value,
+            func.lower(Dataset.name) == value.casefold(),
+            Dataset.source_url == value,
+            and_(DatasetAlias.kind.in_(NAME_ALIAS_KINDS), func.lower(DatasetAlias.value) == value.casefold()),
+            and_(DatasetAlias.kind.in_(("url", "path")), DatasetAlias.value == value),
+        ]
     elif name:
-        conditions = [func.lower(Dataset.name) == value.casefold()]
+        conditions = [
+            func.lower(Dataset.name) == value.casefold(),
+            and_(DatasetAlias.kind.in_(NAME_ALIAS_KINDS), func.lower(DatasetAlias.value) == value.casefold()),
+        ]
     else:
-        conditions = [Dataset.source_url == value]
-    matches = list(db.scalars(select(Dataset).where(or_(*conditions))))
+        conditions = [
+            Dataset.source_url == value,
+            and_(DatasetAlias.kind.in_(("url", "path")), DatasetAlias.value == value),
+        ]
+    matches = list(db.scalars(select(Dataset).outerjoin(DatasetAlias).where(or_(*conditions)).distinct()))
     if len(matches) > 1:
         raise ValueError(f"Dataset identifier is ambiguous: {value}")
     return matches[0] if matches else None
@@ -91,14 +109,77 @@ class DatasetConflictError(RuntimeError):
 
 
 
-def _raise_if_dataset_identity_conflicts(
-    db: Session, name: str, source_reference: str | None
+def _raise_dataset_conflict(existing: Dataset, identity: str) -> None:
+    raise DatasetConflictError(
+        f"Ingestion rejected: dataset {identity} is already registered as "
+        f"{existing.id} ({existing.name} {existing.version}). "
+        f"Existing storage path: {existing.storage_path}"
+    )
+
+
+def _normalize_name_aliases(
+    aliases: Sequence[str], canonical_name: str | None = None
+) -> list[str]:
+    """Normalize user-provided aliases while retaining their display spelling."""
+    normalized: list[str] = []
+    seen: set[str] = set()
+    canonical = canonical_name.casefold() if canonical_name else None
+    for raw_alias in aliases:
+        alias = raw_alias.strip()
+        if not alias:
+            raise ValueError("Dataset aliases must be non-empty")
+        key = alias.casefold()
+        if key == canonical or key in seen:
+            continue
+        seen.add(key)
+        normalized.append(alias)
+    return normalized
+
+
+def _name_alias_owner(db: Session, alias: str) -> Dataset | None:
+    """Return a dataset owning an identity which a user name alias cannot reuse."""
+    return db.scalar(
+        select(Dataset)
+        .outerjoin(DatasetAlias)
+        .where(
+            or_(
+                Dataset.id == alias,
+                func.lower(Dataset.name) == alias.casefold(),
+                Dataset.source_url == alias,
+                and_(
+                    DatasetAlias.kind.in_(NAME_ALIAS_KINDS),
+                    func.lower(DatasetAlias.value) == alias.casefold(),
+                ),
+                and_(
+                    DatasetAlias.kind.in_(("url", "path")),
+                    DatasetAlias.value == alias,
+                ),
+            )
+        )
+        .order_by(Dataset.created_at.desc())
+    )
+
+
+def _raise_if_name_aliases_conflict(
+    db: Session, aliases: Sequence[str], *, dataset_id: str | None = None
 ) -> None:
-    """Reject a registered name or canonical URL/path before dataset processing."""
+    for alias in aliases:
+        owner = _name_alias_owner(db, alias)
+        if owner is not None and owner.id != dataset_id:
+            _raise_dataset_conflict(owner, f"name alias {alias!r}")
+
+
+def _raise_if_dataset_identity_conflicts(
+    db: Session,
+    name: str,
+    source_reference: str | None,
+    name_aliases: Sequence[str] = (),
+) -> None:
+    """Reject registered identities before dataset processing."""
     conditions = [
         func.lower(Dataset.name) == name.casefold(),
         and_(
-            DatasetAlias.kind == "name",
+            DatasetAlias.kind.in_(NAME_ALIAS_KINDS),
             func.lower(DatasetAlias.value) == name.casefold(),
         ),
     ]
@@ -119,23 +200,67 @@ def _raise_if_dataset_identity_conflicts(
         .order_by(Dataset.created_at.desc())
     )
     if existing is None:
+        _raise_if_name_aliases_conflict(db, name_aliases)
         return
-    reason = "name" if existing.name.casefold() == name.casefold() else "source URL/path"
-    raise DatasetConflictError(
-        f"Ingestion rejected: dataset {reason} is already registered as "
-        f"{existing.id} ({existing.name} {existing.version}). "
-        f"Existing storage path: {existing.storage_path}"
-    )
+    name_match = existing.name.casefold() == name.casefold() or db.scalar(
+        select(DatasetAlias.id).where(
+            DatasetAlias.dataset_id == existing.id,
+            DatasetAlias.kind.in_(NAME_ALIAS_KINDS),
+            func.lower(DatasetAlias.value) == name.casefold(),
+        )
+    ) is not None
+    _raise_dataset_conflict(existing, "name" if name_match else "source URL/path")
+
+
+def add_name_aliases(
+    identifier: str, aliases: Sequence[str], config: Settings | None = None
+) -> Dataset:
+    """Append searchable aliases without replacing registered metadata."""
+    config = config or get_settings()
+    requested_aliases = _normalize_name_aliases(aliases)
+    if not requested_aliases:
+        raise ValueError("Provide at least one non-empty dataset alias")
+    with ingestion_lock("registry-intake", config):
+        create_database(config)
+        db = get_session_factory(config.resolved_database_url)()
+        try:
+            item = resolve_dataset(db, identifier)
+            if item is None:
+                raise ValueError("No dataset matched the supplied ID, name, alias, or URL")
+            aliases_to_add = _normalize_name_aliases(requested_aliases, item.name)
+            _raise_if_name_aliases_conflict(db, aliases_to_add, dataset_id=item.id)
+            existing_aliases = {
+                row.value.casefold()
+                for row in item.aliases
+                if row.kind == USER_NAME_ALIAS_KIND
+            }
+            for alias in aliases_to_add:
+                if alias.casefold() not in existing_aliases:
+                    item.aliases.append(
+                        DatasetAlias(kind=USER_NAME_ALIAS_KIND, value=alias)
+                    )
+            db.commit()
+            db.refresh(item)
+            list(item.aliases)
+            return item
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
 
 
 def _preflight_dataset_identity(
-    name: str, source_reference: str | None, config: Settings
+    name: str,
+    source_reference: str | None,
+    config: Settings,
+    name_aliases: Sequence[str] = (),
 ) -> None:
     """Check registry identity before provider, workspace, or dataset-file work."""
     create_database(config)
     db = get_session_factory(config.resolved_database_url)()
     try:
-        _raise_if_dataset_identity_conflicts(db, name, source_reference)
+        _raise_if_dataset_identity_conflicts(db, name, source_reference, name_aliases)
     finally:
         db.close()
 
@@ -151,19 +276,28 @@ def _ingest_local_locked(
     storage_mode: StorageMode,
     *,
     has_remote_url: bool,
+    name_aliases: Sequence[str],
 ) -> Dataset:
     """Ingest a local source while the registry-wide intake lock is held."""
     ensure_layout(config)
     create_database(config)
     db = get_session_factory(config.resolved_database_url)()
     try:
-        _raise_if_dataset_identity_conflicts(db, name, source_reference)
+        _raise_if_dataset_identity_conflicts(db, name, source_reference, name_aliases)
         if not source.is_dir():
             raise ValueError(f"Local source is not a directory: {source}")
         item = Dataset(name=name, provider=provider, source_url=source_reference, version=version, modalities=",".join(sorted(set(modalities))), storage_mode=storage_mode, status=DatasetStatus.INGESTING); db.add(item); db.flush()
         job = IngestionJob(dataset_id=item.id, mode="local", status=JobStatus.RUNNING); db.add(job)
-        db.add(DatasetAlias(dataset_id=item.id, kind="url" if has_remote_url else "path", value=source_reference))
-        db.add(DatasetAlias(dataset_id=item.id, kind="name", value=name))
+        item.aliases.extend(
+            [
+                DatasetAlias(kind="url" if has_remote_url else "path", value=source_reference),
+                DatasetAlias(kind=CANONICAL_NAME_ALIAS_KIND, value=name),
+                *[
+                    DatasetAlias(kind=USER_NAME_ALIAS_KIND, value=alias)
+                    for alias in name_aliases
+                ],
+            ]
+        )
         if storage_mode == StorageMode.REFERENCE:
             managed_path = source
         elif storage_mode == StorageMode.MOVE:
@@ -185,28 +319,29 @@ def _ingest_local_locked(
         db.close()
 
 
-def ingest_local(source: Path, name: str, provider: Provider, url: str | None, version: str | None, modalities: Sequence[str | Modality], config: Settings | None = None, storage_mode: StorageMode = StorageMode.REFERENCE) -> Dataset:
+def ingest_local(source: Path, name: str, provider: Provider, url: str | None, version: str | None, modalities: Sequence[str | Modality], config: Settings | None = None, storage_mode: StorageMode = StorageMode.REFERENCE, *, name_aliases: Sequence[str] = ()) -> Dataset:
     """Register a local dataset after identity preflight and under intake lock."""
     config = config or get_settings()
     name = name.strip()
     if not name:
         raise ValueError("A non-empty dataset name is required")
+    name_aliases = _normalize_name_aliases(name_aliases, name)
     version = version or "unknown"
-    _preflight_dataset_identity(name, url, config)
+    _preflight_dataset_identity(name, url, config, name_aliases)
     source = source.expanduser().resolve()
     source_reference = url or source.as_uri()
     if url is None:
-        _preflight_dataset_identity(name, source_reference, config)
+        _preflight_dataset_identity(name, source_reference, config, name_aliases)
     normalized_modalities = normalize_modalities(modalities)
     with ingestion_lock("registry-intake", config):
-        _preflight_dataset_identity(name, source_reference, config)
+        _preflight_dataset_identity(name, source_reference, config, name_aliases)
         ensure_layout(config)
         log_path = config.logs_dir / f"ingest-{safe_component(name)}-{safe_component(version)}.log"
         _append_ingestion_log(log_path, f"START provider={provider.value} version={version} source={source}")
         try:
             item = _ingest_local_locked(
                 source, name, provider, source_reference, version, normalized_modalities,
-                config, storage_mode, has_remote_url=url is not None,
+                config, storage_mode, has_remote_url=url is not None, name_aliases=name_aliases,
             )
             _append_ingestion_log(log_path, f"SUCCEEDED dataset_id={item.id} storage_path={item.storage_path}")
             return item
@@ -241,13 +376,15 @@ def download(
     modalities: Sequence[str | Modality],
     proxy: str | None = None,
     mirror: str | None = None,
+    name_aliases: Sequence[str] = (),
 ) -> Dataset:
     """Download and register one dataset after identity preflight."""
     name = name.strip()
     if not name:
         raise ValueError("A non-empty dataset name is required for downloads")
+    name_aliases = _normalize_name_aliases(name_aliases, name)
     config = config or get_settings()
-    _preflight_dataset_identity(name, url, config)
+    _preflight_dataset_identity(name, url, config, name_aliases)
     normalized_modalities = normalize_modalities(modalities)
     if not normalized_modalities:
         raise ValueError("At least one modality is required for downloads")
@@ -255,7 +392,7 @@ def download(
     resolved_version = resolve_download_version(url, version)
     with ingestion_lock("registry-intake", config):
         # Repeat the preflight while serialized with all other intake actions.
-        _preflight_dataset_identity(name, url, config)
+        _preflight_dataset_identity(name, url, config, name_aliases)
         source = config.incoming_dir / (
             f"download-{provider.value}-{safe_component(url.rstrip(chr(47)).split(chr(47))[-1])}-"
             f"{safe_component(resolved_version)}"
@@ -277,7 +414,7 @@ def download(
             )
             item = _ingest_local_locked(
                 source, name, provider, url, resolved_version, normalized_modalities,
-                config, StorageMode.MOVE, has_remote_url=True,
+                config, StorageMode.MOVE, has_remote_url=True, name_aliases=name_aliases,
             )
             _append_ingestion_log(log_path, f"SUCCEEDED dataset_id={item.id} storage_path={item.storage_path}")
             return item
@@ -330,7 +467,11 @@ def dataset_dict(item: Dataset) -> dict[str, object]:
         Public current-model fields. Retired SQL columns remain stored but
         are intentionally not exposed.
     """
-    return {
+    data = {
         output_name: _serialize_dataset_value(column, getattr(item, column.name))
         for column, output_name, _ in _dataset_output_columns()
     }
+    data["aliases"] = sorted(
+        alias.value for alias in item.aliases if alias.kind == USER_NAME_ALIAS_KIND
+    )
+    return data

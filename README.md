@@ -55,10 +55,10 @@ All commands read `NDR_DATA_ROOT` and operate on the same registry database.
 
 ### `brainctl query`
 
-Queries the storage path of a registered dataset by its ID (internal to this registry), canonical name, or source URL and prints only its absolute storage path. The three forms are equivalent:
+Queries the storage path of a registered dataset by its ID (internal to this registry), canonical name, name alias, or source URL and prints only its absolute storage path. The forms are equivalent:
 
 ```bash
-brainctl query --name THINGS-MEG
+brainctl query --name THINGS-MEG  # a user-defined name alias can also be searched (e.g., THINGS_MEG)
 brainctl query --url "https://openneuro.org/datasets/ds004212/versions/3.0.0"  # remote URL
 brainctl query 220cb6c2-cc2f-409d-be24-5abb018da87d  # internal ID
 ```
@@ -72,6 +72,7 @@ Lists all registered datasets as a structured summary, optionally narrowed to on
 ```bash
 brainctl list --modality MEG
 brainctl list --provider openneuro
+brainctl list --query THINGS_MEG  # searches canonical names and aliases
 ```
 
 `--modality` accepts a value such as `MEG`, `EEG`, or `fMRI`;
@@ -115,6 +116,8 @@ Usage example:
 ```bash
 brainctl ingest-local /data/legacy/things-meg \
   --name THINGS-MEG \
+  --alias THINGS_MEG \
+  --alias "THINGS object vision" \
   --provider openneuro \
   --url "https://openneuro.org/datasets/ds004212" \
   --version 3.0.0 \
@@ -124,7 +127,8 @@ brainctl ingest-local /data/legacy/things-meg \
 `SOURCE` must be an existing directory. `--name` and `--version` are required.
 `--provider` accepts `openneuro`, `dandi`, `nemar`, `physionet`, `neurovault`, `kaggle`, or `other`; it defaults to `other`.
 `--url` records the canonical remote URL when one exists.
-Repeat `--modality` to register multiple modalities.
+Repeat `--modality` to register multiple modalities. Repeat `--alias` to
+register searchable alternate names alongside the canonical `--name`.
 By default (`--storage-mode reference`), the command leaves `SOURCE` where it is and records its absolute path. Use `--storage-mode move` to relocate `SOURCE` into `$NDR_DATA_ROOT/datasets`. Use `--storage-mode copy` to preserve `SOURCE` while creating a managed duplicate; this consumes additional disk space and should only be used when `SOURCE` may be cleaned in the future. (DO NOT use `move` mode if your source location is still used by other codes)
 Before validating or moving `SOURCE`, it rejects a duplicate canonical name or
 source URL/path and reports the existing storage path.
@@ -140,7 +144,7 @@ duplicate is never downloaded or processed again.
 
 
 ```bash
-brainctl download --url "https://openneuro.org/datasets/ds007338/versions/1.0.0" --name EXAMPLE-MEG --modality MEG
+brainctl download --url "https://openneuro.org/datasets/ds007338/versions/1.0.0" --name EXAMPLE-MEG --alias EXAMPLE --modality MEG
 ```
 
 `--url` is required. `--version` is optional only when an OpenNeuro URL contains a version such as `/versions/1.0.0`; otherwise provide it manually. An explicit `--version` may name a provider branch or tag.
@@ -149,7 +153,19 @@ Install `neural-data-registry[download]` to enable downloads. Automatic download
 
 Each attempt appends a log to `$NDR_DATA_ROOT/logs/download-*.log`, including the full DataLad stdout and stderr on failure. Rerun the same command to resume a valid partial DataLad workspace in `incoming`; an empty workspace is retried as a new clone.
 
-The API uses required `name` and `modalities` fields for the same reason, so registered downloaded datasets always carry explicit metadata.
+The API uses required `name` and `modalities` fields for the same reason, so registered downloaded datasets always carry explicit metadata. Both intake API requests also accept an optional `aliases` array.
+
+### `brainctl alias`
+
+Aliases are globally unique (case-insensitive)
+and cannot reuse another dataset’s canonical name or alias.
+
+```bash
+brainctl alias THINGS-MEG --alias THINGS_MEG --alias "THINGS object vision"
+```
+
+Aliases are append-only: repeat the command to add another name. Use
+`brainctl list --query NAME` to search by either a canonical name or alias.
 
 Use `--proxy https://proxy.example:8080` to configure a download proxy. Use `--mirror https://mirror.example/{dataset_id}.git` (or a mirror base URL) to select a mirror URL. The API accepts the same `proxy` and `mirror` fields, and deployment defaults can be set with `NDR_DOWNLOAD_PROXY` and `NDR_DOWNLOAD_MIRROR`.
 

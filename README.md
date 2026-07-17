@@ -48,7 +48,6 @@ pip install -e '.[download,dev]'
 ```
 The `download` extra installs both DataLad and `git-annex` (`>=10.20230126`).
 
-
 ## CLI commands
 
 All commands read `NDR_DATA_ROOT` and operate on the same registry database.
@@ -190,3 +189,13 @@ Common providers for neural data are included:
 - `neurovault`: https://neurovault.org/ Derived neuroimaging maps: fMRI/PET statistical maps, parcellations, atlases.
 - `kaggle`: Kaggle datasets and competitions, typically downloaded for machine-learning workflows. https://www.kaggle.com/
 - `other`: Any other dataset downloaded manually from arbitrary websites or requested from labs.
+
+## Port usage
+
+You may also use the API in a port.
+
+```bash
+python -m uvicorn neural_data_registry.main:app --host 127.0.0.1 --port 8000
+```
+
+leave this running and open another terminal to use commands.

@@ -30,6 +30,7 @@ from neural_data_registry.service import (
     resolve_download_version,
 )
 from neural_data_registry.storage import directory_size, ensure_layout, process_lock
+from neural_data_registry.storage import dataset_destination, ingestion_lock
 from neural_data_registry.service import dataset_dict, find_datasets, ingest_local, session
 
 
@@ -88,6 +89,107 @@ def test_local_ingestion_can_move_mock_dataset(config, tmp_path):
     assert not source.exists()
     assert Path(item.storage_path).is_relative_to(config.datasets_dir)
     assert (Path(item.storage_path) / "meg.fif").is_file()
+
+
+def test_storage_transition_api_moves_reference_and_preserves_metadata(config, tmp_path):
+    """Move a registered reference without replacing its dataset identity."""
+    source = mock_dataset(tmp_path, "transition-move-source")
+    item = ingest_local(
+        source,
+        "Transition move",
+        Provider.OPENNEURO,
+        "https://openneuro.org/datasets/transition-move",
+        "1",
+        ["meg"],
+        config,
+        name_aliases=["Transition alias"],
+    )
+
+    client = TestClient(create_app(config))
+    response = client.post(
+        f"/datasets/{item.id}/storage-transition", json={"storage_mode": "move"}
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["dataset_id"] == item.id
+    assert data["source_url"] == item.source_url
+    assert data["aliases"] == ["Transition alias"]
+    assert data["storage_mode"] == "move"
+    assert not source.exists()
+    assert Path(data["storage_path"]).is_relative_to(config.datasets_dir)
+    assert (Path(data["storage_path"]) / "meg.fif").is_file()
+    assert json.loads((config.registry_dir / f"{item.id}.json").read_text()) == data
+    assert client.post(
+        f"/datasets/{item.id}/storage-transition", json={"storage_mode": "copy"}
+    ).status_code == 409
+    with session(config) as db:
+        job = (
+            db.query(IngestionJob)
+            .filter_by(dataset_id=item.id, mode="storage-transition-move")
+            .first()
+        )
+        assert job.mode == "storage-transition-move"
+        assert job.status.value == "succeeded"
+
+
+def test_storage_transition_api_copies_reference_and_preserves_source(config, tmp_path):
+    """Copying a reference keeps the registered source directory intact."""
+    source = mock_dataset(tmp_path, "transition-copy-source")
+    item = ingest_local(source, "Transition copy", Provider.OTHER, None, "1", ["meg"], config)
+
+    response = TestClient(create_app(config)).post(
+        f"/datasets/{item.id}/storage-transition", json={"storage_mode": "copy"}
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["storage_mode"] == "copy"
+    assert source.exists()
+    assert Path(data["storage_path"]).is_relative_to(config.datasets_dir)
+    assert (Path(data["storage_path"]) / "meg.fif").read_bytes() == b"mock meg data"
+
+
+def test_storage_transition_api_rejects_invalid_or_unavailable_targets(config, tmp_path):
+    """Reject invalid modes, missing records, and missing reference paths safely."""
+    client = TestClient(create_app(config))
+    source = mock_dataset(tmp_path, "transition-invalid-source")
+    item = ingest_local(source, "Transition invalid", Provider.OTHER, None, "1", ["meg"], config)
+
+    assert client.post("/datasets/no-such-id/storage-transition", json={"storage_mode": "move"}).status_code == 404
+    assert client.post(f"/datasets/{item.id}/storage-transition", json={"storage_mode": "reference"}).status_code == 400
+    assert client.post(f"/datasets/{item.id}/storage-transition", json={"storage_mode": "other"}).status_code == 400
+
+    for child in source.iterdir():
+        child.unlink()
+    source.rmdir()
+    response = client.post(f"/datasets/{item.id}/storage-transition", json={"storage_mode": "move"})
+    assert response.status_code == 400
+    with session(config) as db:
+        unchanged = db.get(Dataset, item.id)
+        assert unchanged.storage_mode is StorageMode.REFERENCE
+        assert unchanged.storage_path == str(source)
+
+
+def test_storage_transition_rejects_destination_conflict_and_intake_lock(config, tmp_path):
+    """Keep the record unchanged when destination or concurrent intake conflicts."""
+    source = mock_dataset(tmp_path, "transition-conflict-source")
+    item = ingest_local(source, "Transition conflict", Provider.OTHER, None, "1", ["meg"], config)
+    destination = dataset_destination(item.id, item.name, item.version, config)
+    destination.mkdir(parents=True)
+    client = TestClient(create_app(config))
+
+    response = client.post(f"/datasets/{item.id}/storage-transition", json={"storage_mode": "move"})
+    assert response.status_code == 409
+    assert source.exists()
+    with session(config) as db:
+        assert db.get(Dataset, item.id).storage_mode is StorageMode.REFERENCE
+
+    destination.rmdir()
+    with ingestion_lock("registry-intake", config):
+        response = client.post(f"/datasets/{item.id}/storage-transition", json={"storage_mode": "move"})
+    assert response.status_code == 409
+    assert source.exists()
 
 
 def test_rejects_repeated_name_with_existing_managed_path(config, tmp_path):

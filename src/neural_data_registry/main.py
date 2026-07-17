@@ -1,15 +1,20 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Response
+from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 from neural_data_registry.config import Settings
 from neural_data_registry.health import request_health_check
 from neural_data_registry.db.models import Dataset
 from neural_data_registry.enums import Modality, Provider, StorageMode
 from neural_data_registry.service import DatasetConflictError, dataset_dict, download, find_datasets, ingest_local, session
+from neural_data_registry.service import DatasetNotFoundError, transition_reference_storage
 
 
 class LocalIngestionRequest(BaseModel):
@@ -35,6 +40,11 @@ class DownloadRequest(BaseModel):
     mirror: str | None = None
 
 
+class StorageTransitionRequest(BaseModel):
+    """Request a supported transition from reference to managed storage."""
+    storage_mode: Literal[StorageMode.MOVE, StorageMode.COPY]
+
+
 def create_app(config: Settings | None = None) -> FastAPI:
     """Create the registry API application.
 
@@ -49,6 +59,11 @@ def create_app(config: Settings | None = None) -> FastAPI:
         Configured API application.
     """
     api = FastAPI(title="Neural Data Registry", version="0.1.0")
+
+    @api.exception_handler(RequestValidationError)
+    async def request_validation_error(_: Request, exc: RequestValidationError):
+        """Use the API's standard bad-request status for invalid inputs."""
+        return JSONResponse(status_code=400, content={"detail": exc.errors()})
 
     @api.get("/health")
     def health() -> dict[str, str]:
@@ -74,6 +89,21 @@ def create_app(config: Settings | None = None) -> FastAPI:
         if report.repair_in_progress:
             data["repair_in_progress"] = True
         return data
+
+    @api.post("/datasets/{dataset_id}/storage-transition")
+    def storage_transition(
+        dataset_id: str, request: StorageTransitionRequest
+    ) -> dict:
+        try:
+            return dataset_dict(
+                transition_reference_storage(dataset_id, request.storage_mode, config)
+            )
+        except DatasetNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @api.post("/ingest/local", status_code=201)
     def ingest_local_dataset(request: LocalIngestionRequest, response: Response) -> dict:

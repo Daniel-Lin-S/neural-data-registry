@@ -107,6 +107,10 @@ class DatasetConflictError(RuntimeError):
     """Raised when a dataset name or source identity is already registered."""
 
 
+class DatasetNotFoundError(LookupError):
+    """Raised when an operation targets an unregistered dataset ID."""
+
+
 
 
 def _raise_dataset_conflict(existing: Dataset, identity: str) -> None:
@@ -348,6 +352,70 @@ def ingest_local(source: Path, name: str, provider: Provider, url: str | None, v
         except Exception as exc:
             _append_ingestion_log(log_path, f"FAILED {type(exc).__name__}: {exc}")
             raise
+
+
+def transition_reference_storage(
+    dataset_id: str,
+    storage_mode: StorageMode,
+    config: Settings | None = None,
+) -> Dataset:
+    """Move or copy a referenced dataset into registry-managed storage."""
+    if storage_mode not in (StorageMode.MOVE, StorageMode.COPY):
+        raise ValueError("Storage transition mode must be 'move' or 'copy'")
+
+    config = config or get_settings()
+    with ingestion_lock("registry-intake", config):
+        ensure_layout(config)
+        create_database(config)
+        db = get_session_factory(config.resolved_database_url)()
+        try:
+            item = db.get(Dataset, dataset_id)
+            if item is None:
+                raise DatasetNotFoundError(f"Dataset not found: {dataset_id}")
+            if item.storage_mode is not StorageMode.REFERENCE:
+                raise DatasetConflictError(
+                    "Storage transition rejected: only datasets in reference "
+                    f"mode can transition (current mode: {item.storage_mode.value})"
+                )
+            if item.storage_path is None:
+                raise ValueError("Referenced dataset has no storage path")
+
+            source = Path(item.storage_path)
+            if not source.is_dir():
+                raise ValueError(
+                    f"Referenced dataset path is not an existing directory: {source}"
+                )
+            destination = dataset_destination(item.id, item.name, item.version, config)
+            job = IngestionJob(
+                dataset_id=item.id,
+                mode=f"storage-transition-{storage_mode.value}",
+                status=JobStatus.RUNNING,
+            )
+            db.add(job)
+
+            if storage_mode is StorageMode.MOVE:
+                move_into_managed_storage(source, destination)
+            else:
+                copy_into_managed_storage(source, destination)
+
+            item.storage_path = str(destination)
+            item.storage_mode = storage_mode
+            item.size_bytes = directory_size(destination)
+            job.status = JobStatus.SUCCEEDED
+            db.commit()
+            db.refresh(item)
+            list(item.aliases)
+            (config.registry_dir / f"{item.id}.json").write_text(
+                json.dumps(dataset_dict(item), indent=2), encoding="utf-8"
+            )
+            return item
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+
 def resolve_download_version(url: str, requested: str | None = None) -> str:
     """Resolve an explicit version or an OpenNeuro version embedded in the URL."""
     if requested is not None:

@@ -76,7 +76,7 @@ brainctl list --query THINGS_MEG  # searches canonical names and aliases
 
 `--modality` accepts a value such as `MEG`, `EEG`, or `fMRI`;
 `--provider` accepts
-`openneuro`, `dandi`, `nemar`, `physionet`, `neurovault`, `kaggle`, or `other`.
+`openneuro`, `dandi`, `nemar`, `physionet`, `neurovault`, `kaggle`, `synapse`, or `other`.
 Missing and broken datasets are hidden by default; use `brainctl list --show-all`
 to include every status. The summary includes dataset ID, name, provider, version,
 modalities, size, and status.
@@ -117,14 +117,13 @@ brainctl ingest-local /data/legacy/things-meg \
   --name THINGS-MEG \
   --alias THINGS_MEG \
   --alias "THINGS object vision" \
-  --provider openneuro \
   --url "https://openneuro.org/datasets/ds004212" \
   --version 3.0.0 \
   --modality MEG
 ```
 
 `SOURCE` must be an existing directory. `--name` and `--version` are required.
-`--provider` accepts `openneuro`, `dandi`, `nemar`, `physionet`, `neurovault`, `kaggle`, or `other`; it defaults to `other`.
+`--provider` accepts `openneuro`, `dandi`, `nemar`, `physionet`, `neurovault`, `kaggle`, `synapse`, or `other`; it defaults to `other`. URLs automatically determine the provider and, where present, the version.
 `--url` records the canonical remote URL when one exists.
 Repeat `--modality` to register multiple modalities. Repeat `--alias` to
 register searchable alternate names alongside the canonical `--name`.
@@ -190,12 +189,65 @@ Common providers for neural data are included:
 - `kaggle`: Kaggle datasets and competitions, typically downloaded for machine-learning workflows. https://www.kaggle.com/
 - `other`: Any other dataset downloaded manually from arbitrary websites or requested from labs.
 
-## Port usage
+## API server and common requests
 
-You may also use the API in a port.
+Run the API on a local port:
 
 ```bash
 python -m uvicorn neural_data_registry.main:app --host 127.0.0.1 --port 8000
 ```
 
-leave this running and open another terminal to use commands.
+Leave the server running, then use another terminal for API requests. The
+examples below assume `http://127.0.0.1:8000`.
+
+```bash
+# Check that the service is available.
+curl http://127.0.0.1:8000/health
+
+# List datasets; optional filters include query, url, modality, provider, and show_all.
+curl 'http://127.0.0.1:8000/datasets?query=THINGS-MEG'
+
+# Get one registered dataset by its ID. This also triggers a health check.
+curl http://127.0.0.1:8000/datasets/220cb6c2-cc2f-409d-be24-5abb018da87d
+```
+
+Register an existing local dataset with `POST /ingest/local`:
+
+```bash
+curl -X POST http://127.0.0.1:8000/ingest/local \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "source": "/data/legacy/things-meg",
+    "name": "THINGS-MEG",
+    "url": "https://openneuro.org/datasets/ds004212",
+    "version": "3.0.0",
+    "modalities": ["meg"],
+    "aliases": ["THINGS_MEG"],
+    "storage_mode": "reference"
+  }'
+```
+
+Download and register a provider dataset with `POST /download`:
+
+```bash
+curl -X POST http://127.0.0.1:8000/download \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "url": "https://openneuro.org/datasets/ds007338/versions/1.0.0",
+    "name": "EXAMPLE-MEG",
+    "modalities": ["meg"],
+    "aliases": ["EXAMPLE"]
+  }'
+```
+
+To move or copy a dataset that was previously registered with
+`storage_mode: "reference"`, send a storage-transition request:
+
+```bash
+curl -X POST http://127.0.0.1:8000/datasets/220cb6c2-cc2f-409d-be24-5abb018da87d/storage-transition \
+  -H 'Content-Type: application/json' \
+  -d '{"storage_mode": "move"}'
+```
+
+The intake `POST` endpoints reject duplicate canonical names and canonical
+URLs or paths with HTTP 409, before processing data or contacting a provider.

@@ -3,6 +3,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Sequence
 import json, re
+import warnings
 from pathlib import Path
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
@@ -330,6 +331,11 @@ def ingest_local(source: Path, name: str, provider: Provider, url: str | None, v
     if not name:
         raise ValueError("A non-empty dataset name is required")
     name_aliases = _normalize_name_aliases(name_aliases, name)
+    if url:
+        # Remote URL metadata is authoritative for local registrations.
+        provider = provider_for_url(url)
+        if version is None:
+            version = infer_url_version(url)
     version = version or "unknown"
     _preflight_dataset_identity(name, url, config, name_aliases)
     source = source.expanduser().resolve()
@@ -416,18 +422,36 @@ def transition_reference_storage(
             db.close()
 
 
+def infer_url_version(url: str) -> str | None:
+    """Return a version embedded in a supported provider URL, when available."""
+    provider = provider_for_url(url)
+    path = urlparse(url).path
+    if provider is Provider.OPENNEURO:
+        match = re.search(r"/versions/([0-9]+(?:\.[0-9]+)*)", path)
+    elif provider is Provider.PHYSIONET:
+        # PhysioNet content URLs use /content/<dataset>/<version>/.
+        match = re.search(r"/content/[^/]+/([0-9]+(?:\.[0-9]+)+)(?:/|$)", path)
+        if not match:
+            warnings.warn(
+                "Could not infer a version from the PhysioNet URL; provide --version or the API version field.",
+                UserWarning,
+                stacklevel=2,
+            )
+    else:
+        match = None
+    return match.group(1) if match else None
+
+
 def resolve_download_version(url: str, requested: str | None = None) -> str:
-    """Resolve an explicit version or an OpenNeuro version embedded in the URL."""
+    """Resolve an explicit version or one embedded in the provider URL."""
     if requested is not None:
         version = requested.strip()
         if version:
             return version
         raise ValueError("Version cannot be blank")
-    provider = provider_for_url(url)
-    if provider is Provider.OPENNEURO:
-        match = re.search(r"/versions/([0-9]+(?:\.[0-9]+)*)", urlparse(url).path)
-        if match:
-            return match.group(1)
+    inferred = infer_url_version(url)
+    if inferred:
+        return inferred
     raise ValueError(
         "A version is required when it is not present in the dataset URL; "
         "provide --version or the API version field"
@@ -452,11 +476,13 @@ def download(
         raise ValueError("A non-empty dataset name is required for downloads")
     name_aliases = _normalize_name_aliases(name_aliases, name)
     config = config or get_settings()
+    provider = provider_for_url(url)
+    if provider is Provider.OTHER:
+        raise ValueError(f"Cannot identify a supported provider from URL: {url}")
     _preflight_dataset_identity(name, url, config, name_aliases)
     normalized_modalities = normalize_modalities(modalities)
     if not normalized_modalities:
         raise ValueError("At least one modality is required for downloads")
-    provider = provider_for_url(url)
     resolved_version = resolve_download_version(url, version)
     with ingestion_lock("registry-intake", config):
         # Repeat the preflight while serialized with all other intake actions.

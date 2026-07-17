@@ -33,15 +33,21 @@ def _find_command(name: str) -> str | None:
 
 
 def provider_for_url(url: str) -> Provider:
-    """Identify the supported provider represented by a dataset URL."""
-    host = urlparse(url).netloc.lower()
-    if host.endswith("openneuro.org"): return Provider.OPENNEURO
-    if host.endswith("dandiarchive.org"): return Provider.DANDI
-    if host.endswith("nemar.org"): return Provider.NEMAR
-    if host.endswith("physionet.org"): return Provider.PHYSIONET
-    if host.endswith("kaggle.com"): return Provider.KAGGLE
-    if host.endswith("neurovault.org"): return Provider.NEUROVAULT
-    raise ProviderDownloadError(f"Cannot identify a supported provider from URL: {url}")
+    """Identify a provider from a dataset URL, defaulting to ``other``."""
+    host = (urlparse(url).hostname or "").lower()
+    providers = {
+        "openneuro.org": Provider.OPENNEURO,
+        "dandiarchive.org": Provider.DANDI,
+        "nemar.org": Provider.NEMAR,
+        "physionet.org": Provider.PHYSIONET,
+        "kaggle.com": Provider.KAGGLE,
+        "neurovault.org": Provider.NEUROVAULT,
+        "synapse.org": Provider.SYNAPSE,
+    }
+    for domain, provider in providers.items():
+        if host == domain or host.endswith("." + domain):
+            return provider
+    return Provider.OTHER
 
 def _mirror_source(mirror: str, dataset_id: str) -> str:
     """Resolve a mirror URL or URL template for one OpenNeuro dataset."""

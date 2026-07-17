@@ -28,6 +28,7 @@ from neural_data_registry.service import (
     download as download_dataset,
     resolve_dataset,
     resolve_download_version,
+    infer_url_version,
 )
 from neural_data_registry.storage import directory_size, ensure_layout, process_lock
 from neural_data_registry.storage import dataset_destination, ingestion_lock
@@ -700,6 +701,7 @@ def test_failed_download_remains_in_incoming(config, monkeypatch):
         ("https://physionet.org/content/example/1.0.0/", Provider.PHYSIONET),
         ("https://neurovault.org/collections/1234/", Provider.NEUROVAULT),
         ("https://www.kaggle.com/datasets/example/dataset", Provider.KAGGLE),
+        ("https://www.synapse.org/Synapse:syn51549340", Provider.SYNAPSE),
     ],
 )
 def test_new_providers_are_recognized_but_not_downloaded(url, provider):
@@ -729,6 +731,48 @@ def test_download_requires_explicit_metadata(config):
         )
 
 
+def test_ingest_local_detects_provider_and_physionet_version_from_url(config, tmp_path):
+    """A local registration takes provider and version metadata from its URL."""
+    item = ingest_local(
+        mock_dataset(tmp_path, "physionet-local"),
+        "EEG Motor Movement",
+        Provider.OPENNEURO,
+        "https://www.physionet.org/content/eegmmidb/1.0.0/",
+        None,
+        ["eeg"],
+        config,
+    )
+    assert item.provider is Provider.PHYSIONET
+    assert item.version == "1.0.0"
+
+
+def test_ingest_local_uses_other_for_unknown_url(config, tmp_path):
+    item = ingest_local(
+        mock_dataset(tmp_path, "unknown-url"),
+        "Unknown URL",
+        Provider.OPENNEURO,
+        "https://example.invalid/dataset",
+        None,
+        ["eeg"],
+        config,
+    )
+    assert item.provider is Provider.OTHER
+
+
+def test_physionet_missing_url_version_warns():
+    with pytest.warns(UserWarning, match="Could not infer a version"):
+        assert infer_url_version("https://physionet.org/content/eegmmidb/") is None
+
+
+def test_download_rejects_unknown_provider_before_workspace(config):
+    with pytest.raises(ValueError, match="Cannot identify a supported provider"):
+        download_dataset(
+            "https://example.invalid/dataset", None, config,
+            name="Unknown URL", modalities=["eeg"],
+        )
+    assert not config.incoming_dir.exists()
+
+
 def test_download_version_is_inferred_or_required():
     """Infer OpenNeuro numeric versions and require versions elsewhere."""
     assert resolve_download_version(
@@ -738,6 +782,9 @@ def test_download_version_is_inferred_or_required():
         "https://openneuro.org/datasets/ds007338/versions/1.0.0",
         "main",
     ) == "main"
+    assert resolve_download_version(
+        "https://www.physionet.org/content/eegmmidb/1.0.0/"
+    ) == "1.0.0"
     with pytest.raises(ValueError, match="version is required"):
         resolve_download_version("https://dandiarchive.org/dandiset/000001/1.0.0")
 

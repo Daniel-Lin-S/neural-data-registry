@@ -1,6 +1,7 @@
 from __future__ import annotations
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 from typing import Annotated
 import typer
 from rich.console import Console
@@ -105,18 +106,51 @@ def _health_problems(dataset_ids: list[str]):
 
 @app.command()
 def query(
-    query: Annotated[str | None, typer.Argument(help="Exact dataset ID, name, or source URL.")] = None,
+    query: Annotated[str | None, typer.Argument(help="Dataset ID, name, or source URL.")] = None,
     name: str | None = typer.Option(None, "--name", help="Exact dataset name to look up."),
-    url: str | None = typer.Option(None, "--url", help="Exact source URL to look up.")
+    url: str | None = typer.Option(None, "--url", help="Source URL to look up by dataset path segment.")
 ):
-    """Print the absolute storage path for one dataset."""
+    """Print a matched dataset storage path, prompting when a URL is ambiguous."""
+    positional_url = (
+        query
+        if query and urlparse(query).scheme and urlparse(query).hostname
+        else None
+    )
+    url_lookup = url or positional_url
     try:
         with session() as db:
-            item = resolve_dataset(db, query, name=name, url=url)
+            if url_lookup:
+                matches = find_datasets(db, url=url_lookup)
+            else:
+                item = resolve_dataset(db, query, name=name)
+                matches = [item] if item else []
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
-    if item is None:
+    if not matches:
         raise typer.BadParameter("No dataset matched the supplied ID, name, or URL")
+    if len(matches) > 1:
+        table = Table(title="Multiple matching datasets", show_lines=True, padding=(0, 0))
+        for label in ("Name", "Modalities", "Source URL", "Size"):
+            table.add_column(label, overflow="fold")
+        for match in matches:
+            data = dataset_dict(match)
+            table.add_row(
+                str(data["name"]),
+                _format_dataset_cell("modalities", data.get("modalities")),
+                _format_dataset_cell("source_url", data.get("source_url")),
+                _format_dataset_cell("size_bytes", data.get("size_bytes")),
+            )
+        console.print("[yellow]Multiple matching datasets found. Select one by canonical name.[/yellow]")
+        console.print(table)
+        by_name = {item.name: item for item in matches}
+        while True:
+            selected_name = typer.prompt("Canonical name")
+            item = by_name.get(selected_name)
+            if item:
+                break
+            console.print("[red]Enter one of the displayed canonical names.[/red]")
+    else:
+        item = matches[0]
     report = request_health_check(item.id)
     if report.warning:
         typer.echo(f"Warning: {report.warning}", err=True)

@@ -6,7 +6,7 @@ import json, re
 import warnings
 from pathlib import Path
 from sqlalchemy import and_, func, or_, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 from urllib.parse import urlparse
 from neural_data_registry.config import Settings, get_settings
 from neural_data_registry.db.models import Dataset, DatasetAlias, IngestionJob
@@ -19,6 +19,49 @@ from neural_data_registry.storage import copy_into_managed_storage, dataset_dest
 CANONICAL_NAME_ALIAS_KIND = "name"
 USER_NAME_ALIAS_KIND = "name_alias"
 NAME_ALIAS_KINDS = (CANONICAL_NAME_ALIAS_KIND, USER_NAME_ALIAS_KIND)
+
+
+def _remote_url_identity(url: str | None) -> tuple[str, str, int | None, str] | None:
+    """Return the segment-bound identity for a remote dataset URL."""
+    if not url:
+        return None
+    try:
+        parsed = urlparse(url)
+        port = parsed.port
+    except ValueError:
+        return None
+    scheme = parsed.scheme.lower()
+    host = (parsed.hostname or "").lower()
+    if not scheme or not host or scheme == "file":
+        return None
+    if (scheme, port) in (("http", 80), ("https", 443)):
+        port = None
+    segments = [segment for segment in parsed.path.split("/") if segment]
+    if not segments:
+        return None
+    return scheme, host, port, segments[0]
+
+
+def _urls_match_dataset(url: str | None, candidate: str | None) -> bool:
+    """Return whether two URL spellings identify the same dataset segment."""
+    if url == candidate:
+        return True
+    identity = _remote_url_identity(url)
+    candidate_identity = _remote_url_identity(candidate)
+    return identity is not None and identity == candidate_identity
+
+
+def _matches_url_identifier(item: Dataset, url: str) -> bool:
+    """Match canonical remote URLs and URL aliases, but exact local paths."""
+    if _urls_match_dataset(url, item.source_url):
+        return True
+    return any(
+        (alias.kind == "url" and _urls_match_dataset(url, alias.value))
+        or (alias.kind == "path" and alias.value == url)
+        for alias in item.aliases
+    )
+
+
 def _append_ingestion_log(path: Path, message: str) -> None:
     """Append one timestamped ingestion event to a persistent workspace log."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -46,17 +89,10 @@ def session(config: Settings | None = None) -> Session:
     return get_session_factory(config.resolved_database_url)()
 def find_datasets(db: Session, query: str | None = None, url: str | None = None, modality: str | None = None, provider: str | None = None, *, show_all: bool = False) -> list[Dataset]:
     """Return registered datasets matching the supplied filters."""
-    stmt = select(Dataset).order_by(Dataset.created_at.desc())
+    stmt = select(Dataset).options(selectinload(Dataset.aliases)).order_by(Dataset.created_at.desc())
     if not show_all:
         stmt = stmt.where(
             Dataset.status.notin_((DatasetStatus.MISSING, DatasetStatus.BROKEN))
-        )
-    if url:
-        stmt = stmt.outerjoin(DatasetAlias).where(
-            or_(
-                Dataset.source_url == url,
-                and_(DatasetAlias.kind.in_(("url", "path")), DatasetAlias.value == url),
-            )
         )
     if query:
         needle = f"%{query}%"
@@ -71,7 +107,8 @@ def find_datasets(db: Session, query: str | None = None, url: str | None = None,
     if provider:
         provider_value = Provider(provider).name if isinstance(provider, str) else provider
         stmt = stmt.where(Dataset.provider == provider_value)
-    return list(db.scalars(stmt.distinct()))
+    items = list(db.scalars(stmt.distinct()))
+    return [item for item in items if _matches_url_identifier(item, url)] if url else items
 
 
 def resolve_dataset(db: Session, identifier: str | None = None, *, name: str | None = None, url: str | None = None) -> Dataset | None:
@@ -80,7 +117,10 @@ def resolve_dataset(db: Session, identifier: str | None = None, *, name: str | N
     if len(values) != 1:
         raise ValueError("Provide exactly one dataset id, name, or URL")
     value = values[0]
-    if identifier:
+    url_lookup = url or (identifier if identifier and _remote_url_identity(identifier) else None)
+    if url_lookup:
+        matches = find_datasets(db, url=url_lookup, show_all=True)
+    elif identifier:
         conditions = [
             Dataset.id == value,
             func.lower(Dataset.name) == value.casefold(),
@@ -95,10 +135,14 @@ def resolve_dataset(db: Session, identifier: str | None = None, *, name: str | N
         ]
     else:
         conditions = [
+            Dataset.id == value,
+            func.lower(Dataset.name) == value.casefold(),
             Dataset.source_url == value,
+            and_(DatasetAlias.kind.in_(NAME_ALIAS_KINDS), func.lower(DatasetAlias.value) == value.casefold()),
             and_(DatasetAlias.kind.in_(("url", "path")), DatasetAlias.value == value),
         ]
-    matches = list(db.scalars(select(Dataset).outerjoin(DatasetAlias).where(or_(*conditions)).distinct()))
+    if not url_lookup:
+        matches = list(db.scalars(select(Dataset).outerjoin(DatasetAlias).where(or_(*conditions)).distinct()))
     if len(matches) > 1:
         raise ValueError(f"Dataset identifier is ambiguous: {value}")
     return matches[0] if matches else None

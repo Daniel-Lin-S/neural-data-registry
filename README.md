@@ -54,7 +54,7 @@ All commands read `NDR_DATA_ROOT` and operate on the same registry database.
 
 ### `brainctl query`
 
-Queries the storage path of a registered dataset by its ID (internal to this registry), canonical name, name alias, or source URL and prints only its absolute storage path. The forms are equivalent:
+Queries the storage path of a registered dataset by its ID (internal to this registry), canonical name, name alias, or source URL. Remote URLs match by normalized scheme and host plus their first non-empty path segment, so an OSF dataset root and a nested OSF file URL can resolve together. A unique match prints only its absolute storage path; multiple URL matches display their details and prompt for a canonical name.
 
 ```bash
 brainctl query --name THINGS-MEG  # a user-defined name alias can also be searched (e.g., THINGS_MEG)
@@ -62,7 +62,7 @@ brainctl query --url "https://openneuro.org/datasets/ds004212/versions/3.0.0"  #
 brainctl query 220cb6c2-cc2f-409d-be24-5abb018da87d  # internal ID
 ```
 
-IDs, names, and source URLs are unique. Query does not list or summarize records; use `brainctl list` for that.
+IDs and names are unique. URL segment matches can be ambiguous, in which case `brainctl query` asks which displayed canonical dataset to use.
 
 ### `brainctl list`
 
@@ -257,7 +257,7 @@ To move or copy a dataset that was previously registered with
 `storage_mode: "reference"`, send a storage-transition request:
 
 ```bash
-curl -X POST http://127.0.0.1:8000/datasets/220cb6c2-cc2f-409d-be24-5abb018da87d/storage-transition \
+curl -X POST http://127.0.0.1:8000/datasets/{DATASET_ID}/storage-transition \
   -H 'Content-Type: application/json' \
   -d '{"storage_mode": "move"}'
 ```

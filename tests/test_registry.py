@@ -13,7 +13,7 @@ from typer.testing import CliRunner
 from neural_data_registry import cli
 from neural_data_registry import health as health_service
 from neural_data_registry.config import Settings, get_settings
-from neural_data_registry.db.models import Base, Dataset, HealthCheckHistory, IngestionJob
+from neural_data_registry.db.models import Base, Dataset, DatasetAlias, HealthCheckHistory, IngestionJob
 from neural_data_registry.db.session import create_database, get_session_factory
 from neural_data_registry.enums import DatasetStatus, Provider, StorageMode
 from neural_data_registry.health import (
@@ -310,6 +310,41 @@ def test_queries_by_name_url_and_modality(config, tmp_path):
 
 
 
+def test_segment_bound_url_matching_for_queries_and_api(config, tmp_path):
+    """Match remote URLs by host and first path segment, never provider root."""
+    root = ingest_local(
+        mock_dataset(tmp_path, "osf-root"), "OSF ROOT", Provider.OTHER,
+        "https://osf.io/pq7vb/", "1", ["meg"], config,
+    )
+    nested = ingest_local(
+        mock_dataset(tmp_path, "osf-nested"), "OSF NESTED", Provider.OTHER,
+        "https://osf.io/pq7vb/files/osfstorage", "1", ["eeg"], config,
+    )
+    other = ingest_local(
+        mock_dataset(tmp_path, "osf-other"), "OSF OTHER", Provider.OTHER,
+        "https://osf.io/otherid/files", "1", ["meg"], config,
+    )
+    with session(config) as db:
+        stored_root = db.get(Dataset, root.id)
+        stored_root.aliases.append(DatasetAlias(kind="url", value="https://osf.io/aliasid/files"))
+        stored_root.aliases.append(DatasetAlias(kind="path", value="/registered/local/path"))
+        db.commit()
+    with session(config) as db:
+        assert {item.id for item in find_datasets(db, url="https://osf.io/pq7vb/?download=1#files")} == {root.id, nested.id}
+        assert {item.id for item in find_datasets(db, url="https://osf.io/pq7vb/files/osfstorage")} == {root.id, nested.id}
+        assert [item.id for item in find_datasets(db, url="https://osf.io/")] == []
+        assert [item.id for item in find_datasets(db, url="https://osf.io/otherid/")] == [other.id]
+        assert [item.id for item in find_datasets(db, url="https://osf.io/aliasid/")] == [root.id]
+        assert [item.id for item in find_datasets(db, url="/registered/local/path")] == [root.id]
+        assert find_datasets(db, url="/registered/local/path/child") == []
+        with pytest.raises(ValueError, match="ambiguous"):
+            resolve_dataset(db, url="https://osf.io/pq7vb/")
+    response = TestClient(create_app(config)).get(
+        "/datasets", params={"url": "https://osf.io/pq7vb/files/osfstorage"}
+    )
+    assert {row["dataset_id"] for row in response.json()} == {root.id, nested.id}
+
+
 def test_name_aliases_are_searchable_and_protected_during_local_intake(config, tmp_path):
     """Record intake aliases, resolve them, and reserve them as dataset names."""
     item = ingest_local(
@@ -425,6 +460,39 @@ def test_all_core_api_routes(config, tmp_path):
     assert item["storage_mode"] == "reference"
     assert source.exists()
     assert client.post("/ingest/local", json={"source": str(tmp_path / "missing"), "name": "Missing", "version": "1"}).status_code == 400
+
+
+def test_cli_query_prompts_for_a_segment_url_match(config, tmp_path, monkeypatch):
+    """Let users choose one canonical name when a URL matches several datasets."""
+    root = ingest_local(
+        mock_dataset(tmp_path, "cli-osf-root"), "CLI OSF ROOT", Provider.OTHER,
+        "https://osf.io/pq7vb/", "1", ["meg"], config,
+    )
+    nested = ingest_local(
+        mock_dataset(tmp_path, "cli-osf-nested"), "CLI OSF NESTED", Provider.OTHER,
+        "https://osf.io/pq7vb/files/osfstorage", "1", ["eeg"], config,
+    )
+    monkeypatch.setattr(cli, "session", lambda: session(config))
+    monkeypatch.setattr(cli, "maybe_launch_cooldown_check", lambda: False)
+    monkeypatch.setattr(cli, "request_health_check", lambda dataset_id: request_health_check(dataset_id, config))
+    monkeypatch.setattr(cli, "console", cli.Console(width=160))
+    result = CliRunner().invoke(
+        cli.app, ["query", "--url", "https://osf.io/pq7vb/"],
+        input="not a dataset\nCLI OSF NESTED\n",
+    )
+    assert result.exit_code == 0
+    assert "Multiple matching datasets found" in result.output
+    assert "Name" in result.output and "Modalities" in result.output
+    assert "Source URL" in result.output and "Size" in result.output
+    assert "Enter one of the displayed canonical names" in result.output
+    assert str(Path(nested.storage_path).resolve()) in result.output
+    assert str(Path(root.storage_path).resolve()) not in result.output
+    positional = CliRunner().invoke(
+        cli.app, ["query", "https://osf.io/pq7vb/files/osfstorage"],
+        input="CLI OSF ROOT\n",
+    )
+    assert positional.exit_code == 0
+    assert str(Path(root.storage_path).resolve()) in positional.output
 
 
 def test_cli_query_and_list(config, tmp_path, monkeypatch):

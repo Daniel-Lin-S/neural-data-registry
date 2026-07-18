@@ -14,7 +14,11 @@ from neural_data_registry.health import request_health_check
 from neural_data_registry.db.models import Dataset
 from neural_data_registry.enums import Modality, Provider, StorageMode
 from neural_data_registry.service import DatasetConflictError, dataset_dict, download, find_datasets, ingest_local, session
-from neural_data_registry.service import DatasetNotFoundError, transition_reference_storage
+from neural_data_registry.service import (
+    DatasetNotFoundError,
+    transition_reference_storage,
+    update_dataset_metadata,
+)
 
 
 class LocalIngestionRequest(BaseModel):
@@ -43,6 +47,16 @@ class DownloadRequest(BaseModel):
 class StorageTransitionRequest(BaseModel):
     """Request a supported transition from reference to managed storage."""
     storage_mode: Literal[StorageMode.MOVE, StorageMode.COPY]
+
+
+class DatasetUpdateRequest(BaseModel):
+    """Metadata fields that may enrich an existing dataset."""
+    url: str | None = None
+    provider: Provider | None = None
+    version: str | None = None
+    modalities: list[Modality] = Field(default_factory=list)
+    aliases: list[str] = Field(default_factory=list)
+    force_replace: bool = False
 
 
 def create_app(config: Settings | None = None) -> FastAPI:
@@ -89,6 +103,28 @@ def create_app(config: Settings | None = None) -> FastAPI:
         if report.repair_in_progress:
             data["repair_in_progress"] = True
         return data
+
+    @api.patch("/datasets/{dataset_id}")
+    def update_dataset(dataset_id: str, request: DatasetUpdateRequest) -> dict:
+        try:
+            return dataset_dict(
+                update_dataset_metadata(
+                    dataset_id,
+                    url=request.url,
+                    provider=request.provider,
+                    version=request.version,
+                    modalities=request.modalities,
+                    aliases=request.aliases,
+                    force_replace=request.force_replace,
+                    config=config,
+                )
+            )
+        except DatasetNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except DatasetConflictError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @api.post("/datasets/{dataset_id}/storage-transition")
     def storage_transition(

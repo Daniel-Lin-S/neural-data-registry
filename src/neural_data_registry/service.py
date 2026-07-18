@@ -255,6 +255,173 @@ def add_name_aliases(
             db.close()
 
 
+def _has_remote_source_url(item: Dataset) -> bool:
+    """Return whether the dataset already has a canonical remote URL."""
+    return bool(
+        item.source_url
+        and urlparse(item.source_url).scheme not in ("", "file")
+    )
+
+
+def _raise_if_source_reference_conflicts(
+    db: Session, source_reference: str, *, dataset_id: str
+) -> None:
+    """Reject a source URL/path already reserved by another dataset."""
+    existing = db.scalar(
+        select(Dataset)
+        .outerjoin(DatasetAlias)
+        .where(
+            Dataset.id != dataset_id,
+            or_(
+                Dataset.source_url == source_reference,
+                and_(
+                    DatasetAlias.kind.in_(("url", "path")),
+                    DatasetAlias.value == source_reference,
+                ),
+            ),
+        )
+        .order_by(Dataset.created_at.desc())
+    )
+    if existing is not None:
+        _raise_dataset_conflict(existing, "source URL/path")
+
+
+def _replace_scalar_metadata(
+    item: Dataset,
+    field: str,
+    value: str | Provider,
+    *,
+    missing: bool,
+    force_replace: bool,
+) -> None:
+    """Fill one scalar value, requiring force before replacing it."""
+    current = getattr(item, field)
+    if current == value:
+        return
+    if not missing and not force_replace:
+        display_current = current.value if isinstance(current, Enum) else current
+        raise ValueError(
+            f"Dataset {field.replace('_', ' ')} is already set to "
+            f"{display_current!r}; use --force-replace to change it"
+        )
+    setattr(item, field, value)
+
+
+def update_dataset_metadata(
+    identifier: str,
+    *,
+    url: str | None = None,
+    provider: Provider | str | None = None,
+    version: str | None = None,
+    modalities: Sequence[str | Modality] = (),
+    aliases: Sequence[str] = (),
+    force_replace: bool = False,
+    config: Settings | None = None,
+) -> Dataset:
+    """Enrich registered metadata without changing dataset files or identity.
+
+    URLs can be added only to datasets without a canonical remote URL. Provider
+    and version may replace non-missing values only with ``force_replace``.
+    Modalities and aliases are append-only.
+    """
+    if not any((url is not None, provider is not None, version is not None, modalities, aliases)):
+        raise ValueError("Provide at least one metadata field to update")
+    config = config or get_settings()
+    normalized_aliases = _normalize_name_aliases(aliases)
+    normalized_modalities = normalize_modalities(modalities)
+    normalized_url = url.strip() if url is not None else None
+    if normalized_url == "":
+        raise ValueError("Source URL cannot be blank")
+    normalized_version = version.strip() if version is not None else None
+    if normalized_version == "":
+        raise ValueError("Version cannot be blank")
+    requested_provider = Provider(provider) if provider is not None else None
+    detected_provider = provider_for_url(normalized_url) if normalized_url else None
+    if (
+        requested_provider is not None
+        and detected_provider is not None
+        and requested_provider is not detected_provider
+    ):
+        raise ValueError(
+            "Provider conflicts with the supplied URL; source URLs determine provider"
+        )
+
+    with ingestion_lock("registry-intake", config):
+        ensure_layout(config)
+        create_database(config)
+        db = get_session_factory(config.resolved_database_url)()
+        try:
+            item = resolve_dataset(db, identifier)
+            if item is None:
+                raise DatasetNotFoundError(
+                    f"No dataset matched the supplied ID, name, alias, or URL: {identifier}"
+                )
+
+            if normalized_url is not None:
+                if _has_remote_source_url(item) and item.source_url != normalized_url:
+                    raise ValueError(
+                        "Dataset source URL is already set and cannot be replaced"
+                    )
+                if item.source_url != normalized_url:
+                    _raise_if_source_reference_conflicts(
+                        db, normalized_url, dataset_id=item.id
+                    )
+                    item.source_url = normalized_url
+                    if not any(
+                        alias.kind == "url" and alias.value == normalized_url
+                        for alias in item.aliases
+                    ):
+                        item.aliases.append(
+                            DatasetAlias(kind="url", value=normalized_url)
+                        )
+
+            effective_provider = detected_provider or requested_provider
+            if effective_provider is not None:
+                _replace_scalar_metadata(
+                    item,
+                    "provider",
+                    effective_provider,
+                    missing=item.provider is Provider.OTHER,
+                    force_replace=force_replace,
+                )
+            if normalized_version is not None:
+                _replace_scalar_metadata(
+                    item,
+                    "version",
+                    normalized_version,
+                    missing=item.version == "unknown",
+                    force_replace=force_replace,
+                )
+
+            merged_modalities = sorted(
+                set(filter(None, item.modalities.split(","))) | set(normalized_modalities)
+            )
+            item.modalities = ",".join(merged_modalities)
+            aliases_to_add = _normalize_name_aliases(normalized_aliases, item.name)
+            _raise_if_name_aliases_conflict(db, aliases_to_add, dataset_id=item.id)
+            existing_aliases = {
+                alias.value.casefold()
+                for alias in item.aliases
+                if alias.kind == USER_NAME_ALIAS_KIND
+            }
+            for alias in aliases_to_add:
+                if alias.casefold() not in existing_aliases:
+                    item.aliases.append(DatasetAlias(kind=USER_NAME_ALIAS_KIND, value=alias))
+
+            db.commit()
+            db.refresh(item)
+            list(item.aliases)
+            (config.registry_dir / f"{item.id}.json").write_text(
+                json.dumps(dataset_dict(item), indent=2), encoding="utf-8"
+            )
+            return item
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
+
+
 def _preflight_dataset_identity(
     name: str,
     source_reference: str | None,

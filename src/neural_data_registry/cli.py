@@ -22,6 +22,7 @@ from neural_data_registry.service import (
     ingest_local,
     resolve_dataset,
     session,
+    update_dataset_metadata,
 )
 
 app = typer.Typer(help="Search, list, ingest, and download managed neuroscience datasets.", add_completion=False)
@@ -196,6 +197,36 @@ def add_alias_command(
     try:
         item = add_name_aliases(dataset, alias)
     except (ValueError, RuntimeError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    console.print_json(data=dataset_dict(item))
+
+
+@app.command("update")
+def update_command(
+    dataset: Annotated[str, typer.Argument(help="Dataset ID, canonical name, existing alias, or source URL.")],
+    url: str | None = typer.Option(None, "--url", help="Canonical remote source URL to add when missing."),
+    provider: Provider | None = typer.Option(None, "--provider", help="Dataset provider; a supplied URL determines this value."),
+    version: str | None = typer.Option(None, "--version", help="Dataset version to add or replace."),
+    modality: list[Modality] = typer.Option([], "--modality", help="Dataset modality to append; repeat for multiple modalities."),
+    alias: list[str] = typer.Option([], "--alias", help="Searchable alternate dataset name to append; repeat for multiple aliases."),
+    force_replace: bool = typer.Option(False, "--force-replace", help="Allow replacement of an existing provider or version."),
+):
+    """Add missing metadata to a registered dataset.
+
+    Modalities and aliases are appended. Existing provider or version values
+    require --force-replace; an existing canonical source URL cannot change.
+    """
+    try:
+        item = update_dataset_metadata(
+            dataset,
+            url=url,
+            provider=provider,
+            version=version,
+            modalities=[item.value for item in modality],
+            aliases=alias,
+            force_replace=force_replace,
+        )
+    except (ValueError, RuntimeError, LookupError) as exc:
         raise typer.BadParameter(str(exc)) from exc
     console.print_json(data=dataset_dict(item))
 

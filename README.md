@@ -167,6 +167,19 @@ Aliases are append-only: repeat the command to add another name. Use
 
 Use `--proxy https://proxy.example:8080` to configure a download proxy. Use `--mirror https://mirror.example/{dataset_id}.git` (or a mirror base URL) to select a mirror URL. The API accepts the same `proxy` and `mirror` fields, and deployment defaults can be set with `NDR_DOWNLOAD_PROXY` and `NDR_DOWNLOAD_MIRROR`.
 
+### `brainctl update`
+
+Add metadata to a dataset already registered in the registry:
+
+```bash
+brainctl update THINGS-MEG --version 3.0.0 --modality MEG --alias THINGS_MEG
+```
+
+Repeat `--modality` and `--alias` to append values. A missing canonical URL can
+be added with `--url`; its provider is detected from the URL. Existing provider
+and version values are protected unless `--force-replace` is supplied. A
+canonical source URL is never replaced.
+
 ## API
 
 Run the API service:

@@ -32,7 +32,7 @@ from neural_data_registry.service import (
 )
 from neural_data_registry.storage import directory_size, ensure_layout, process_lock
 from neural_data_registry.storage import dataset_destination, ingestion_lock
-from neural_data_registry.service import dataset_dict, find_datasets, ingest_local, session
+from neural_data_registry.service import dataset_dict, find_datasets, ingest_local, session, update_dataset_metadata
 
 
 @pytest.fixture
@@ -1248,3 +1248,89 @@ def test_successful_datalad_health_check_refreshes_size(config, tmp_path, monkey
         history = db.query(HealthCheckHistory).filter_by(dataset_id=item.id).one()
         assert stored.size_bytes == expected_size
         assert history.result == "healthy"
+
+def test_update_metadata_enriches_missing_values_and_refreshes_manifest(config, tmp_path):
+    """Metadata updates fill local-record gaps while retaining the path identity."""
+    item = ingest_local(
+        mock_dataset(tmp_path, "update-missing"),
+        "Update missing",
+        Provider.OTHER,
+        None,
+        None,
+        [],
+        config,
+    )
+    original_path = item.source_url
+
+    updated = update_dataset_metadata(
+        item.id,
+        url="https://openneuro.org/datasets/ds009999",
+        version="1.0.0",
+        modalities=["meg", "eeg", "meg"],
+        aliases=["Update alias", "Update alias"],
+        config=config,
+    )
+
+    data = dataset_dict(updated)
+    assert data["source_url"] == "https://openneuro.org/datasets/ds009999"
+    assert data["provider"] == "openneuro"
+    assert data["version"] == "1.0.0"
+    assert data["modalities"] == ["eeg", "meg"]
+    assert data["aliases"] == ["Update alias"]
+    assert json.loads((config.registry_dir / f"{item.id}.json").read_text()) == data
+    with session(config) as db:
+        assert resolve_dataset(db, original_path).id == item.id
+        assert resolve_dataset(db, data["source_url"]).id == item.id
+
+
+def test_update_metadata_requires_force_and_never_replaces_url(config, tmp_path):
+    """Existing scalar metadata is guarded and remote URLs remain immutable."""
+    item = ingest_mock(config, tmp_path)
+    with pytest.raises(ValueError, match="force-replace"):
+        update_dataset_metadata(item.id, version="4.0.0", config=config)
+    updated = update_dataset_metadata(
+        item.id, version="4.0.0", provider=Provider.DANDI,
+        force_replace=True, config=config,
+    )
+    assert updated.version == "4.0.0"
+    assert updated.provider is Provider.DANDI
+    with pytest.raises(ValueError, match="cannot be replaced"):
+        update_dataset_metadata(
+            item.id, url="https://openneuro.org/datasets/ds000001", config=config
+        )
+
+
+def test_update_metadata_cli_and_api_statuses(config, tmp_path, monkeypatch):
+    """CLI resolves identifiers and PATCH reports the documented error codes."""
+    item = ingest_local(
+        mock_dataset(tmp_path, "update-cli"), "Update CLI", Provider.OTHER,
+        None, None, [], config,
+    )
+    other = ingest_local(
+        mock_dataset(tmp_path, "update-conflict"), "Update conflict", Provider.OTHER,
+        None, None, [], config,
+    )
+    monkeypatch.setattr(cli, "session", lambda: session(config))
+    monkeypatch.setattr(
+        cli, "update_dataset_metadata",
+        lambda identifier, **kwargs: update_dataset_metadata(identifier, config=config, **kwargs),
+    )
+    monkeypatch.setattr(cli, "maybe_launch_cooldown_check", lambda: False)
+    result = CliRunner().invoke(
+        cli.app,
+        ["update", "Update CLI", "--version", "1", "--modality", "meg", "--alias", "CLI alias"],
+    )
+    assert result.exit_code == 0
+    assert '"version": "1"' in result.output
+    assert '"aliases": [' in result.output
+
+    client = TestClient(create_app(config))
+    assert client.patch("/datasets/no-such-id", json={"version": "1"}).status_code == 404
+    assert client.patch(f"/datasets/{item.id}", json={"version": "2"}).status_code == 400
+    assert client.patch(f"/datasets/{item.id}", json={"url": other.source_url}).status_code == 409
+    response = client.patch(
+        f"/datasets/{item.id}", json={"modalities": ["eeg", "meg"], "aliases": ["API alias"]}
+    )
+    assert response.status_code == 200
+    assert response.json()["modalities"] == ["eeg", "meg"]
+    assert response.json()["aliases"] == ["API alias", "CLI alias"]

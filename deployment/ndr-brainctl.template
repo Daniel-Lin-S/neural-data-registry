@@ -1,0 +1,20 @@
+#!/bin/sh
+
+set -eu
+umask 027
+
+cd @SERVICE_HOME@
+
+if [ "${1-}" = "ingest-local" ]; then
+    printf "Use the protected public brainctl wrapper for ingest-local.\n" >&2
+    exit 2
+fi
+
+exec @ENV_PATH@ -i \
+    HOME=@SERVICE_HOME@ \
+    PATH=@SAFE_PATH@ \
+    PYTHONNOUSERSITE=1 \
+    NDR_DATA_ROOT=@DATA_ROOT@ \
+    NDR_DATABASE_URL=@DATABASE_URL@ \
+    NDR_STARTUP_HEALTH_CHECK_ENABLED=false \
+    @CLI_PATH@ "$@"

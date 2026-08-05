@@ -25,9 +25,9 @@ variable. Every CLI or API process that should use the same registry must receiv
 the same value:
 
 ```bash
-export NDR_DATA_ROOT=/data/neural_data
+export NDR_DATA_ROOT=/ABSOLUTE/PATH/TO/NEURAL_DATA
 # Optional database override; otherwise SQLite is stored under NDR_DATA_ROOT.
-export NDR_DATABASE_URL=sqlite:////data/neural_data/registry/registry.db
+export NDR_DATABASE_URL=sqlite:////ABSOLUTE/PATH/TO/NEURAL_DATA/registry/registry.db
 ```
 
 These values can also be placed in a `.env` file in the working directory. For a long-running service, configure them in the service manager or deployment environment. If `NDR_DATABASE_URL` is omitted, the application uses `$NDR_DATA_ROOT/registry/registry.db`.
@@ -69,7 +69,7 @@ IDs and names are unique. URL segment matches can be ambiguous, in which case `b
 Lists all registered datasets as a structured summary, optionally narrowed to one modality or provider.
 
 ```bash
-brainctl list --modality MEG
+brainctl list --modality meg
 brainctl list --provider openneuro
 brainctl list --query THINGS_MEG  # searches canonical names and aliases
 ```
@@ -113,13 +113,13 @@ Registers a dataset that has already been downloaded to a local directory, or a 
 Usage example:
 
 ```bash
-brainctl ingest-local /data/legacy/things-meg \
+brainctl ingest-local /path/to/things-meg \
   --name THINGS-MEG \
   --alias THINGS_MEG \
   --alias "THINGS object vision" \
   --url "https://openneuro.org/datasets/ds004212" \
   --version 3.0.0 \
-  --modality MEG
+  --modality meg
 ```
 
 `SOURCE` must be an existing directory. `--name` and `--version` are required.
@@ -130,6 +130,34 @@ register searchable alternate names alongside the canonical `--name`.
 By default (`--storage-mode reference`), the command leaves `SOURCE` where it is and records its absolute path. Use `--storage-mode move` to relocate `SOURCE` into `$NDR_DATA_ROOT/datasets`. Use `--storage-mode copy` to preserve `SOURCE` while creating a managed duplicate; this consumes additional disk space and should only be used when `SOURCE` may be cleaned in the future. (DO NOT use `move` mode if your source location is still used by other codes)
 Before validating or moving `SOURCE`, it rejects a duplicate canonical name or
 source URL/path and reports the existing storage path.
+
+### Protected CLI local ingestion
+
+Install this service account so that `ingest-local` is delegated to the locally configured service account. The service account alone can write the registry, manifests, logs, and managed datasets; ordinary accounts cannot write those paths directly. (installation requires admin)
+
+Installation steps:
+
+1. Copy `deployment/reference_ingest.env.example` to `deployment/reference_ingest.local.env` and replace every placeholder.
+
+```bash
+# make the file root-owned
+sudo chown root:root /path/to/registry/deployment/reference_ingest.local.env
+sudo chmod 600 /path/to/registry/deployment/reference_ingest.local.env
+```
+2. User an administrator accont to make the local file root-owned with mode `600`,
+   then run:
+
+   ```bash
+   sudo $REPOSITORY_ROOT/deployment/install_protected_ingest.sh \
+     $LOCAL_REFERENCE_INGEST_CONFIG
+   ```
+
+The installation process `install_protected_ingest.sh` should be re-run when:
+
+- source codes under `src` changes
+- python dependencies changes
+- `deployment/` files changes
+- $LOCAL_REFERENCE_INGEST_CONFIG changes
 
 ### `brainctl download`
 
@@ -142,7 +170,7 @@ duplicate is never downloaded or processed again.
 
 
 ```bash
-brainctl download --url "https://openneuro.org/datasets/ds007338/versions/1.0.0" --name EXAMPLE-MEG --alias EXAMPLE --modality MEG
+brainctl download --url "https://openneuro.org/datasets/ds007338/versions/1.0.0" --name EXAMPLE-MEG --alias EXAMPLE --modality meg
 ```
 
 `--url` is required. `--version` is optional only when an OpenNeuro URL contains a version such as `/versions/1.0.0`; otherwise provide it manually. An explicit `--version` may name a provider branch or tag.
@@ -172,7 +200,7 @@ Use `--proxy https://proxy.example:8080` to configure a download proxy. Use `--m
 Add metadata to a dataset already registered in the registry:
 
 ```bash
-brainctl update THINGS-MEG --version 3.0.0 --modality MEG --alias THINGS_MEG
+brainctl update THINGS-MEG --version 3.0.0 --modality meg --alias THINGS_MEG
 ```
 
 Repeat `--modality` and `--alias` to append values. A missing canonical URL can
@@ -230,7 +258,7 @@ Register an existing local dataset with `POST /ingest/local`:
 curl -X POST http://127.0.0.1:8000/ingest/local \
   -H 'Content-Type: application/json' \
   -d '{
-    "source": "/data/legacy/things-meg",
+    "source": "/path/to/things-meg",
     "name": "THINGS-MEG",
     "url": "https://openneuro.org/datasets/ds004212",
     "version": "3.0.0",

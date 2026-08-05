@@ -2,14 +2,7 @@
 
 ## Dataset intake idempotency
 
-Before `ingest_local`, `download`, or any future dataset-intake action performs
-provider/network work, creates an incoming workspace, reads dataset contents,
-moves files, or records a job, it must check for both canonical-name and
-canonical-URL/path conflicts. A conflict must abort the action and report the
-existing dataset and storage path; duplicate datasets must never be processed
-again. Repeat this check while holding the registry intake lock so concurrent
-requests cannot bypass it. New intake routes must reuse the shared service
-preflight rather than implementing their own duplicate handling.
+Before `ingest_local`, `download`, or any future dataset-intake action performs provider/network work, creates an incoming workspace, reads dataset contents, moves files, or records a job, it must check for both canonical-name and canonical-URL/path conflicts. A conflict must abort the action and report the existing dataset and storage path; duplicate datasets must never be processed again. Repeat this check while holding the registry intake lock so concurrent requests cannot bypass it. New intake routes must reuse the shared service preflight rather than implementing their own duplicate handling.
 
 ### Process lock
 
@@ -24,3 +17,6 @@ Field update:
 - If future versions add new fields to the dataset meta (SQL), it should be updated automatically for old neural dataset entries.
 - If future version deprecated any field, the field values of previously registered neural datasets should be preserved in the database, but not shown to user.
 
+## Documentation rules
+
+For README.md, docstring, and documentations in the codebase, DONT include excessive implementation details for the public interfaces. Details should be written in docstring of the corresponding modules rather than all stacking in a public interface or `README.md`.

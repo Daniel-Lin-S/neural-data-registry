@@ -1,0 +1,11 @@
+#!/bin/sh
+
+set -eu
+
+if [ "${1-}" = "ingest-local" ]; then
+    shift
+    exec @SUDO_PATH@ -n -- @HELPER_PATH@ "$@"
+fi
+
+exec @SUDO_PATH@ -n -u @SERVICE_USER@ -- \
+    @COMMAND_HELPER_PATH@ "$@"

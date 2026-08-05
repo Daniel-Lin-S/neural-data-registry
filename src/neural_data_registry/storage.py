@@ -27,21 +27,32 @@ def directory_size(path: Path) -> int:
     """
     total = 0
     seen: set[tuple[int, int]] = set()
-    for item in path.rglob("*"):
-        try:
-            item_stat = item.stat()
-        except FileNotFoundError:
-            # A dangling link (or a file removed during traversal) contributes
-            # no readable payload.
-            continue
-        if not stat.S_ISREG(item_stat.st_mode):
-            continue
-        identity = (item_stat.st_dev, item_stat.st_ino)
-        if identity in seen:
-            continue
-        seen.add(identity)
-        total += item_stat.st_size
+
+    def raise_walk_error(error: OSError) -> None:
+        raise error
+
+    for current_root, directory_names, file_names in os.walk(
+        path,
+        followlinks=False,
+        onerror=raise_walk_error,
+    ):
+        current = Path(current_root)
+        for name in (*directory_names, *file_names):
+            item = current / name
+            try:
+                item_stat = item.stat()
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISREG(item_stat.st_mode):
+                continue
+            identity = (item_stat.st_dev, item_stat.st_ino)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            total += item_stat.st_size
     return total
+
+
 def safe_component(value: str) -> str: return re.sub(r"[^a-zA-Z0-9._-]+", "-", value).strip(".-").lower() or "dataset"
 
 @contextmanager

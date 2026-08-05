@@ -1,0 +1,26 @@
+#!/bin/sh
+
+set -eu
+umask 027
+
+: "${SUDO_UID:?Missing SUDO_UID from sudo}"
+: "${SUDO_GID:?Missing SUDO_GID from sudo}"
+: "${SUDO_USER:?Missing SUDO_USER from sudo}"
+
+cd @SERVICE_HOME@
+
+exec @ENV_PATH@ -i \
+    HOME=@SERVICE_HOME@ \
+    PATH=@SAFE_PATH@ \
+    PYTHONNOUSERSITE=1 \
+    SUDO_UID="$SUDO_UID" \
+    SUDO_GID="$SUDO_GID" \
+    SUDO_USER="$SUDO_USER" \
+    NDR_DATA_ROOT=@DATA_ROOT@ \
+    NDR_DATABASE_URL=@DATABASE_URL@ \
+    NDR_SERVICE_USER=@SERVICE_USER@ \
+    NDR_PRIVILEGED_INGEST_ONLY=true \
+    NDR_PRIVILEGED_SOURCE_ROOTS=@SOURCE_ROOTS@ \
+    NDR_PROTECTED_COORDINATOR=true \
+    NDR_STARTUP_HEALTH_CHECK_ENABLED=false \
+    @CLI_PATH@ ingest-local "$@"

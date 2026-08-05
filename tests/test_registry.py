@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from pathlib import Path
 import json
+import os
 import subprocess
 from unittest.mock import Mock
 
@@ -12,6 +14,7 @@ from typer.testing import CliRunner
 
 from neural_data_registry import cli
 from neural_data_registry import health as health_service
+from neural_data_registry import storage as storage_service
 from neural_data_registry.config import Settings, get_settings
 from neural_data_registry.db.models import Base, Dataset, DatasetAlias, HealthCheckHistory, IngestionJob
 from neural_data_registry.db.session import create_database, get_session_factory
@@ -23,11 +26,15 @@ from neural_data_registry.health import (
 )
 from neural_data_registry.main import create_app
 from neural_data_registry.provider import base as provider_base
+from neural_data_registry import protected_ingest
 from neural_data_registry.service import (
     add_name_aliases,
+    commit_local_ingestion_request,
     download as download_dataset,
+    prepare_local_ingestion_request,
     resolve_dataset,
     resolve_download_version,
+    validate_privileged_source,
     infer_url_version,
 )
 from neural_data_registry.storage import directory_size, ensure_layout, process_lock
@@ -80,6 +87,432 @@ def test_local_ingestion_references_mock_dataset_by_default(config, tmp_path):
     assert Path(data["storage_path"]) == source.resolve()
     assert (Path(data["storage_path"]) / "meg.fif").is_file()
     assert (config.registry_dir / f"{item.id}.json").is_file()
+
+
+def test_protected_local_ingestion(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Protect the registry while allowing approved local sources."""
+    registry_root = tmp_path / "neural_data"
+    data_root = tmp_path / "data"
+    data2_root = tmp_path / "data2"
+    data_root.mkdir()
+    data2_root.mkdir()
+    config_incoming_root = registry_root / "incoming"
+    config_incoming_root.mkdir(parents=True)
+    config = Settings(
+        data_root=registry_root,
+        privileged_ingest_only=True,
+        privileged_source_roots=f"{data_root}:{data2_root}",
+    )
+    source = mock_dataset(data_root, "allowed-reference")
+    move_source = mock_dataset(data2_root, "allowed-move")
+    copy_source = mock_dataset(data2_root, "allowed-copy")
+    incoming_source = mock_dataset(
+        config_incoming_root,
+        "allowed-incoming",
+    )
+    outside_source = mock_dataset(tmp_path, "outside-source")
+    escaped_source = data_root / "escaped-source"
+    escaped_source.symlink_to(outside_source, target_is_directory=True)
+    managed_source = config.datasets_dir / "managed-source"
+    managed_source.mkdir(parents=True)
+
+    item = ingest_local(
+        source,
+        "Protected reference",
+        Provider.OTHER,
+        None,
+        "1",
+        ["meg"],
+        config,
+    )
+    assert Path(item.storage_path) == source.resolve()
+    assert validate_privileged_source(move_source, config) == move_source
+    assert (
+        validate_privileged_source(incoming_source, config)
+        == incoming_source
+    )
+    incoming_item = ingest_local(
+        incoming_source,
+        "Protected incoming",
+        Provider.OTHER,
+        None,
+        "1",
+        ["meg"],
+        config,
+    )
+    assert Path(incoming_item.storage_path) == incoming_source.resolve()
+    with pytest.raises(ValueError, match="allowed root"):
+        validate_privileged_source(outside_source, config)
+    with pytest.raises(ValueError, match="managed storage"):
+        validate_privileged_source(managed_source, config)
+    with pytest.raises(ValueError, match="allowed root"):
+        validate_privileged_source(escaped_source, config)
+
+    moved = ingest_local(
+        move_source, "Protected move", Provider.OTHER, None, "1", ["meg"],
+        config, storage_mode=StorageMode.MOVE,
+    )
+    assert moved.storage_mode is StorageMode.MOVE
+    assert not move_source.exists()
+
+    monkeypatch.setattr(cli, "get_settings", lambda: config)
+    monkeypatch.setattr(cli, "maybe_launch_cooldown_check", lambda: None)
+    copied = CliRunner().invoke(
+        cli.app,
+        [
+            "ingest-local", str(copy_source), "--name", "Protected copy",
+            "--modality", "meg", "--storage-mode", "copy",
+        ],
+    )
+    assert copied.exit_code == 0, copied.output
+    assert copy_source.exists()
+
+
+def _caller_scoped_config(tmp_path: Path) -> Settings:
+    """Create protected settings with isolated source and registry roots."""
+    data_root = tmp_path / "data"
+    data2_root = tmp_path / "data2"
+    data_root.mkdir()
+    data2_root.mkdir()
+    return Settings(
+        data_root=tmp_path / "neural_data",
+        privileged_ingest_only=True,
+        privileged_source_roots=f"{data_root}:{data2_root}",
+        protected_coordinator=True,
+        service_user="test-service",
+        startup_health_check_enabled=False,
+    )
+
+
+def _mock_caller_scoped_identities(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Avoid real UID changes while retaining coordinator identity checks."""
+    identity = protected_ingest.UnixIdentity(
+        "test-user",
+        os.getuid(),
+        os.getgid(),
+        tuple(os.getgroups()),
+    )
+    monkeypatch.setattr(protected_ingest.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(
+        protected_ingest,
+        "caller_identity_from_sudo",
+        lambda: identity,
+    )
+    monkeypatch.setattr(
+        protected_ingest,
+        "_identity_for_account",
+        lambda _: identity,
+    )
+    monkeypatch.setattr(
+        protected_ingest,
+        "effective_identity",
+        lambda _: nullcontext(),
+    )
+
+
+def test_caller_scoped_reference_uses_only_submitted_source(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Measure as caller and prevent the service from reopening the source."""
+    config = _caller_scoped_config(tmp_path)
+    source = mock_dataset(tmp_path / "data", "submitted-reference")
+    _mock_caller_scoped_identities(monkeypatch)
+    measured_paths: list[Path] = []
+    preflight_count = 0
+    original_preflight = protected_ingest.preflight_local_ingestion_request
+
+    def measure_submitted_path(path: Path) -> int:
+        measured_paths.append(path)
+        return 123
+
+    def count_preflight(request, settings) -> None:
+        nonlocal preflight_count
+        preflight_count += 1
+        original_preflight(request, settings)
+
+    def reject_service_scan(path: Path) -> int:
+        raise AssertionError(f"service scanned original source: {path}")
+
+    monkeypatch.setattr(
+        protected_ingest,
+        "directory_size",
+        measure_submitted_path,
+    )
+    monkeypatch.setattr(
+        protected_ingest,
+        "preflight_local_ingestion_request",
+        count_preflight,
+    )
+    monkeypatch.setattr(
+        "neural_data_registry.service.directory_size",
+        reject_service_scan,
+    )
+
+    item, warning = protected_ingest.coordinate_protected_ingestion(
+        source,
+        "Caller reference",
+        Provider.OTHER,
+        None,
+        "1",
+        ["meg"],
+        StorageMode.REFERENCE,
+        [],
+        config,
+    )
+
+    assert warning is None
+    assert measured_paths == [source.resolve()]
+    assert preflight_count == 2
+    assert item.size_bytes == 123
+    assert item.size_bytes_known is True
+    assert Path(item.storage_path) == source.resolve()
+
+
+def test_caller_scoped_reference_allows_unknown_size(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Register an inaccessible size as unknown instead of fabricating zero."""
+    config = _caller_scoped_config(tmp_path)
+    source = mock_dataset(tmp_path / "data", "unknown-size-reference")
+    _mock_caller_scoped_identities(monkeypatch)
+
+    def reject_size_scan(path: Path) -> int:
+        raise PermissionError(f"cannot read {path}")
+
+    monkeypatch.setattr(protected_ingest, "directory_size", reject_size_scan)
+
+    item, warning = protected_ingest.coordinate_protected_ingestion(
+        source,
+        "Unknown size reference",
+        Provider.OTHER,
+        None,
+        "1",
+        ["meg"],
+        StorageMode.REFERENCE,
+        [],
+        config,
+    )
+
+    assert warning is not None
+    assert "unknown size" in warning
+    assert item.size_bytes_known is False
+    assert dataset_dict(item)["size_bytes"] is None
+
+
+@pytest.mark.parametrize("storage_mode", [StorageMode.COPY, StorageMode.MOVE])
+def test_caller_scoped_managed_ingestion_stages_only_submitted_source(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    storage_mode: StorageMode,
+) -> None:
+    """Use caller staging and keep the service away from the original path."""
+    config = _caller_scoped_config(tmp_path)
+    source = mock_dataset(
+        tmp_path / "data2",
+        f"submitted-{storage_mode.value}",
+    )
+    _mock_caller_scoped_identities(monkeypatch)
+    measured_paths: list[Path] = []
+    real_directory_size = directory_size
+
+    def measure_staging(path: Path) -> int:
+        measured_paths.append(path)
+        return real_directory_size(path)
+
+    def reject_service_scan(path: Path) -> int:
+        raise AssertionError(f"service scanned original source: {path}")
+
+    monkeypatch.setattr(protected_ingest, "directory_size", measure_staging)
+    monkeypatch.setattr(
+        "neural_data_registry.service.directory_size",
+        reject_service_scan,
+    )
+
+    item, warning = protected_ingest.coordinate_protected_ingestion(
+        source,
+        f"Caller {storage_mode.value}",
+        Provider.OTHER,
+        None,
+        "1",
+        ["meg"],
+        storage_mode,
+        [],
+        config,
+    )
+
+    assert warning is None
+    assert len(measured_paths) == 1
+    assert measured_paths[0].is_relative_to(config.incoming_dir)
+    assert Path(item.storage_path).is_relative_to(config.datasets_dir)
+    assert Path(item.storage_path, "meg.fif").is_file()
+    assert list(config.incoming_dir.iterdir()) == []
+    assert source.exists() is (storage_mode is StorageMode.COPY)
+
+
+def test_caller_scoped_staging_failure_preserves_partial_data(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Report the retained staging path without deleting partial data."""
+    config = _caller_scoped_config(tmp_path)
+    source = mock_dataset(tmp_path / "data", "failed-copy")
+    _mock_caller_scoped_identities(monkeypatch)
+
+    def fail_after_partial_copy(source_path: Path, destination: Path) -> None:
+        destination.mkdir()
+        (destination / "partial.bin").write_bytes(b"partial")
+        raise PermissionError(f"cannot finish reading {source_path}")
+
+    monkeypatch.setattr(
+        protected_ingest.shutil,
+        "copytree",
+        fail_after_partial_copy,
+    )
+
+    with pytest.raises(RuntimeError, match="partial data was retained at"):
+        protected_ingest.coordinate_protected_ingestion(
+            source,
+            "Failed caller copy",
+            Provider.OTHER,
+            None,
+            "1",
+            ["meg"],
+            StorageMode.COPY,
+            [],
+            config,
+        )
+
+    staging_roots = list(config.incoming_dir.iterdir())
+    assert len(staging_roots) == 1
+    assert Path(staging_roots[0], "payload", "partial.bin").is_file()
+    assert source.is_dir()
+
+
+def test_prepared_ingestion_restores_staging_before_failed_commit(
+    config: Settings,
+    tmp_path: Path,
+) -> None:
+    """Return prepared data to staging when validation aborts the commit."""
+    original_source = tmp_path / "original-source"
+    config.incoming_dir.mkdir(parents=True)
+    staging_source = mock_dataset(config.incoming_dir, "prepared-source")
+    request = prepare_local_ingestion_request(
+        original_source,
+        "Prepared failure",
+        Provider.OTHER,
+        None,
+        "1",
+        ["meg"],
+        StorageMode.COPY,
+        [],
+    )
+
+    with ingestion_lock("registry-intake", config):
+        with pytest.raises(ValueError, match="non-negative"):
+            commit_local_ingestion_request(
+                request,
+                config,
+                prepared_source=staging_source,
+                source_prevalidated=True,
+                size_bytes=-1,
+            )
+
+    assert staging_source.is_dir()
+    assert Path(staging_source, "meg.fif").is_file()
+    assert list(config.datasets_dir.iterdir()) == []
+
+
+def test_protected_installer_never_traverses_source_roots() -> None:
+    """Keep source-root validation constant-time and preserve existing data."""
+    repository_root = Path(__file__).resolve().parents[1]
+    deployment_root = repository_root / "deployment"
+    installer = (deployment_root / "install_protected_ingest.sh").read_text()
+    wrapper = (deployment_root / "brainctl.template").read_text()
+    helper = (deployment_root / "ndr-ingest-local.template").read_text()
+    command_helper = (
+        deployment_root / "ndr-brainctl.template"
+    ).read_text()
+    sudoers = (
+        deployment_root / "ndr-ingest-local.sudoers.template"
+    ).read_text()
+
+    assert '@COMMAND_HELPER_PATH@ "$@"' in wrapper
+    assert '@CLI_PATH@ "$@"' in command_helper
+    assert '"${1-}" = "ingest-local"' in command_helper
+    assert 'find "$source_root"' not in installer
+    assert 'chown -R "$source_root"' not in installer
+    assert 'chmod -R "$source_root"' not in installer
+    assert "setfacl" not in installer
+    assert "NDR_STARTUP_HEALTH_CHECK_ENABLED=false" in helper
+    assert "NDR_STARTUP_HEALTH_CHECK_ENABLED=false" in command_helper
+    assert "ALL ALL = (root)" in sudoers
+    assert "ALL ALL = (@SERVICE_USER@)" in sudoers
+
+
+def test_protected_cli_disables_automatic_health_scan(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Avoid unrelated background traversal from protected CLI startup."""
+    config = Settings(
+        data_root=tmp_path / "registry",
+        startup_health_check_enabled=False,
+    )
+    launch = Mock()
+    monkeypatch.setattr(cli, "get_settings", lambda: config)
+    monkeypatch.setattr(cli, "maybe_launch_cooldown_check", launch)
+
+    cli.startup_health_check(Mock(invoked_subcommand="ingest-local"))
+
+    launch.assert_not_called()
+
+
+def test_ingest_local_cli_routes_through_protected_coordinator(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Keep the public command while selecting the protected coordinator."""
+    config = _caller_scoped_config(tmp_path)
+    source = mock_dataset(tmp_path / "data", "cli-protected-source")
+    expected_item = Mock()
+    coordinate = Mock(
+        return_value=(expected_item, "size is unknown"),
+    )
+    monkeypatch.setattr(cli, "get_settings", lambda: config)
+    monkeypatch.setattr(
+        protected_ingest,
+        "coordinate_protected_ingestion",
+        coordinate,
+    )
+    monkeypatch.setattr(
+        cli,
+        "dataset_dict",
+        lambda item: {"dataset_id": "protected-id"},
+    )
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "ingest-local",
+            str(source),
+            "--name",
+            "Protected CLI",
+            "--modality",
+            "meg",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "size is unknown" in result.output
+    assert "protected-id" in result.output
+    coordinate.assert_called_once()
 
 
 def test_local_ingestion_can_move_mock_dataset(config, tmp_path):
@@ -549,6 +982,7 @@ def test_create_database_reconciles_missing_columns_across_registry(config):
         dataset = db.get(Dataset, "legacy-id")
         assert dataset is not None
         assert dataset.storage_mode.value == "reference"
+        assert dataset.size_bytes_known is True
         job = db.get(IngestionJob, "legacy-job")
         assert job is not None
         assert job.message is None
@@ -1223,6 +1657,24 @@ def test_directory_size_deduplicates_symlink_targets_and_ignores_broken_links(tm
     assert directory_size(source) == len(b"annex payload") + len(b"other payload")
 
 
+def test_directory_size_rejects_unreadable_subdirectories(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Do not silently turn an unreadable dataset subtree into size zero."""
+    source = tmp_path / "permission-protected"
+    source.mkdir()
+
+    def fail_walk(path, *, followlinks, onerror):
+        onerror(PermissionError(f"cannot read {path}"))
+        return iter(())
+
+    monkeypatch.setattr(storage_service.os, "walk", fail_walk)
+
+    with pytest.raises(PermissionError):
+        directory_size(source)
+
+
 def test_ingestion_persists_inode_deduplicated_logical_size(config, tmp_path):
     """Ingestion stores each git-annex payload once, not once per symlink."""
     source = mock_dataset(tmp_path, "deduplicated-ingest")
@@ -1247,12 +1699,14 @@ def test_worker_health_check_refreshes_stale_size_and_manifest(config, tmp_path)
     with session(config) as db:
         stored = db.get(Dataset, item.id)
         stored.size_bytes = 1
+        stored.size_bytes_known = False
         db.commit()
 
     assert run_health_checks([item.id], config) is True
     with session(config) as db:
         stored = db.get(Dataset, item.id)
         assert stored.size_bytes == expected_size
+        assert stored.size_bytes_known is True
     manifest = json.loads((config.registry_dir / f"{item.id}.json").read_text())
     assert manifest["size_bytes"] == expected_size
 

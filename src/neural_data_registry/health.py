@@ -144,6 +144,7 @@ def _finish_healthy_with_size(
     """Persist a verified dataset's logical size before marking it healthy."""
     try:
         item.size_bytes = directory_size(path)
+        item.size_bytes_known = True
     except OSError as exc:
         error = f"Dataset size calculation failed: {exc}"
         _finish_history(

@@ -6,6 +6,9 @@ from pathlib import Path
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+DEFAULT_PRIVILEGED_SOURCE_ROOTS = ""
+SOURCE_ROOT_SEPARATOR = ":"
+
 
 class Settings(BaseSettings):
     """Deployment settings for the registry.
@@ -30,6 +33,29 @@ class Settings(BaseSettings):
     database_url: str | None = Field(
         default=None,
         description="SQLAlchemy database URL. Defaults to sqlite under <data_root>/registry/registry.db",
+    )
+    privileged_ingest_only: bool = Field(
+        default=False,
+        description="Restrict local ingestion to approved source roots.",
+    )
+    protected_coordinator: bool = Field(
+        default=False,
+        description="Run caller-scoped protected local ingestion.",
+    )
+    service_user: str | None = Field(
+        default=None,
+        description="Account allowed to update protected registry storage.",
+    )
+    startup_health_check_enabled: bool = Field(
+        default=True,
+        description="Launch cooldown health checks from normal CLI commands.",
+    )
+    privileged_source_roots: str = Field(
+        default=DEFAULT_PRIVILEGED_SOURCE_ROOTS,
+        description=(
+            "Colon-separated roots accepted by protected local ingestion. "
+            "Required when protected local ingestion is enabled."
+        ),
     )
     lock_timeout_seconds: int = 1800
     download_proxy: str | None = Field(
@@ -56,6 +82,21 @@ class Settings(BaseSettings):
     def incoming_dir(self) -> Path:
         return self.data_root / "incoming"
 
+    @property
+    def privileged_source_root_paths(self) -> tuple[Path, ...]:
+        """Return normalized roots accepted by protected local ingestion."""
+        roots = tuple(
+            Path(value).expanduser().resolve()
+            for value in self.privileged_source_roots.split(
+                SOURCE_ROOT_SEPARATOR
+            )
+            if value.strip()
+        )
+        if not roots:
+            raise ValueError(
+                "At least one protected ingestion source root is required"
+            )
+        return roots
 
     @property
     def quarantine_dir(self) -> Path:

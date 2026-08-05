@@ -4,6 +4,7 @@ from datetime import datetime
 from uuid import uuid4
 
 from sqlalchemy import Boolean, DateTime, Enum as SqlEnum, ForeignKey, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import true
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from neural_data_registry.enums import DatasetStatus, JobStatus, Provider, StorageMode
@@ -38,6 +39,12 @@ class Dataset(Base):
     modalities: Mapped[str] = mapped_column(Text, default="")
     size_bytes: Mapped[int] = mapped_column(
         Integer, default=0, info={"label": "Size"}
+    )
+    size_bytes_known: Mapped[bool] = mapped_column(
+        Boolean,
+        default=True,
+        server_default=true(),
+        info={"serialize": False},
     )
     status: Mapped[DatasetStatus] = mapped_column(SqlEnum(DatasetStatus, native_enum=False), default=DatasetStatus.INGESTING)
     storage_path: Mapped[str | None] = mapped_column(

@@ -1,4 +1,5 @@
 from __future__ import annotations
+from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import Enum
 from typing import Sequence
@@ -19,6 +20,24 @@ from neural_data_registry.storage import copy_into_managed_storage, dataset_dest
 CANONICAL_NAME_ALIAS_KIND = "name"
 USER_NAME_ALIAS_KIND = "name_alias"
 NAME_ALIAS_KINDS = (CANONICAL_NAME_ALIAS_KIND, USER_NAME_ALIAS_KIND)
+
+UNKNOWN_SIZE_BYTES = 0
+_SIZE_NOT_MEASURED = object()
+
+
+@dataclass(frozen=True)
+class LocalIngestionRequest:
+    """Normalized metadata for one local ingestion request."""
+
+    source: Path
+    name: str
+    provider: Provider
+    source_reference: str
+    version: str
+    modalities: tuple[str, ...]
+    storage_mode: StorageMode
+    has_remote_url: bool
+    name_aliases: tuple[str, ...]
 
 
 def _remote_url_identity(url: str | None) -> tuple[str, str, int | None, str] | None:
@@ -481,95 +500,326 @@ def _preflight_dataset_identity(
         db.close()
 
 
-def _ingest_local_locked(
+
+def prepare_local_ingestion_request(
     source: Path,
     name: str,
     provider: Provider,
-    source_reference: str,
-    version: str,
+    url: str | None,
+    version: str | None,
     modalities: Sequence[str | Modality],
-    config: Settings,
     storage_mode: StorageMode,
-    *,
-    has_remote_url: bool,
     name_aliases: Sequence[str],
+) -> LocalIngestionRequest:
+    """Normalize a local ingestion request without reading dataset contents."""
+    normalized_name = name.strip()
+    if not normalized_name:
+        raise ValueError("A non-empty dataset name is required")
+    normalized_aliases = tuple(
+        _normalize_name_aliases(name_aliases, normalized_name)
+    )
+    resolved_source = source.expanduser().resolve()
+    has_remote_url = url is not None
+    if url:
+        provider = provider_for_url(url)
+        if version is None:
+            version = infer_url_version(url)
+    normalized_version = version or "unknown"
+    source_reference = url or resolved_source.as_uri()
+    return LocalIngestionRequest(
+        source=resolved_source,
+        name=normalized_name,
+        provider=provider,
+        source_reference=source_reference,
+        version=normalized_version,
+        modalities=tuple(normalize_modalities(modalities)),
+        storage_mode=StorageMode(storage_mode),
+        has_remote_url=has_remote_url,
+        name_aliases=normalized_aliases,
+    )
+
+
+def preflight_local_ingestion_request(
+    request: LocalIngestionRequest,
+    config: Settings,
+) -> None:
+    """Reject a duplicate normalized local ingestion request."""
+    _preflight_dataset_identity(
+        request.name,
+        request.source_reference,
+        config,
+        request.name_aliases,
+    )
+
+
+def _ingest_local_locked(
+    request: LocalIngestionRequest,
+    config: Settings,
+    *,
+    prepared_source: Path | None = None,
+    source_prevalidated: bool = False,
+    size_bytes: int | None | object = _SIZE_NOT_MEASURED,
 ) -> Dataset:
-    """Ingest a local source while the registry-wide intake lock is held."""
+    """Ingest a normalized request while the intake lock is held."""
     ensure_layout(config)
     create_database(config)
     db = get_session_factory(config.resolved_database_url)()
+    managed_path: Path | None = None
+    database_committed = False
     try:
-        _raise_if_dataset_identity_conflicts(db, name, source_reference, name_aliases)
-        if not source.is_dir():
-            raise ValueError(f"Local source is not a directory: {source}")
-        item = Dataset(name=name, provider=provider, source_url=source_reference, version=version, modalities=",".join(sorted(set(modalities))), storage_mode=storage_mode, status=DatasetStatus.INGESTING); db.add(item); db.flush()
-        job = IngestionJob(dataset_id=item.id, mode="local", status=JobStatus.RUNNING); db.add(job)
+        _raise_if_dataset_identity_conflicts(
+            db,
+            request.name,
+            request.source_reference,
+            request.name_aliases,
+        )
+        if prepared_source is not None and not prepared_source.is_dir():
+            raise ValueError(
+                "Prepared source is not an existing directory: "
+                f"{prepared_source}"
+            )
+        if (
+            prepared_source is None
+            and not source_prevalidated
+            and not request.source.is_dir()
+        ):
+            raise ValueError(
+                f"Local source is not a directory: {request.source}"
+            )
+        item = Dataset(
+            name=request.name,
+            provider=request.provider,
+            source_url=request.source_reference,
+            version=request.version,
+            modalities=",".join(request.modalities),
+            storage_mode=request.storage_mode,
+            status=DatasetStatus.INGESTING,
+        )
+        db.add(item)
+        db.flush()
+        job = IngestionJob(
+            dataset_id=item.id,
+            mode="local",
+            status=JobStatus.RUNNING,
+        )
+        db.add(job)
         item.aliases.extend(
             [
-                DatasetAlias(kind="url" if has_remote_url else "path", value=source_reference),
-                DatasetAlias(kind=CANONICAL_NAME_ALIAS_KIND, value=name),
+                DatasetAlias(
+                    kind="url" if request.has_remote_url else "path",
+                    value=request.source_reference,
+                ),
+                DatasetAlias(
+                    kind=CANONICAL_NAME_ALIAS_KIND,
+                    value=request.name,
+                ),
                 *[
                     DatasetAlias(kind=USER_NAME_ALIAS_KIND, value=alias)
-                    for alias in name_aliases
+                    for alias in request.name_aliases
                 ],
             ]
         )
-        if storage_mode == StorageMode.REFERENCE:
-            managed_path = source
-        elif storage_mode == StorageMode.MOVE:
-            managed_path = dataset_destination(item.id, name, version, config)
-            move_into_managed_storage(source, managed_path)
-        elif storage_mode == StorageMode.COPY:
-            managed_path = dataset_destination(item.id, name, version, config)
-            copy_into_managed_storage(source, managed_path)
+        if request.storage_mode is StorageMode.REFERENCE:
+            if prepared_source is not None:
+                raise ValueError(
+                    "Reference ingestion does not accept a prepared source"
+                )
+            managed_path = request.source
         else:
-            raise ValueError(f"Unsupported storage mode: {storage_mode}")
+            managed_path = dataset_destination(
+                item.id,
+                request.name,
+                request.version,
+                config,
+            )
+            if prepared_source is not None:
+                move_into_managed_storage(prepared_source, managed_path)
+            elif request.storage_mode is StorageMode.MOVE:
+                move_into_managed_storage(request.source, managed_path)
+            elif request.storage_mode is StorageMode.COPY:
+                copy_into_managed_storage(request.source, managed_path)
+            else:
+                raise ValueError(
+                    f"Unsupported storage mode: {request.storage_mode}"
+                )
         item.storage_path = str(managed_path)
-        item.size_bytes = directory_size(managed_path)
+        if size_bytes is _SIZE_NOT_MEASURED:
+            item.size_bytes = directory_size(managed_path)
+            item.size_bytes_known = True
+        elif size_bytes is None:
+            item.size_bytes = UNKNOWN_SIZE_BYTES
+            item.size_bytes_known = False
+        else:
+            measured_size = int(size_bytes)
+            if measured_size < 0:
+                raise ValueError(
+                    f"Dataset size must be non-negative, got {measured_size}"
+                )
+            item.size_bytes = measured_size
+            item.size_bytes_known = True
         item.status = DatasetStatus.AVAILABLE
         job.status = JobStatus.SUCCEEDED
-        db.commit(); db.refresh(item); (config.registry_dir / f"{item.id}.json").write_text(json.dumps(dataset_dict(item), indent=2), encoding="utf-8"); return item
-    except Exception:
-        db.rollback(); raise
+        db.commit()
+        database_committed = True
+        db.refresh(item)
+        manifest_path = config.registry_dir / f"{item.id}.json"
+        manifest_path.write_text(
+            json.dumps(dataset_dict(item), indent=2),
+            encoding="utf-8",
+        )
+        return item
+    except Exception as exc:
+        db.rollback()
+        if (
+            prepared_source is not None
+            and managed_path is not None
+            and not database_committed
+            and managed_path.exists()
+            and not prepared_source.exists()
+        ):
+            try:
+                move_into_managed_storage(managed_path, prepared_source)
+            except Exception as restore_exc:
+                raise RuntimeError(
+                    "Registry update failed before commit and prepared data "
+                    f"could not be restored to {prepared_source}; data remains "
+                    f"at {managed_path}: {restore_exc}"
+                ) from exc
+        raise
     finally:
         db.close()
 
 
-def ingest_local(source: Path, name: str, provider: Provider, url: str | None, version: str | None, modalities: Sequence[str | Modality], config: Settings | None = None, storage_mode: StorageMode = StorageMode.REFERENCE, *, name_aliases: Sequence[str] = ()) -> Dataset:
+def commit_local_ingestion_request(
+    request: LocalIngestionRequest,
+    config: Settings,
+    *,
+    prepared_source: Path | None = None,
+    source_prevalidated: bool = False,
+    size_bytes: int | None | object = _SIZE_NOT_MEASURED,
+) -> Dataset:
+    """Commit a prepared request while the caller holds the intake lock."""
+    ensure_layout(config)
+    log_name = safe_component(request.name)
+    log_version = safe_component(request.version)
+    log_path = config.logs_dir / f"ingest-{log_name}-{log_version}.log"
+    _append_ingestion_log(
+        log_path,
+        "START "
+        f"provider={request.provider.value} "
+        f"version={request.version} source={request.source}",
+    )
+    try:
+        item = _ingest_local_locked(
+            request,
+            config,
+            prepared_source=prepared_source,
+            source_prevalidated=source_prevalidated,
+            size_bytes=size_bytes,
+        )
+    except Exception as exc:
+        _append_ingestion_log(
+            log_path,
+            f"FAILED {type(exc).__name__}: {exc}",
+        )
+        raise
+    _append_ingestion_log(
+        log_path,
+        f"SUCCEEDED dataset_id={item.id} storage_path={item.storage_path}",
+    )
+    return item
+
+def validate_privileged_source(
+    source: Path,
+    config: Settings,
+) -> Path:
+    """Validate a source accepted by protected local ingestion.
+
+    Parameters
+    ----------
+    source : pathlib.Path
+        Caller-supplied dataset directory.
+    config : neural_data_registry.config.Settings
+        Registry settings defining managed storage and allowed source roots.
+
+    Returns
+    -------
+    pathlib.Path
+        Existing, resolved source directory below an allowed source root.
+
+    Raises
+    ------
+    ValueError
+        If the source is missing, not a directory, outside an allowed root, or
+        within managed storage other than the incoming workspace.
+    """
+    try:
+        resolved_source = source.expanduser().resolve()
+    except OSError as exc:
+        raise ValueError(
+            f"Unable to resolve protected ingestion source path: {source}"
+        ) from exc
+    if not resolved_source.is_dir():
+        raise ValueError(
+            "Protected ingestion source must be an existing directory: "
+            f"{resolved_source}"
+        )
+    managed_root = config.data_root.expanduser().resolve()
+    incoming_root = config.incoming_dir.expanduser().resolve()
+    if resolved_source.is_relative_to(incoming_root):
+        return resolved_source
+    if resolved_source.is_relative_to(managed_root):
+        raise ValueError(
+            "Protected ingestion source must not be inside managed storage "
+            "except for its incoming workspace: "
+            f"{managed_root}"
+        )
+    if any(
+        resolved_source.is_relative_to(root)
+        for root in config.privileged_source_root_paths
+    ):
+        return resolved_source
+    allowed_roots = ", ".join(
+        str(root) for root in config.privileged_source_root_paths
+    )
+    raise ValueError(
+        "Protected ingestion source must resolve below an allowed root: "
+        f"{allowed_roots}"
+    )
+
+
+
+def ingest_local(
+    source: Path,
+    name: str,
+    provider: Provider,
+    url: str | None,
+    version: str | None,
+    modalities: Sequence[str | Modality],
+    config: Settings | None = None,
+    storage_mode: StorageMode = StorageMode.REFERENCE,
+    *,
+    name_aliases: Sequence[str] = (),
+) -> Dataset:
     """Register a local dataset after identity preflight and under intake lock."""
     config = config or get_settings()
-    name = name.strip()
-    if not name:
-        raise ValueError("A non-empty dataset name is required")
-    name_aliases = _normalize_name_aliases(name_aliases, name)
-    if url:
-        # Remote URL metadata is authoritative for local registrations.
-        provider = provider_for_url(url)
-        if version is None:
-            version = infer_url_version(url)
-    version = version or "unknown"
-    _preflight_dataset_identity(name, url, config, name_aliases)
-    source = source.expanduser().resolve()
-    source_reference = url or source.as_uri()
-    if url is None:
-        _preflight_dataset_identity(name, source_reference, config, name_aliases)
-    normalized_modalities = normalize_modalities(modalities)
+    request = prepare_local_ingestion_request(
+        source,
+        name,
+        provider,
+        url,
+        version,
+        modalities,
+        storage_mode,
+        name_aliases,
+    )
+    preflight_local_ingestion_request(request, config)
+    if config.privileged_ingest_only:
+        validated_source = validate_privileged_source(request.source, config)
+        request = replace(request, source=validated_source)
     with ingestion_lock("registry-intake", config):
-        _preflight_dataset_identity(name, source_reference, config, name_aliases)
-        ensure_layout(config)
-        log_path = config.logs_dir / f"ingest-{safe_component(name)}-{safe_component(version)}.log"
-        _append_ingestion_log(log_path, f"START provider={provider.value} version={version} source={source}")
-        try:
-            item = _ingest_local_locked(
-                source, name, provider, source_reference, version, normalized_modalities,
-                config, storage_mode, has_remote_url=url is not None, name_aliases=name_aliases,
-            )
-            _append_ingestion_log(log_path, f"SUCCEEDED dataset_id={item.id} storage_path={item.storage_path}")
-            return item
-        except Exception as exc:
-            _append_ingestion_log(log_path, f"FAILED {type(exc).__name__}: {exc}")
-            raise
-
+        preflight_local_ingestion_request(request, config)
+        return commit_local_ingestion_request(request, config)
 
 def transition_reference_storage(
     dataset_id: str,
@@ -618,6 +868,7 @@ def transition_reference_storage(
             item.storage_path = str(destination)
             item.storage_mode = storage_mode
             item.size_bytes = directory_size(destination)
+            item.size_bytes_known = True
             job.status = JobStatus.SUCCEEDED
             db.commit()
             db.refresh(item)
@@ -717,10 +968,17 @@ def download(
                 proxy=proxy if proxy is not None else config.download_proxy,
                 mirror=mirror if mirror is not None else config.download_mirror,
             )
-            item = _ingest_local_locked(
-                source, name, provider, url, resolved_version, normalized_modalities,
-                config, StorageMode.MOVE, has_remote_url=True, name_aliases=name_aliases,
+            request = prepare_local_ingestion_request(
+                source,
+                name,
+                provider,
+                url,
+                resolved_version,
+                normalized_modalities,
+                StorageMode.MOVE,
+                name_aliases,
             )
+            item = _ingest_local_locked(request, config)
             _append_ingestion_log(log_path, f"SUCCEEDED dataset_id={item.id} storage_path={item.storage_path}")
             return item
         except Exception as exc:
@@ -776,6 +1034,8 @@ def dataset_dict(item: Dataset) -> dict[str, object]:
         output_name: _serialize_dataset_value(column, getattr(item, column.name))
         for column, output_name, _ in _dataset_output_columns()
     }
+    if item.size_bytes_known is False:
+        data["size_bytes"] = None
     data["aliases"] = sorted(
         alias.value for alias in item.aliases if alias.kind == USER_NAME_ALIAS_KIND
     )

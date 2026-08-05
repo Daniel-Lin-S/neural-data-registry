@@ -36,6 +36,8 @@ def startup_health_check(ctx: typer.Context) -> None:
     if ctx.invoked_subcommand in {"health-check", "health-scheduler"}:
         return
     try:
+        if not get_settings().startup_health_check_enabled:
+            return
         maybe_launch_cooldown_check()
     except Exception:
         # A best-effort startup check must not block normal registry commands.
@@ -52,7 +54,7 @@ def format_size(size_bytes: int) -> str:
 
 def _format_dataset_cell(field: str, value) -> str:
     if field == "size_bytes":
-        return format_size(value or 0)
+        return "-" if value is None else format_size(value)
     if isinstance(value, list):
         return ", ".join(str(item) for item in value) or "-"
     if value is None or value == "":
@@ -181,31 +183,100 @@ def list_datasets(
                 show_all=show_all,
             )
         )
+
 @app.command("ingest-local")
-def ingest_local_command(source: Path = typer.Argument(..., help="Existing local dataset directory to register."), name: str = typer.Option(..., "--name", help="Canonical dataset name to register."), alias: list[str] = typer.Option([], "--alias", help="Searchable alternate dataset name; repeat for multiple aliases."), provider: Provider = typer.Option(Provider.OTHER, "--provider", help="Dataset provider: openneuro, dandi, nemar, physionet, neurovault, kaggle, or other."), url: str | None = typer.Option(None, "--url", help="Optional canonical source URL for the dataset."), version: str | None = typer.Option(None, "--version", help="Optional dataset version; defaults to unknown for unversioned local data."), modality: list[Modality] = typer.Option([], "--modality", help="Dataset modality (eeg, meg, ieeg, fmri, fnris, pet, smri, dmri, ephys, or other); repeat for multiple modalities."), storage_mode: StorageMode = typer.Option(StorageMode.REFERENCE, "--storage-mode", help="Reference files in place (default), move into managed storage, or copy into managed storage (leaves a duplicate; use only when SOURCE may be cleaned later).")):
+def ingest_local_command(
+    source: Path = typer.Argument(
+        ...,
+        help="Existing local dataset directory to register.",
+    ),
+    name: str = typer.Option(
+        ...,
+        "--name",
+        help="Canonical dataset name to register.",
+    ),
+    alias: list[str] = typer.Option(
+        [],
+        "--alias",
+        help="Searchable alternate dataset name; repeat for multiple aliases.",
+    ),
+    provider: Provider = typer.Option(
+        Provider.OTHER,
+        "--provider",
+        help="Dataset provider.",
+    ),
+    url: str | None = typer.Option(
+        None,
+        "--url",
+        help="Optional canonical source URL for the dataset.",
+    ),
+    version: str | None = typer.Option(
+        None,
+        "--version",
+        help="Optional dataset version; defaults to unknown for local data.",
+    ),
+    modality: list[Modality] = typer.Option(
+        [],
+        "--modality",
+        help="Dataset modality; repeat for multiple modalities.",
+    ),
+    storage_mode: StorageMode = typer.Option(
+        StorageMode.REFERENCE,
+        "--storage-mode",
+        help="Reference, move, or copy the source dataset.",
+    ),
+) -> None:
     """Register an already-downloaded local dataset.
 
     SOURCE must be a directory. By default, its files remain in place and
     the registry stores a reference path. Use --storage-mode move to relocate
     files under NDR_DATA_ROOT/datasets. Duplicate names or source URLs are
-    rejected with the existing storage path. The created record is printed as JSON.
+    rejected with the existing storage path. The created record is printed as
+    JSON.
     """
     if storage_mode is StorageMode.COPY:
-        console.print("[yellow]Warning: copy mode uses additional disk space because SOURCE and the managed copy are both retained. Use it only when SOURCE may be cleaned in the future.[/yellow]")
-    console.print_json(
-        data=dataset_dict(
-            ingest_local(
+        console.print(
+            "[yellow]Warning: copy mode uses additional disk space because "
+            "SOURCE and the managed copy are both retained. Use it only when "
+            "SOURCE may be cleaned in the future.[/yellow]"
+        )
+    config = get_settings()
+    warning = None
+    try:
+        if config.protected_coordinator:
+            from neural_data_registry.protected_ingest import (
+                coordinate_protected_ingestion,
+            )
+
+            item, warning = coordinate_protected_ingestion(
                 source,
                 name,
                 provider,
                 url,
                 version,
                 [item.value for item in modality],
+                storage_mode,
+                alias,
+                config,
+            )
+        else:
+            item = ingest_local(
+                source,
+                name,
+                provider,
+                url,
+                version,
+                [item.value for item in modality],
+                config=config,
                 storage_mode=storage_mode,
                 name_aliases=alias,
             )
-        )
-    )
+    except (RuntimeError, ValueError) as exc:
+        raise typer.BadParameter(str(exc), param_hint="SOURCE") from exc
+    if warning:
+        console.print(f"[yellow]Warning: {warning}[/yellow]")
+    console.print_json(data=dataset_dict(item))
+
 @app.command()
 def download(url: str = typer.Option(..., "--url", help="Provider dataset URL; the provider is detected from its host."), name: str = typer.Option(..., "--name", help="Dataset name to register."), alias: list[str] = typer.Option([], "--alias", help="Searchable alternate dataset name; repeat for multiple aliases."), modality: list[Modality] = typer.Option(..., "--modality", help="Dataset modality; repeat for multiple modalities."), version: str | None = typer.Option(None, "--version", help="Version or branch; required unless an OpenNeuro URL contains /versions/x.y.z."), proxy: str | None = typer.Option(None, "--proxy", help="Proxy URL for this download."), mirror: str | None = typer.Option(None, "--mirror", help="Mirror URL, URL base, or template containing {dataset_id}.")):
     """Download a supported provider dataset and ingest it automatically.

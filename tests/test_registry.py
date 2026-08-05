@@ -954,6 +954,76 @@ def test_cli_query_and_list(config, tmp_path, monkeypatch):
     assert "reference" not in result.output
 
 
+def test_cli_query_fields(config, tmp_path, monkeypatch):
+    """Render requested dataset fields without changing path-query output."""
+    item = ingest_mock(config, tmp_path)
+    add_name_aliases(item.id, ["THINGS_MEG"], config)
+    with session(config) as db:
+        stored = db.get(Dataset, item.id)
+        stored.aliases.extend(
+            [
+                DatasetAlias(
+                    kind="url",
+                    value="https://osf.io/aliasid/files",
+                ),
+                DatasetAlias(kind="path", value="/registered/local/path"),
+            ]
+        )
+        db.commit()
+
+    monkeypatch.setattr(cli, "session", lambda: session(config))
+    monkeypatch.setattr(cli, "maybe_launch_cooldown_check", lambda: False)
+    monkeypatch.setattr(
+        cli,
+        "request_health_check",
+        lambda dataset_id: request_health_check(dataset_id, config),
+    )
+    monkeypatch.setattr(cli, "console", cli.Console(width=160))
+    runner = CliRunner()
+
+    name_result = runner.invoke(
+        cli.app,
+        ["query", "THINGS_MEG", "--field", "name"],
+    )
+    assert name_result.exit_code == 0
+    assert json.loads(name_result.output) == "THINGS-MEG"
+
+    aliases_result = runner.invoke(
+        cli.app,
+        ["query", item.id, "--field", "aliases"],
+    )
+    assert aliases_result.exit_code == 0
+    assert json.loads(aliases_result.output) == ["THINGS_MEG"]
+
+    fields_result = runner.invoke(
+        cli.app,
+        [
+            "query",
+            "--url",
+            "https://osf.io/aliasid/",
+            "--field",
+            "url_aliases",
+            "--field",
+            "path_aliases",
+        ],
+    )
+    assert fields_result.exit_code == 0
+    assert json.loads(fields_result.output) == {
+        "url_aliases": [
+            "https://openneuro.org/datasets/ds004212",
+            "https://osf.io/aliasid/files",
+        ],
+        "path_aliases": ["/registered/local/path"],
+    }
+
+    unknown_result = runner.invoke(
+        cli.app,
+        ["query", item.id, "--field", "created_at"],
+    )
+    assert unknown_result.exit_code != 0
+    assert "Unknown dataset field(s): created_at" in unknown_result.output
+    assert "Valid fields:" in unknown_result.output
+
 def test_create_database_reconciles_missing_columns_across_registry(config):
     """Synchronize old SQLite tables with all columns in the current models."""
     create_database(config)

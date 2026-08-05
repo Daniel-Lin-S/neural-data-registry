@@ -62,6 +62,17 @@ brainctl query --url "https://openneuro.org/datasets/ds004212/versions/3.0.0"  #
 brainctl query 220cb6c2-cc2f-409d-be24-5abb018da87d  # internal ID
 ```
 
+Query a read-only metadata field with `--field`; repeat it to return a JSON
+object containing multiple fields. For example:
+
+```bash
+brainctl query THINGS-MEG --field aliases
+brainctl query THINGS-MEG --field name --field modalities
+```
+
+`aliases`, `url_aliases`, and `path_aliases` expose their respective stored
+alias categories.
+
 IDs and names are unique. URL segment matches can be ambiguous, in which case `brainctl query` asks which displayed canonical dataset to use.
 
 ### `brainctl list`

@@ -1,4 +1,5 @@
 from __future__ import annotations
+import json
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -18,6 +19,7 @@ from neural_data_registry.service import (
     add_name_aliases,
     dataset_dict,
     dataset_output_fields,
+    dataset_query_dict,
     download as download_dataset,
     find_datasets,
     ingest_local,
@@ -108,11 +110,28 @@ def _health_problems(dataset_ids: list[str]):
 
 @app.command()
 def query(
-    query: Annotated[str | None, typer.Argument(help="Dataset ID, name, or source URL.")] = None,
-    name: str | None = typer.Option(None, "--name", help="Exact dataset name to look up."),
-    url: str | None = typer.Option(None, "--url", help="Source URL to look up by dataset path segment.")
+    query: Annotated[
+        str | None,
+        typer.Argument(help="Dataset ID, name, or source URL."),
+    ] = None,
+    name: str | None = typer.Option(
+        None,
+        "--name",
+        help="Exact dataset name to look up.",
+    ),
+    url: str | None = typer.Option(
+        None,
+        "--url",
+        help="Source URL to look up by dataset path segment.",
+    ),
+    field: list[str] = typer.Option(
+        [],
+        "--field",
+        "-f",
+        help="Dataset field to print as JSON; repeat for multiple fields.",
+    ),
 ):
-    """Print a matched dataset storage path, prompting when a URL is ambiguous."""
+    """Print a dataset storage path or selected metadata fields."""
     positional_url = (
         query
         if query and urlparse(query).scheme and urlparse(query).hostname
@@ -156,6 +175,30 @@ def query(
     report = request_health_check(item.id)
     if report.warning:
         typer.echo(f"Warning: {report.warning}", err=True)
+    if field:
+        data = dataset_query_dict(item)
+        available_fields = sorted(data)
+        unknown_fields = sorted(set(field).difference(data))
+        if unknown_fields:
+            valid_fields = ", ".join(available_fields)
+            unknown = ", ".join(unknown_fields)
+            raise typer.BadParameter(
+                f"Unknown dataset field(s): {unknown}. "
+                f"Valid fields: {valid_fields}."
+            )
+        duplicate_fields = sorted(
+            item for item in set(field) if field.count(item) > 1
+        )
+        if duplicate_fields:
+            duplicate = ", ".join(duplicate_fields)
+            raise typer.BadParameter(
+                f"Dataset field(s) requested more than once: {duplicate}."
+            )
+        value = data[field[0]] if len(field) == 1 else {
+            name: data[name] for name in field
+        }
+        console.print_json(json.dumps(value))
+        return
     if not item.storage_path:
         raise typer.BadParameter("The matched dataset has no storage path")
     console.print(Path(item.storage_path).expanduser().resolve())

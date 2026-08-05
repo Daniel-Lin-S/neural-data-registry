@@ -20,6 +20,8 @@ from neural_data_registry.storage import copy_into_managed_storage, dataset_dest
 CANONICAL_NAME_ALIAS_KIND = "name"
 USER_NAME_ALIAS_KIND = "name_alias"
 NAME_ALIAS_KINDS = (CANONICAL_NAME_ALIAS_KIND, USER_NAME_ALIAS_KIND)
+URL_ALIAS_KIND = "url"
+PATH_ALIAS_KIND = "path"
 
 UNKNOWN_SIZE_BYTES = 0
 _SIZE_NOT_MEASURED = object()
@@ -161,7 +163,14 @@ def resolve_dataset(db: Session, identifier: str | None = None, *, name: str | N
             and_(DatasetAlias.kind.in_(("url", "path")), DatasetAlias.value == value),
         ]
     if not url_lookup:
-        matches = list(db.scalars(select(Dataset).outerjoin(DatasetAlias).where(or_(*conditions)).distinct()))
+        stmt = (
+            select(Dataset)
+            .options(selectinload(Dataset.aliases))
+            .outerjoin(DatasetAlias)
+            .where(or_(*conditions))
+            .distinct()
+        )
+        matches = list(db.scalars(stmt))
     if len(matches) > 1:
         raise ValueError(f"Dataset identifier is ambiguous: {value}")
     return matches[0] if matches else None
@@ -1038,5 +1047,30 @@ def dataset_dict(item: Dataset) -> dict[str, object]:
         data["size_bytes"] = None
     data["aliases"] = sorted(
         alias.value for alias in item.aliases if alias.kind == USER_NAME_ALIAS_KIND
+    )
+    return data
+
+
+def dataset_query_dict(item: Dataset) -> dict[str, object]:
+    """Serialize fields available to read-only CLI dataset queries.
+
+    Parameters
+    ----------
+    item : Dataset
+        Dataset row with aliases loaded.
+
+    Returns
+    -------
+    dict[str, object]
+        Current public dataset fields and aliases grouped by stored kind.
+    """
+    data = dataset_dict(item)
+    data.update(
+        {
+            f"{kind}_aliases": sorted(
+                alias.value for alias in item.aliases if alias.kind == kind
+            )
+            for kind in (URL_ALIAS_KIND, PATH_ALIAS_KIND)
+        }
     )
     return data

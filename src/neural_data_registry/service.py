@@ -14,7 +14,16 @@ from neural_data_registry.db.models import Dataset, DatasetAlias, IngestionJob
 from neural_data_registry.db.session import create_database, get_session_factory
 from neural_data_registry.enums import DatasetStatus, JobStatus, Modality, Provider, StorageMode, normalize_modalities
 from neural_data_registry.provider import download_from_url, provider_for_url
-from neural_data_registry.storage import copy_into_managed_storage, dataset_destination, directory_size, ensure_layout, ingestion_lock, move_into_managed_storage, safe_component
+from neural_data_registry.storage import (
+    copy_into_managed_storage,
+    dataset_destination,
+    directory_size,
+    ensure_layout,
+    ingestion_lock,
+    move_into_managed_storage,
+    normalize_managed_dataset_access,
+    safe_component,
+)
 
 
 CANONICAL_NAME_ALIAS_KIND = "name"
@@ -567,6 +576,7 @@ def _ingest_local_locked(
     *,
     prepared_source: Path | None = None,
     source_prevalidated: bool = False,
+    prepared_access_normalized: bool = False,
     size_bytes: int | None | object = _SIZE_NOT_MEASURED,
 ) -> Dataset:
     """Ingest a normalized request while the intake lock is held."""
@@ -586,6 +596,11 @@ def _ingest_local_locked(
             raise ValueError(
                 "Prepared source is not an existing directory: "
                 f"{prepared_source}"
+            )
+        if prepared_access_normalized and prepared_source is None:
+            raise ValueError(
+                "Prepared access can be normalized only when a prepared "
+                "source is supplied"
             )
         if (
             prepared_source is None
@@ -651,6 +666,8 @@ def _ingest_local_locked(
                 raise ValueError(
                     f"Unsupported storage mode: {request.storage_mode}"
                 )
+            if not prepared_access_normalized:
+                normalize_managed_dataset_access(managed_path)
         item.storage_path = str(managed_path)
         if size_bytes is _SIZE_NOT_MEASURED:
             item.size_bytes = directory_size(managed_path)
@@ -705,6 +722,7 @@ def commit_local_ingestion_request(
     *,
     prepared_source: Path | None = None,
     source_prevalidated: bool = False,
+    prepared_access_normalized: bool = False,
     size_bytes: int | None | object = _SIZE_NOT_MEASURED,
 ) -> Dataset:
     """Commit a prepared request while the caller holds the intake lock."""
@@ -724,6 +742,7 @@ def commit_local_ingestion_request(
             config,
             prepared_source=prepared_source,
             source_prevalidated=source_prevalidated,
+            prepared_access_normalized=prepared_access_normalized,
             size_bytes=size_bytes,
         )
     except Exception as exc:
@@ -873,6 +892,7 @@ def transition_reference_storage(
                 move_into_managed_storage(source, destination)
             else:
                 copy_into_managed_storage(source, destination)
+            normalize_managed_dataset_access(destination)
 
             item.storage_path = str(destination)
             item.storage_mode = storage_mode

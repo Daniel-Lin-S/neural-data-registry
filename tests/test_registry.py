@@ -4,6 +4,8 @@ from contextlib import nullcontext
 from pathlib import Path
 import json
 import os
+import stat
+import shutil
 import subprocess
 from unittest.mock import Mock
 
@@ -38,7 +40,11 @@ from neural_data_registry.service import (
     infer_url_version,
 )
 from neural_data_registry.storage import directory_size, ensure_layout, process_lock
-from neural_data_registry.storage import dataset_destination, ingestion_lock
+from neural_data_registry.storage import (
+    dataset_destination,
+    ingestion_lock,
+    normalize_managed_dataset_access,
+)
 from neural_data_registry.service import dataset_dict, find_datasets, ingest_local, session, update_dataset_metadata
 
 
@@ -56,6 +62,58 @@ def mock_dataset(tmp_path: Path, label: str) -> Path:
     (source / "dataset_description.json").write_text('{"Name": "Mock"}')
     (source / "meg.fif").write_bytes(b"mock meg data")
     return source
+
+
+def test_managed_dataset_access_is_public_read_only(
+    tmp_path: Path,
+) -> None:
+    """Normalize only one managed tree without following its symlinks."""
+    managed_root = tmp_path / "managed"
+    nested = managed_root / "nested"
+    nested.mkdir(parents=True)
+    data_file = nested / "data.bin"
+    executable_file = nested / "tool.sh"
+    external_file = tmp_path / "external.bin"
+    data_file.write_bytes(b"data")
+    executable_file.write_text("#!/bin/sh\n")
+    external_file.write_bytes(b"external")
+    link = managed_root / "external-link"
+    link.symlink_to(external_file)
+
+    os.chmod(managed_root, 0o700)
+    os.chmod(nested, 0o700)
+    os.chmod(data_file, 0o600)
+    os.chmod(executable_file, 0o700)
+    os.chmod(external_file, 0o600)
+    acl_result = None
+    if shutil.which("setfacl") is not None:
+        acl_result = subprocess.run(
+            [
+                "setfacl",
+                "-m",
+                "d:o:---",
+                str(managed_root),
+            ],
+            check=False,
+            capture_output=True,
+        )
+
+    normalize_managed_dataset_access(
+        managed_root,
+        owner_uid=os.getuid(),
+        owner_gid=os.getgid(),
+    )
+
+    assert stat.S_IMODE(managed_root.stat().st_mode) == 0o755
+    assert stat.S_IMODE(nested.stat().st_mode) == 0o755
+    assert stat.S_IMODE(data_file.stat().st_mode) == 0o644
+    assert stat.S_IMODE(executable_file.stat().st_mode) == 0o755
+    assert stat.S_IMODE(external_file.stat().st_mode) == 0o600
+    if acl_result is not None and acl_result.returncode == 0:
+        assert (
+            "system.posix_acl_default" not in os.listxattr(managed_root)
+        )
+    assert link.is_symlink()
 
 
 def test_global_data_root_comes_from_environment(monkeypatch, tmp_path):
@@ -318,6 +376,8 @@ def test_caller_scoped_managed_ingestion_stages_only_submitted_source(
         tmp_path / "data2",
         f"submitted-{storage_mode.value}",
     )
+    os.chmod(source, 0o700)
+    os.chmod(source / "meg.fif", 0o600)
     _mock_caller_scoped_identities(monkeypatch)
     measured_paths: list[Path] = []
     real_directory_size = directory_size
@@ -352,6 +412,10 @@ def test_caller_scoped_managed_ingestion_stages_only_submitted_source(
     assert measured_paths[0].is_relative_to(config.incoming_dir)
     assert Path(item.storage_path).is_relative_to(config.datasets_dir)
     assert Path(item.storage_path, "meg.fif").is_file()
+    managed_path = Path(item.storage_path)
+    assert stat.S_IMODE(managed_path.stat().st_mode) == 0o755
+    assert stat.S_IMODE((managed_path / "meg.fif").stat().st_mode) == 0o644
+    assert os.access(managed_path / "meg.fif", os.W_OK)
     assert list(config.incoming_dir.iterdir()) == []
     assert source.exists() is (storage_mode is StorageMode.COPY)
 
@@ -450,10 +514,14 @@ def test_protected_installer_never_traverses_source_roots() -> None:
     assert 'chown -R "$source_root"' not in installer
     assert 'chmod -R "$source_root"' not in installer
     assert "setfacl" not in installer
+    assert "readonly INCOMING_MODE=0711" in installer
+    assert "readonly DATASETS_ROOT_MODE=0755" in installer
+    assert '"$NDR_DATA_ROOT/datasets"' in installer
     assert "NDR_STARTUP_HEALTH_CHECK_ENABLED=false" in helper
     assert "NDR_STARTUP_HEALTH_CHECK_ENABLED=false" in command_helper
     assert "ALL ALL = (root)" in sudoers
     assert "ALL ALL = (@SERVICE_USER@)" in sudoers
+    assert "REPAIR" not in sudoers
 
 
 def test_protected_cli_disables_automatic_health_scan(

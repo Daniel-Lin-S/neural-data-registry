@@ -27,7 +27,11 @@ from neural_data_registry.service import (
     prepare_local_ingestion_request,
     validate_privileged_source,
 )
-from neural_data_registry.storage import directory_size, ingestion_lock
+from neural_data_registry.storage import (
+    directory_size,
+    ingestion_lock,
+    normalize_managed_dataset_access,
+)
 
 SUDO_GID_VARIABLE = "SUDO_GID"
 SUDO_UID_VARIABLE = "SUDO_UID"
@@ -115,35 +119,6 @@ def effective_identity(identity: UnixIdentity) -> Iterator[None]:
         os.seteuid(original_uid)
 
 
-def _change_tree_owner(path: Path, identity: UnixIdentity) -> None:
-    """Transfer one selected staging tree to the service account."""
-    for current_root, directory_names, file_names in os.walk(
-        path,
-        topdown=False,
-        followlinks=False,
-    ):
-        current = Path(current_root)
-        for name in directory_names:
-            os.chown(
-                current / name,
-                identity.uid,
-                identity.gid,
-                follow_symlinks=False,
-            )
-        for name in file_names:
-            os.chown(
-                current / name,
-                identity.uid,
-                identity.gid,
-                follow_symlinks=False,
-            )
-        os.chown(
-            current,
-            identity.uid,
-            identity.gid,
-            follow_symlinks=False,
-        )
-
 
 def _stage_source_as_caller(
     request: LocalIngestionRequest,
@@ -182,10 +157,14 @@ def _stage_source_as_caller(
             f"{staging_root}: {exc}"
         ) from exc
     try:
-        _change_tree_owner(staging_root, service)
+        normalize_managed_dataset_access(
+            staging_root,
+            owner_uid=service.uid,
+            owner_gid=service.gid,
+        )
     except OSError as exc:
         raise RuntimeError(
-            "Staging ownership transfer failed; data was retained at "
+            "Staging access preparation failed; data was retained at "
             f"{staging_root}: {exc}"
         ) from exc
     return PreparedCallerSource(
@@ -299,6 +278,9 @@ def coordinate_protected_ingestion(
                         else None
                     ),
                     source_prevalidated=True,
+                    prepared_access_normalized=(
+                        prepared.staging_root is not None
+                    ),
                     size_bytes=prepared.size_bytes,
                 )
             except Exception as exc:

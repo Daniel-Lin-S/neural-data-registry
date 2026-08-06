@@ -13,6 +13,8 @@ fi
 
 readonly CONFIG_FILE=$1
 readonly CONFIG_MODE=600
+readonly DATASETS_ROOT_MODE=0755
+readonly INCOMING_MODE=0711
 readonly ROOT_UID=0
 readonly ROOT_SQUASHED_UID=65534
 readonly TEMPLATE_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -53,7 +55,8 @@ done
 
 NDR_DATABASE_URL=${NDR_DATABASE_URL:-sqlite:///$NDR_DATA_ROOT/registry/registry.db}
 readonly CLI_PATH="$NDR_RUNTIME_ROOT/venv/bin/brainctl"
-readonly COMMAND_HELPER_PATH="${NDR_HELPER_PATH%/*}/ndr-brainctl"
+readonly HELPER_DIRECTORY=${NDR_HELPER_PATH%/*}
+readonly COMMAND_HELPER_PATH="$HELPER_DIRECTORY/ndr-brainctl"
 readonly ENV_PATH=$(command -v env)
 readonly SUDO_PATH=$(command -v sudo)
 
@@ -147,9 +150,11 @@ install -d -o "$NDR_SERVICE_USER" -g "$NDR_SERVICE_GROUP" -m 0750 \
     "$NDR_SERVICE_HOME"
 install -d -o "$NDR_SERVICE_USER" -g "$NDR_SERVICE_GROUP" -m 0711 \
     "$NDR_DATA_ROOT"
-for directory_name in datasets incoming quarantine; do
-    install_managed_directory "$NDR_DATA_ROOT/$directory_name"
-done
+install -d -o "$NDR_SERVICE_USER" -g "$NDR_SERVICE_GROUP" \
+    -m "$DATASETS_ROOT_MODE" "$NDR_DATA_ROOT/datasets"
+install_managed_directory "$NDR_DATA_ROOT/quarantine"
+install -d -o "$NDR_SERVICE_USER" -g "$NDR_SERVICE_GROUP" \
+    -m "$INCOMING_MODE" "$NDR_DATA_ROOT/incoming"
 for directory_name in registry logs; do
     protect_control_path "$NDR_DATA_ROOT/$directory_name"
 done

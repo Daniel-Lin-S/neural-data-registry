@@ -60,3 +60,7 @@ Thumbs.db
 .tox/
 .nox/
 .ipynb_checkpoints/
+
+# Temporary files
+temp*
+temp/

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from urllib import error
 from pathlib import Path
 import json
 import os
@@ -15,6 +16,7 @@ from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
 from neural_data_registry import cli
+from neural_data_registry import main as main_api
 from neural_data_registry import health as health_service
 from neural_data_registry import storage as storage_service
 from neural_data_registry.config import Settings, get_settings
@@ -1262,6 +1264,189 @@ def test_layout_consolidates_download_workspace_in_incoming(config):
     ensure_layout(config)
     assert config.incoming_dir.is_dir()
     assert not (config.data_root / "staging").exists()
+
+
+class FakeHttpResponse:
+    """Provide one minimal HTTP response for connectivity probe tests."""
+
+    def __init__(self, url: str, status_code: int = 200):
+        self.status_code = status_code
+        self.url = url
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return False
+
+    def getcode(self) -> int:
+        return self.status_code
+
+    def geturl(self) -> str:
+        return self.url
+
+
+def test_connectivity_probe_uses_mirror_proxy_and_head(monkeypatch):
+    """Probe the resolved clone URL through the requested proxy."""
+    calls = []
+    handlers = []
+
+    class FakeOpener:
+        def open(self, probe, timeout):
+            calls.append((probe, timeout))
+            return FakeHttpResponse("https://redirect.example/ds004212.git")
+
+    def fake_build_opener(handler):
+        handlers.append(handler)
+        return FakeOpener()
+
+    monkeypatch.setattr(
+        provider_base.request,
+        "build_opener",
+        fake_build_opener,
+    )
+    report = provider_base.check_download_connectivity(
+        "https://openneuro.org/datasets/ds004212",
+        proxy="https://proxy.example:8080",
+        mirror="https://mirror.example/{dataset_id}.git",
+    )
+
+    assert report.source_url == "https://mirror.example/ds004212.git"
+    assert report.final_url == "https://redirect.example/ds004212.git"
+    assert report.probe_method == "HEAD"
+    assert report.total_size_bytes is None
+    assert calls[0][0].get_method() == "HEAD"
+    assert handlers[0].proxies == {
+        "http": "https://proxy.example:8080",
+        "https": "https://proxy.example:8080",
+    }
+
+
+def test_connectivity_probe_falls_back_to_ranged_get(monkeypatch):
+    """Use a one-byte GET when a source rejects HEAD."""
+    probes = []
+
+    class FakeOpener:
+        def open(self, probe, timeout):
+            probes.append(probe)
+            if probe.get_method() == "HEAD":
+                raise error.HTTPError(
+                    probe.full_url,
+                    405,
+                    "Method Not Allowed",
+                    None,
+                    None,
+                )
+            return FakeHttpResponse(probe.full_url, status_code=206)
+
+    monkeypatch.setattr(
+        provider_base.request,
+        "build_opener",
+        lambda handler: FakeOpener(),
+    )
+    report = provider_base.check_download_connectivity(
+        "https://openneuro.org/datasets/ds004212"
+    )
+
+    assert report.probe_method == "GET range"
+    assert report.status_code == 206
+    assert probes[1].get_header("Range") == "bytes=0-0"
+
+
+def test_connectivity_probe_rejects_non_http_mirror():
+    """Reject Git transports that cannot be probed through HTTP(S)."""
+    with pytest.raises(
+        provider_base.ProviderDownloadError,
+        match="require an HTTP or HTTPS mirror URL",
+    ):
+        provider_base.check_download_connectivity(
+            "https://openneuro.org/datasets/ds004212",
+            mirror="git@mirror.example:OpenNeuroDatasets/ds004212.git",
+        )
+
+
+def test_cli_connectivity_check_does_not_start_download(config, monkeypatch):
+    """Allow a URL-only connectivity check without creating intake state."""
+    report = {
+        "provider": "openneuro",
+        "source_url": "https://mirror.example/ds004212.git",
+        "final_url": "https://mirror.example/ds004212.git",
+        "status_code": 200,
+        "probe_method": "HEAD",
+        "total_size_bytes": None,
+        "total_size_status": "unavailable",
+    }
+    monkeypatch.setattr(
+        cli,
+        "check_download_connectivity",
+        lambda *args, **kwargs: report,
+    )
+    monkeypatch.setattr(cli, "download_dataset", Mock())
+    monkeypatch.setattr(cli, "get_settings", lambda: config)
+    monkeypatch.setattr(cli, "maybe_launch_cooldown_check", lambda: False)
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "download",
+            "--url",
+            "https://openneuro.org/datasets/ds004212",
+            "--check-connection",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert '"total_size_bytes": null' in result.output
+    assert not config.data_root.exists()
+    cli.download_dataset.assert_not_called()
+
+
+def test_download_connectivity_api_returns_report(config, monkeypatch):
+    """Return a successful check without invoking the download service."""
+    report = {
+        "provider": "openneuro",
+        "source_url": "https://github.com/OpenNeuroDatasets/ds004212.git",
+        "final_url": "https://github.com/OpenNeuroDatasets/ds004212.git",
+        "status_code": 200,
+        "probe_method": "HEAD",
+        "total_size_bytes": None,
+        "total_size_status": "unavailable",
+    }
+    check = Mock(return_value=report)
+    monkeypatch.setattr(main_api, "check_download_connectivity", check)
+
+    response = TestClient(create_app(config)).post(
+        "/download/check",
+        json={"url": "https://openneuro.org/datasets/ds004212"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == report
+    check.assert_called_once_with(
+        "https://openneuro.org/datasets/ds004212",
+        config,
+        proxy=None,
+        mirror=None,
+    )
+
+
+def test_download_connectivity_api_returns_failure_as_bad_gateway(
+    config, monkeypatch
+):
+    """Expose provider connectivity failures as HTTP 502 responses."""
+    monkeypatch.setattr(
+        main_api,
+        "check_download_connectivity",
+        Mock(side_effect=RuntimeError("Could not connect to mirror")),
+    )
+
+    response = TestClient(create_app(config)).post(
+        "/download/check",
+        json={"url": "https://openneuro.org/datasets/ds004212"},
+    )
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "Could not connect to mirror"
 
 
 def test_datalad_download_uses_mirror_proxy_and_fetches_content(tmp_path, monkeypatch):

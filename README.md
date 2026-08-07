@@ -184,6 +184,18 @@ duplicate is never downloaded or processed again.
 brainctl download --url "https://openneuro.org/datasets/ds007338/versions/1.0.0" --name EXAMPLE-MEG --alias EXAMPLE --modality meg
 ```
 
+Check the selected HTTP(S) source without downloading or registering anything:
+
+```bash
+brainctl download --url "https://openneuro.org/datasets/ds007338" \\
+  --mirror "https://mirror.example/{dataset_id}.git" --check-connection
+```
+
+The check uses the same `--proxy`, `--mirror`, and deployment defaults as a
+download. It creates no incoming workspace, log, job, or dataset record. It
+reports that total dataset size is unavailable when Git/DataLad metadata cannot
+provide a trustworthy annexed-content total before cloning.
+
 `--url` is required. `--version` is optional only when an OpenNeuro URL contains a version such as `/versions/1.0.0`; otherwise provide it manually. An explicit `--version` may name a provider branch or tag.
 
 Install `neural-data-registry[download]` to enable downloads. Automatic downloads currently support OpenNeuro; DANDI, NEMAR, PhysioNet, NeuroVault, and Kaggle URLs are recognised but their download clients are not configured yet.
@@ -280,6 +292,21 @@ curl -X POST http://127.0.0.1:8000/ingest/local \
 ```
 
 Download and register a provider dataset with `POST /download`:
+
+Check a download source without creating a download workspace with
+`POST /download/check`:
+
+```bash
+curl -X POST http://127.0.0.1:8000/download/check \\
+  -H 'Content-Type: application/json' \\
+  -d '{
+    "url": "https://openneuro.org/datasets/ds007338",
+    "mirror": "https://mirror.example/{dataset_id}.git"
+  }'
+```
+
+The endpoint returns HTTP 502 when the configured HTTP(S) source cannot be
+reached.
 
 ```bash
 curl -X POST http://127.0.0.1:8000/download \

@@ -17,6 +17,7 @@ from neural_data_registry.health import (
 from neural_data_registry.enums import Modality, Provider, StorageMode
 from neural_data_registry.service import (
     add_name_aliases,
+    check_download_connectivity,
     dataset_dict,
     dataset_output_fields,
     dataset_query_dict,
@@ -321,15 +322,69 @@ def ingest_local_command(
     console.print_json(data=dataset_dict(item))
 
 @app.command()
-def download(url: str = typer.Option(..., "--url", help="Provider dataset URL; the provider is detected from its host."), name: str = typer.Option(..., "--name", help="Dataset name to register."), alias: list[str] = typer.Option([], "--alias", help="Searchable alternate dataset name; repeat for multiple aliases."), modality: list[Modality] = typer.Option(..., "--modality", help="Dataset modality; repeat for multiple modalities."), version: str | None = typer.Option(None, "--version", help="Version or branch; required unless an OpenNeuro URL contains /versions/x.y.z."), proxy: str | None = typer.Option(None, "--proxy", help="Proxy URL for this download."), mirror: str | None = typer.Option(None, "--mirror", help="Mirror URL, URL base, or template containing {dataset_id}.")):
+def download(
+    url: str = typer.Option(
+        ..., "--url", help="Provider dataset URL; the provider is detected."
+    ),
+    name: str | None = typer.Option(
+        None, "--name", help="Dataset name to register."
+    ),
+    alias: list[str] = typer.Option(
+        [], "--alias", help="Searchable alternate dataset name."
+    ),
+    modality: list[Modality] = typer.Option(
+        [], "--modality", help="Dataset modality; repeat for multiple."
+    ),
+    version: str | None = typer.Option(
+        None, "--version", help="Version or branch for a real download."
+    ),
+    proxy: str | None = typer.Option(
+        None, "--proxy", help="Proxy URL for this download or check."
+    ),
+    mirror: str | None = typer.Option(
+        None, "--mirror", help="Mirror URL, base, or {dataset_id} template."
+    ),
+    check_connection: bool = typer.Option(
+        False,
+        "--check-connection",
+        help="Probe the configured HTTP(S) source without downloading.",
+    ),
+):
     """Download a supported provider dataset and ingest it automatically.
 
-    NAME and at least one --modality are required so the registry record has
-    explicit metadata. Install the package with the download extra to enable
-    DataLad-backed downloads. Failed downloads remain in NDR_DATA_ROOT/incoming.
+    With ``--check-connection``, only ``--url`` is required. The check uses
+    the same proxy and mirror selection as a download and creates no state.
     """
+    if check_connection:
+        try:
+            report = check_download_connectivity(
+                url,
+                proxy=proxy,
+                mirror=mirror,
+            )
+        except RuntimeError as exc:
+            console.print(f"[red]Connectivity check failed:[/red] {exc}")
+            raise typer.Exit(code=1) from exc
+        console.print_json(data=report)
+        return
+    if name is None:
+        raise typer.BadParameter(
+            "--name is required unless checking connection"
+        )
+    if not modality:
+        raise typer.BadParameter(
+            "At least one --modality is required unless checking connection"
+        )
     try:
-        item = download_dataset(url, version, name=name, modalities=[item.value for item in modality], proxy=proxy, mirror=mirror, name_aliases=alias)
+        item = download_dataset(
+            url,
+            version,
+            name=name,
+            modalities=[item.value for item in modality],
+            proxy=proxy,
+            mirror=mirror,
+            name_aliases=alias,
+        )
     except RuntimeError as exc:
         console.print(f"[red]Download failed:[/red] {exc}")
         raise typer.Exit(code=1) from exc

@@ -13,7 +13,11 @@ from neural_data_registry.config import Settings, get_settings
 from neural_data_registry.db.models import Dataset, DatasetAlias, IngestionJob
 from neural_data_registry.db.session import create_database, get_session_factory
 from neural_data_registry.enums import DatasetStatus, JobStatus, Modality, Provider, StorageMode, normalize_modalities
-from neural_data_registry.provider import download_from_url, provider_for_url
+from neural_data_registry.provider import (
+    check_download_connectivity as provider_connectivity_check,
+    download_from_url,
+    provider_for_url,
+)
 from neural_data_registry.storage import (
     copy_into_managed_storage,
     dataset_destination,
@@ -948,6 +952,35 @@ def resolve_download_version(url: str, requested: str | None = None) -> str:
         "provide --version or the API version field"
     )
 
+
+
+def check_download_connectivity(
+    url: str,
+    config: Settings | None = None,
+    *,
+    proxy: str | None = None,
+    mirror: str | None = None,
+) -> dict[str, object]:
+    """Check a download source without creating registry or staging state.
+
+    Parameters
+    ----------
+    url : str
+        Provider dataset URL.
+    config : Settings or None, optional
+        Registry settings supplying proxy and mirror defaults.
+    proxy : str or None, optional
+        Per-request proxy overriding the configured default.
+    mirror : str or None, optional
+        Per-request mirror overriding the configured default.
+    """
+    config = config or get_settings()
+    report = provider_connectivity_check(
+        url,
+        proxy=proxy if proxy is not None else config.download_proxy,
+        mirror=mirror if mirror is not None else config.download_mirror,
+    )
+    return report.as_dict()
 
 
 def download(

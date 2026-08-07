@@ -13,7 +13,15 @@ from neural_data_registry.config import Settings
 from neural_data_registry.health import request_health_check
 from neural_data_registry.db.models import Dataset
 from neural_data_registry.enums import Modality, Provider, StorageMode
-from neural_data_registry.service import DatasetConflictError, dataset_dict, download, find_datasets, ingest_local, session
+from neural_data_registry.service import (
+    DatasetConflictError,
+    check_download_connectivity,
+    dataset_dict,
+    download,
+    find_datasets,
+    ingest_local,
+    session,
+)
 from neural_data_registry.service import (
     DatasetNotFoundError,
     transition_reference_storage,
@@ -40,6 +48,14 @@ class DownloadRequest(BaseModel):
     name: str = Field(min_length=1)
     modalities: list[Modality] = Field(min_length=1)
     aliases: list[str] = Field(default_factory=list)
+    proxy: str | None = None
+    mirror: str | None = None
+
+
+class DownloadConnectivityRequest(BaseModel):
+    """Request body for checking a provider download source."""
+
+    url: str
     proxy: str | None = None
     mirror: str | None = None
 
@@ -156,6 +172,19 @@ def create_app(config: Settings | None = None) -> FastAPI:
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return dataset_dict(item)
+    @api.post("/download/check")
+    def check_download_source(request: DownloadConnectivityRequest) -> dict:
+        """Check provider connectivity without creating a download workspace."""
+        try:
+            return check_download_connectivity(
+                request.url,
+                config,
+                proxy=request.proxy,
+                mirror=request.mirror,
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
     @api.post("/download", status_code=202)
     def download_dataset(request: DownloadRequest) -> dict:
         try:

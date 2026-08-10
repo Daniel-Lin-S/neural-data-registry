@@ -282,6 +282,10 @@ def test_caller_scoped_reference_uses_only_submitted_source(
     """Measure as caller and prevent the service from reopening the source."""
     config = _caller_scoped_config(tmp_path)
     source = mock_dataset(tmp_path / "data", "submitted-reference")
+    owner_uid = source.stat().st_uid
+    owner_gid = source.stat().st_gid
+    os.chmod(source, 0o700)
+    os.chmod(source / "meg.fif", 0o600)
     _mock_caller_scoped_identities(monkeypatch)
     measured_paths: list[Path] = []
     preflight_count = 0
@@ -328,6 +332,11 @@ def test_caller_scoped_reference_uses_only_submitted_source(
 
     assert warning is None
     assert measured_paths == [source.resolve()]
+    assert source.stat().st_uid == owner_uid
+    assert source.stat().st_gid == owner_gid
+    assert stat.S_IMODE(source.stat().st_mode) == 0o755
+    assert stat.S_IMODE((source / "meg.fif").stat().st_mode) == 0o644
+    assert os.access(source / "meg.fif", os.W_OK)
     assert preflight_count == 2
     assert item.size_bytes == 123
     assert item.size_bytes_known is True
@@ -364,6 +373,42 @@ def test_caller_scoped_reference_allows_unknown_size(
     assert "unknown size" in warning
     assert item.size_bytes_known is False
     assert dataset_dict(item)["size_bytes"] is None
+
+def test_caller_scoped_reference_access_failure_does_not_register(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Reject a reference when its full public-read preparation fails."""
+    config = _caller_scoped_config(tmp_path)
+    source = mock_dataset(tmp_path / "data", "failed-reference")
+    _mock_caller_scoped_identities(monkeypatch)
+    failed_path = source / "meg.fif"
+
+    def fail_normalization(path: Path) -> None:
+        raise PermissionError(13, "Permission denied", str(failed_path))
+
+    monkeypatch.setattr(
+        protected_ingest,
+        "normalize_managed_dataset_access",
+        fail_normalization,
+    )
+
+    with pytest.raises(RuntimeError) as error:
+        protected_ingest.coordinate_protected_ingestion(
+            source,
+            "Failed reference",
+            Provider.OTHER,
+            None,
+            "1",
+            ["meg"],
+            StorageMode.REFERENCE,
+            [],
+            config,
+        )
+    assert str(failed_path) in str(error.value)
+    with session(config) as db:
+        assert db.query(Dataset).count() == 0
+
 
 
 @pytest.mark.parametrize("storage_mode", [StorageMode.COPY, StorageMode.MOVE])
@@ -577,12 +622,42 @@ def test_ingest_local_cli_routes_through_protected_coordinator(
             "--modality",
             "meg",
         ],
+        input="Y\n",
     )
 
     assert result.exit_code == 0, result.output
     assert "size is unknown" in result.output
     assert "protected-id" in result.output
     coordinate.assert_called_once()
+
+
+def test_ingest_local_cli_cancels_public_reference(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Avoid publication and coordination when confirmation is declined."""
+    config = _caller_scoped_config(tmp_path)
+    source = mock_dataset(tmp_path / "data", "cli-cancelled-source")
+    os.chmod(source, 0o700)
+    coordinate = Mock()
+    monkeypatch.setattr(cli, "get_settings", lambda: config)
+    monkeypatch.setattr(
+        protected_ingest,
+        "coordinate_protected_ingestion",
+        coordinate,
+    )
+
+    result = CliRunner().invoke(
+        cli.app,
+        ["ingest-local", str(source), "--name", "Cancelled CLI"],
+        input="N\n",
+    )
+
+    assert "no changes were made" in result.output
+    assert stat.S_IMODE(source.stat().st_mode) == 0o700
+    coordinate.assert_not_called()
+    assert result.exit_code != 0
+
 
 
 def test_local_ingestion_can_move_mock_dataset(config, tmp_path):
@@ -935,6 +1010,7 @@ def test_aliases_are_accepted_by_intake_api(config, tmp_path):
             "version": "1",
             "modalities": ["meg"],
             "aliases": ["API alias"],
+            "storage_mode": "copy",
         },
     )
 
@@ -949,7 +1025,28 @@ def test_all_core_api_routes(config, tmp_path):
     client = TestClient(create_app(config))
     assert client.get("/health").json() == {"status": "ok"}
     source = mock_dataset(tmp_path, "api-source")
-    created = client.post("/ingest/local", json={"source": str(source), "name": "THINGS-MEG", "provider": "openneuro", "url": "https://openneuro.org/datasets/ds004212", "version": "3.0.0", "modalities": ["meg"]})
+    reference = client.post(
+        "/ingest/local",
+        json={
+            "source": str(source),
+            "name": "API reference",
+            "storage_mode": "reference",
+        },
+    )
+    assert reference.status_code == 400
+    assert "interactive" in reference.json()["detail"]
+    created = client.post(
+        "/ingest/local",
+        json={
+            "source": str(source),
+            "name": "THINGS-MEG",
+            "provider": "openneuro",
+            "url": "https://openneuro.org/datasets/ds004212",
+            "version": "3.0.0",
+            "modalities": ["meg"],
+            "storage_mode": "copy",
+        },
+    )
     assert created.status_code == 201
     item = created.json()
     assert client.get("/datasets", params={"query": "THINGS"}).json() == [item]
@@ -957,10 +1054,19 @@ def test_all_core_api_routes(config, tmp_path):
     assert client.get("/datasets", params={"modality": "MEG"}).json() == [item]
     assert client.get(f"/datasets/{item['dataset_id']}").json() == item
     assert client.get("/datasets/no-such-id").status_code == 404
-    duplicate = client.post("/ingest/local", json={"source": str(mock_dataset(tmp_path, "api-duplicate")), "name": "things-meg", "provider": "local", "version": "1.0.0"})
+    duplicate = client.post(
+        "/ingest/local",
+        json={
+            "source": str(mock_dataset(tmp_path, "api-duplicate")),
+            "name": "things-meg",
+            "provider": "local",
+            "version": "1.0.0",
+            "storage_mode": "copy",
+        },
+    )
     assert duplicate.status_code == 409
     assert item["storage_path"] in duplicate.json()["detail"]
-    assert item["storage_mode"] == "reference"
+    assert item["storage_mode"] == "copy"
     assert source.exists()
     assert client.post("/ingest/local", json={"source": str(tmp_path / "missing"), "name": "Missing", "version": "1"}).status_code == 400
 

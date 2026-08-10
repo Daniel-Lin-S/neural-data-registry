@@ -159,6 +159,14 @@ def create_app(config: Settings | None = None) -> FastAPI:
 
     @api.post("/ingest/local", status_code=201)
     def ingest_local_dataset(request: LocalIngestionRequest, response: Response) -> dict:
+        if request.storage_mode is StorageMode.REFERENCE:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Reference-mode ingestion requires the interactive "
+                    "brainctl ingest-local command"
+                ),
+            )
         if request.storage_mode is StorageMode.COPY:
             response.headers["Warning"] = "299 - \"copy mode uses additional disk space; use only when SOURCE may be cleaned in the future\""
         try:

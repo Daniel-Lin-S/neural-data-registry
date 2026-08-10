@@ -278,7 +278,23 @@ def ingest_local_command(
     rejected with the existing storage path. The created record is printed as
     JSON.
     """
-    if storage_mode is StorageMode.COPY:
+    if storage_mode is StorageMode.REFERENCE:
+        console.print(
+            "[yellow]Warning: reference mode makes every directory "
+            "traversable and every file publicly readable. Ownership and "
+            "your write access are preserved; files are not moved or "
+            "removed. Symbolic links are preserved, but their targets may "
+            "retain separate access restrictions.[/yellow]"
+        )
+        if not typer.confirm(
+            "Make this reference dataset public?",
+            default=False,
+        ):
+            console.print(
+                "Reference ingestion cancelled; no changes were made."
+            )
+            raise typer.Abort()
+    elif storage_mode is StorageMode.COPY:
         console.print(
             "[yellow]Warning: copy mode uses additional disk space because "
             "SOURCE and the managed copy are both retained. Use it only when "

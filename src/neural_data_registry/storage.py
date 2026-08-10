@@ -124,18 +124,18 @@ def normalize_managed_dataset_access(
     owner_gid: int | None = None,
     progress_callback: Callable[[int, Path], None] | None = None,
 ) -> None:
-    """Make one managed tree publicly readable and service-writable.
+    """Make one dataset tree publicly readable.
 
     The traversal is limited to path and never follows symbolic links.
     Directories become mode 0755. Regular and special files become mode 0644,
     except files that already have an executable bit become mode 0755.
     Extended and default POSIX ACLs are removed. Optional ownership is applied
-    without following links.
+    for managed storage without following links.
 
     Parameters
     ----------
     path : pathlib.Path
-        Managed dataset directory to normalize.
+        Dataset directory to normalize.
     owner_uid : int or None, optional
         Service account UID, by default None.
     owner_gid : int or None, optional
@@ -158,19 +158,19 @@ def normalize_managed_dataset_access(
     requested_path = path.expanduser()
     if requested_path.is_symlink():
         raise ValueError(
-            "Managed dataset root must not be a symbolic link: "
+            "Dataset root must not be a symbolic link: "
             f"{requested_path.absolute()}"
         )
     try:
         root = requested_path.resolve(strict=True)
     except OSError as exc:
         raise ValueError(
-            "Managed dataset root could not be resolved: "
+            "Dataset root could not be resolved: "
             f"{requested_path.absolute()}"
         ) from exc
     if not root.is_dir():
         raise ValueError(
-            f"Managed dataset root must be a directory: {root}"
+            f"Dataset root must be a directory: {root}"
         )
 
     pending = [root]

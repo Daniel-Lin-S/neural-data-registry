@@ -1,7 +1,7 @@
 """Coordinate protected local ingestion across caller and service identities.
 
 Input is one parsed ``brainctl ingest-local`` request plus trusted ``SUDO_*``
-identity variables. Reference mode records the validated source path. Copy and
+identity variables. Reference mode publishes and records the source path. Copy and
 move modes stage only the submitted directory below the registry ``incoming``
 folder. Output is a committed dataset row and an optional size warning.
 """
@@ -175,11 +175,20 @@ def _stage_source_as_caller(
     )
 
 
-def _measure_reference_as_caller(
+def _prepare_reference_as_caller(
     request: LocalIngestionRequest,
     caller: UnixIdentity,
 ) -> PreparedCallerSource:
-    """Measure only the submitted reference with caller permissions."""
+    """Publish and measure one reference using caller permissions."""
+    try:
+        with effective_identity(caller):
+            normalize_managed_dataset_access(request.source)
+    except OSError as exc:
+        failed_path = exc.filename or str(request.source)
+        raise RuntimeError(
+            "Could not make reference dataset publicly readable at "
+            f"{failed_path}: {exc}"
+        ) from exc
     try:
         with effective_identity(caller):
             size_bytes = directory_size(request.source)
@@ -257,7 +266,7 @@ def coordinate_protected_ingestion(
         with ingestion_lock("registry-intake", config):
             preflight_local_ingestion_request(request, config)
             if request.storage_mode is StorageMode.REFERENCE:
-                prepared = _measure_reference_as_caller(request, caller)
+                prepared = _prepare_reference_as_caller(request, caller)
             else:
                 with effective_identity(
                     UnixIdentity("root", 0, 0, (0,))

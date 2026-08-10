@@ -138,7 +138,12 @@ brainctl ingest-local /path/to/things-meg \
 `--url` records the canonical remote URL when one exists.
 Repeat `--modality` to register multiple modalities. Repeat `--alias` to
 register searchable alternate names alongside the canonical `--name`.
-By default (`--storage-mode reference`), the command leaves `SOURCE` where it is and records its absolute path. Use `--storage-mode move` to relocate `SOURCE` into `$NDR_DATA_ROOT/datasets`. Use `--storage-mode copy` to preserve `SOURCE` while creating a managed duplicate; this consumes additional disk space and should only be used when `SOURCE` may be cleaned in the future. (DO NOT use `move` mode if your source location is still used by other codes)
+By default (`--storage-mode reference`), the command asks for confirmation,
+then leaves `SOURCE` where it is and records its absolute path. It makes the
+tree publicly readable and traversable without changing its owner or removing
+files. Use `--storage-mode move` to relocate `SOURCE` into
+`$NDR_DATA_ROOT/datasets`. Use `--storage-mode copy` to preserve `SOURCE`
+while creating a managed duplicate.
 Before validating or moving `SOURCE`, it rejects a duplicate canonical name or
 source URL/path and reports the existing storage path.
 
@@ -286,10 +291,14 @@ curl -X POST http://127.0.0.1:8000/ingest/local \
     "url": "https://openneuro.org/datasets/ds004212",
     "version": "3.0.0",
     "modalities": ["meg"],
+
     "aliases": ["THINGS_MEG"],
-    "storage_mode": "reference"
+    "storage_mode": "copy"
   }'
 ```
+
+The API rejects reference mode because public reference ingestion requires the
+interactive `brainctl ingest-local` confirmation.
 
 Download and register a provider dataset with `POST /download`:
 

@@ -851,6 +851,15 @@ def ingest_local(
         request = replace(request, source=validated_source)
     with ingestion_lock("registry-intake", config):
         preflight_local_ingestion_request(request, config)
+        if request.storage_mode is StorageMode.REFERENCE:
+            try:
+                normalize_managed_dataset_access(request.source)
+            except OSError as exc:
+                failed_path = exc.filename or str(request.source)
+                raise RuntimeError(
+                    "Could not make reference dataset publicly readable at "
+                    f"{failed_path}: {exc}"
+                ) from exc
         return commit_local_ingestion_request(request, config)
 
 def transition_reference_storage(

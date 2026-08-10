@@ -2,30 +2,31 @@
 
 set -Eeuo pipefail
 
+
 # ============================================================
 # Hugging Face dataset downloader
 #
-# Example:
+# Examples:
 #
-# Mainland China + HF mirror + local proxy:
+# Direct Hugging Face + local proxy:
 #
-#   ./download_hf_dataset.sh \
+#   ./download_huggingface.sh \
+#       --dest /data/LibriBrain \
+#       --proxy-port 7893
+#
+#
+# Mainland China mirror + proxy:
+#
+#   ./download_huggingface.sh \
 #       --dest /data/LibriBrain \
 #       --mirror https://hf-mirror.com \
 #       --proxy-port 7893
 #
 #
-# Direct download:
+# Direct download without proxy:
 #
-#   ./download_hf_dataset.sh \
+#   ./download_huggingface.sh \
 #       --dest /data/LibriBrain
-#
-#
-# Disable proxy explicitly:
-#
-#   ./download_hf_dataset.sh \
-#       --dest /data/LibriBrain \
-#       --no-proxy
 #
 # ============================================================
 
@@ -38,10 +39,8 @@ REPO_ID="pnpl/LibriBrain"
 
 DEST=""
 
-# Official HF by default
 HF_ENDPOINT="https://huggingface.co"
 
-# Proxy disabled by default
 USE_PROXY=0
 
 PROXY_HOST="127.0.0.1"
@@ -77,6 +76,7 @@ Optional:
 
   --repo REPO_ID
         Hugging Face dataset repository.
+
         Default:
         pnpl/LibriBrain
 
@@ -92,7 +92,7 @@ Optional:
 
 
   --proxy-port PORT
-        Enable HTTP proxy with given port.
+        Enable proxy with given port.
 
         Example:
         7893
@@ -111,23 +111,20 @@ Optional:
         Default:
         http
 
-        Example:
-        socks5
-
 
   --no-proxy
         Disable proxy.
 
 
   --max-workers N
-        Number of parallel download workers.
+        Number of parallel file downloads.
 
         Default:
         4
 
 
   --timeout SEC
-        Download timeout.
+        HTTP timeout.
 
         Default:
         60
@@ -139,7 +136,6 @@ Optional:
 
   -h, --help
         Show this message.
-
 
 EOF
 }
@@ -158,18 +154,15 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
 
-
         --repo)
             REPO_ID="$2"
             shift 2
             ;;
 
-
         --mirror)
             HF_ENDPOINT="$2"
             shift 2
             ;;
-
 
         --proxy-port)
             USE_PROXY=1
@@ -177,13 +170,11 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
 
-
         --proxy-host)
             USE_PROXY=1
             PROXY_HOST="$2"
             shift 2
             ;;
-
 
         --proxy-scheme)
             USE_PROXY=1
@@ -191,36 +182,30 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
 
-
         --no-proxy)
             USE_PROXY=0
             shift
             ;;
-
 
         --max-workers)
             MAX_WORKERS="$2"
             shift 2
             ;;
 
-
         --timeout)
             TIMEOUT="$2"
             shift 2
             ;;
-
 
         --dry-run)
             DRY_RUN=1
             shift
             ;;
 
-
         -h|--help)
             show_help
             exit 0
             ;;
-
 
         *)
             echo "Unknown option: $1"
@@ -232,7 +217,6 @@ while [[ $# -gt 0 ]]; do
     esac
 
 done
-
 
 
 # -----------------------------
@@ -251,28 +235,29 @@ if [[ -z "${DEST}" ]]; then
 fi
 
 
-
 # -----------------------------
-# Check hf CLI
+# Check dependencies
 # -----------------------------
 
-if ! command -v hf >/dev/null 2>&1; then
+if ! python - <<'PY' >/dev/null 2>&1
+import httpx
+import huggingface_hub
+PY
+then
 
-    echo "ERROR: Hugging Face CLI not found."
-
+    echo "ERROR: Required Python packages are missing."
     echo
     echo "Install with:"
     echo
-    echo "  pip install -U huggingface_hub"
+    echo "  pip install -U huggingface_hub httpx"
 
     exit 1
 
 fi
 
 
-
 # -----------------------------
-# Environment setup
+# Environment
 # -----------------------------
 
 export HF_ENDPOINT="${HF_ENDPOINT}"
@@ -280,6 +265,17 @@ export HF_ENDPOINT="${HF_ENDPOINT}"
 export HF_HUB_DOWNLOAD_TIMEOUT="${TIMEOUT}"
 
 
+# Important:
+#
+# The TLS 1.2 workaround below customizes Hugging Face's
+# HTTPX client. hf_xet has a separate network stack, so
+# disable it to ensure file requests use this HTTP client.
+export HF_HUB_DISABLE_XET=1
+
+
+# -----------------------------
+# Proxy
+# -----------------------------
 
 if [[ "${USE_PROXY}" == "1" ]]; then
 
@@ -293,11 +289,10 @@ if [[ "${USE_PROXY}" == "1" ]]; then
 
 else
 
-    unset HTTP_PROXY HTTPS_PROXY
-    unset http_proxy https_proxy
+    unset HTTP_PROXY HTTPS_PROXY || true
+    unset http_proxy https_proxy || true
 
 fi
-
 
 
 # -----------------------------
@@ -305,7 +300,6 @@ fi
 # -----------------------------
 
 mkdir -p "${DEST}"
-
 
 
 # -----------------------------
@@ -329,6 +323,8 @@ fi
 
 echo "Workers    : ${MAX_WORKERS}"
 echo "Timeout    : ${TIMEOUT}s"
+echo "TLS        : TLS 1.2 only"
+echo "Xet        : disabled"
 echo
 
 echo "Interrupted downloads can be resumed by rerunning"
@@ -337,35 +333,130 @@ echo
 
 
 # -----------------------------
-# Build command
+# Export configuration for Python
 # -----------------------------
 
-CMD=(
+export DOWNLOAD_REPO_ID="${REPO_ID}"
+export DOWNLOAD_DEST="${DEST}"
+export DOWNLOAD_ENDPOINT="${HF_ENDPOINT}"
+export DOWNLOAD_MAX_WORKERS="${MAX_WORKERS}"
+export DOWNLOAD_TIMEOUT="${TIMEOUT}"
+export DOWNLOAD_DRY_RUN="${DRY_RUN}"
 
-    hf download
 
-    "${REPO_ID}"
+# -----------------------------
+# Download
+# -----------------------------
 
-    --repo-type dataset
+python - <<'PY'
+import os
+import ssl
 
-    --local-dir "${DEST}"
-
-    --max-workers "${MAX_WORKERS}"
-
+import httpx
+from huggingface_hub import (
+    set_client_factory,
+    snapshot_download,
 )
 
 
+repo_id = os.environ["DOWNLOAD_REPO_ID"]
+dest = os.environ["DOWNLOAD_DEST"]
+endpoint = os.environ["DOWNLOAD_ENDPOINT"]
 
-if [[ "${DRY_RUN}" == "1" ]]; then
+max_workers = int(os.environ["DOWNLOAD_MAX_WORKERS"])
+timeout = float(os.environ["DOWNLOAD_TIMEOUT"])
 
-    CMD+=(--dry-run)
-
-fi
-
+dry_run = os.environ["DOWNLOAD_DRY_RUN"] == "1"
 
 
-# -----------------------------
-# Execute
-# -----------------------------
+# ------------------------------------------------------------
+# TLS configuration
+#
+# HTTPX default TLS negotiation was unstable through the
+# current Mihomo route, while forcing TLS 1.2 was stable.
+# ------------------------------------------------------------
 
-"${CMD[@]}"
+ssl_context = ssl.create_default_context()
+
+ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
+ssl_context.maximum_version = ssl.TLSVersion.TLSv1_2
+
+
+# ------------------------------------------------------------
+# Hugging Face HTTP client
+# ------------------------------------------------------------
+
+def hf_client_factory():
+
+    return httpx.Client(
+        verify=ssl_context,
+
+        # HTTP_PROXY / HTTPS_PROXY are configured by the
+        # parent shell script.
+        trust_env=True,
+
+        follow_redirects=True,
+
+        timeout=httpx.Timeout(timeout),
+    )
+
+
+set_client_factory(hf_client_factory)
+
+
+# ------------------------------------------------------------
+# Download repository
+# ------------------------------------------------------------
+
+result = snapshot_download(
+    repo_id=repo_id,
+    repo_type="dataset",
+
+    local_dir=dest,
+
+    endpoint=endpoint,
+
+    max_workers=max_workers,
+
+    dry_run=dry_run,
+)
+
+
+# ------------------------------------------------------------
+# Dry-run output
+# ------------------------------------------------------------
+
+if dry_run:
+
+    pending = [
+        item
+        for item in result
+        if item.will_download
+    ]
+
+    total_bytes = sum(
+        item.file_size
+        for item in pending
+    )
+
+    print()
+    print("Dry-run summary")
+    print("----------------------------------------")
+    print(f"Files to download : {len(pending)}")
+    print(f"GiB to download   : {total_bytes / 1024**3:.2f}")
+
+    print()
+
+    for item in pending:
+
+        print(
+            f"{item.file_size / 1024**2:10.2f} MiB  "
+            f"{item.filename}"
+        )
+
+else:
+
+    print()
+    print(f"Download location: {result}")
+
+PY

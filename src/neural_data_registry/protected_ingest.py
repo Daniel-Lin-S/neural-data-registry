@@ -31,6 +31,7 @@ from neural_data_registry.storage import (
     directory_size,
     ingestion_lock,
     normalize_managed_dataset_access,
+    normalize_reference_dataset_access,
 )
 
 SUDO_GID_VARIABLE = "SUDO_GID"
@@ -182,7 +183,7 @@ def _prepare_reference_as_caller(
     """Publish and measure one reference using caller permissions."""
     try:
         with effective_identity(caller):
-            normalize_managed_dataset_access(request.source)
+            normalize_reference_dataset_access(request.source)
     except OSError as exc:
         failed_path = exc.filename or str(request.source)
         raise RuntimeError(

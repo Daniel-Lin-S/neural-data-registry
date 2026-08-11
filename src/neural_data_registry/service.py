@@ -26,6 +26,7 @@ from neural_data_registry.storage import (
     ingestion_lock,
     move_into_managed_storage,
     normalize_managed_dataset_access,
+    normalize_reference_dataset_access,
     safe_component,
 )
 
@@ -853,7 +854,7 @@ def ingest_local(
         preflight_local_ingestion_request(request, config)
         if request.storage_mode is StorageMode.REFERENCE:
             try:
-                normalize_managed_dataset_access(request.source)
+                normalize_reference_dataset_access(request.source)
             except OSError as exc:
                 failed_path = exc.filename or str(request.source)
                 raise RuntimeError(

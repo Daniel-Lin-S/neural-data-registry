@@ -46,6 +46,7 @@ from neural_data_registry.storage import (
     dataset_destination,
     ingestion_lock,
     normalize_managed_dataset_access,
+    normalize_reference_dataset_access,
 )
 from neural_data_registry.service import dataset_dict, find_datasets, ingest_local, session, update_dataset_metadata
 
@@ -117,6 +118,116 @@ def test_managed_dataset_access_is_public_read_only(
         )
     assert link.is_symlink()
 
+
+def test_reference_dataset_access_preserves_owner_permissions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Publish a reference without changing owner, group, ACLs, or links."""
+    source = mock_dataset(tmp_path, "reference")
+    nested = source / "nested"
+    nested.mkdir()
+    data_file = nested / "data.bin"
+    executable_file = nested / "tool.sh"
+    external_file = tmp_path / "external.bin"
+    data_file.write_bytes(b"data")
+    executable_file.write_text("#!/bin/sh\n")
+    external_file.write_bytes(b"external")
+    link = source / "external-link"
+    link.symlink_to(external_file)
+    entries = (source, nested, data_file, executable_file, link)
+    entry_ownership = {
+        entry: (entry.lstat().st_uid, entry.lstat().st_gid)
+        for entry in entries
+    }
+    os.chmod(source, 0o740)
+    os.chmod(nested, 0o710)
+    os.chmod(data_file, 0o640)
+    os.chmod(executable_file, 0o750)
+    os.chmod(external_file, 0o600)
+    remove_acl = Mock()
+    monkeypatch.setattr(storage_service, "_remove_posix_acls", remove_acl)
+
+    normalize_reference_dataset_access(source)
+
+    assert {
+        entry: (entry.lstat().st_uid, entry.lstat().st_gid)
+        for entry in entries
+    } == entry_ownership
+    assert stat.S_IMODE(source.stat().st_mode) == 0o745
+    assert stat.S_IMODE(nested.stat().st_mode) == 0o715
+    assert stat.S_IMODE(data_file.stat().st_mode) == 0o644
+    assert stat.S_IMODE(executable_file.stat().st_mode) == 0o754
+    assert stat.S_IMODE(external_file.stat().st_mode) == 0o600
+    assert link.is_symlink()
+    remove_acl.assert_not_called()
+
+
+def test_reference_ingestion_allows_public_foreign_source(
+    monkeypatch: pytest.MonkeyPatch,
+    config: Settings,
+    tmp_path: Path,
+) -> None:
+    """Register an already-public foreign reference without chmod."""
+    source = mock_dataset(tmp_path, "public-external")
+    source_uid = source.stat().st_uid
+    source_gid = source.stat().st_gid
+    os.chmod(source, 0o755)
+    os.chmod(source / "dataset_description.json", 0o644)
+    os.chmod(source / "meg.fif", 0o644)
+    chmod = Mock()
+    monkeypatch.setattr(storage_service.os, "chmod", chmod)
+    monkeypatch.setattr(storage_service.os, "geteuid", lambda: source_uid + 1)
+
+    item = ingest_local(
+        source,
+        "Public external",
+        Provider.OTHER,
+        None,
+        "1",
+        ["meg"],
+        config,
+    )
+
+    assert item.storage_mode is StorageMode.REFERENCE
+    assert source.stat().st_uid == source_uid
+    assert source.stat().st_gid == source_gid
+    chmod.assert_not_called()
+
+
+def test_reference_ingestion_rejects_private_foreign_source(
+    monkeypatch: pytest.MonkeyPatch,
+    config: Settings,
+    tmp_path: Path,
+) -> None:
+    """Reject a private foreign reference before modifying its permissions."""
+    source = mock_dataset(tmp_path, "private-external")
+    data_file = source / "dataset_description.json"
+    os.chmod(source, 0o700)
+    os.chmod(data_file, 0o600)
+    os.chmod(source / "meg.fif", 0o600)
+    source_mode = stat.S_IMODE(source.stat().st_mode)
+    data_mode = stat.S_IMODE(data_file.stat().st_mode)
+    meg_mode = stat.S_IMODE((source / "meg.fif").stat().st_mode)
+    foreign_uid = source.stat().st_uid + 1
+    monkeypatch.setattr(storage_service.os, "geteuid", lambda: foreign_uid)
+
+    with pytest.raises(RuntimeError, match="does not own this entry"):
+        ingest_local(
+            source,
+            "Private external",
+            Provider.OTHER,
+            None,
+            "1",
+            ["meg"],
+            config,
+        )
+
+    assert stat.S_IMODE(source.stat().st_mode) == source_mode
+    assert stat.S_IMODE(data_file.stat().st_mode) == data_mode
+    assert stat.S_IMODE((source / "meg.fif").stat().st_mode) == meg_mode
+    with session(config) as db:
+        assert db.query(Dataset).count() == 0
 
 def test_global_data_root_comes_from_environment(monkeypatch, tmp_path):
     """Verify the global root and default SQLite URL are derived from NDR_DATA_ROOT."""
@@ -334,8 +445,8 @@ def test_caller_scoped_reference_uses_only_submitted_source(
     assert measured_paths == [source.resolve()]
     assert source.stat().st_uid == owner_uid
     assert source.stat().st_gid == owner_gid
-    assert stat.S_IMODE(source.stat().st_mode) == 0o755
-    assert stat.S_IMODE((source / "meg.fif").stat().st_mode) == 0o644
+    assert stat.S_IMODE(source.stat().st_mode) == 0o705
+    assert stat.S_IMODE((source / "meg.fif").stat().st_mode) == 0o604
     assert os.access(source / "meg.fif", os.W_OK)
     assert preflight_count == 2
     assert item.size_bytes == 123
@@ -389,7 +500,7 @@ def test_caller_scoped_reference_access_failure_does_not_register(
 
     monkeypatch.setattr(
         protected_ingest,
-        "normalize_managed_dataset_access",
+        "normalize_reference_dataset_access",
         fail_normalization,
     )
 

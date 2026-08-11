@@ -140,8 +140,11 @@ Repeat `--modality` to register multiple modalities. Repeat `--alias` to
 register searchable alternate names alongside the canonical `--name`.
 By default (`--storage-mode reference`), the command asks for confirmation,
 then leaves `SOURCE` where it is and records its absolute path. It makes the
-tree publicly readable and traversable without changing its owner or removing
-files. Use `--storage-mode move` to relocate `SOURCE` into
+tree publicly readable and traversable without changing ownership, existing
+owner or group permissions, or POSIX ACLs. An already-public source owned by
+another user can be registered read-only. If publication needs a permission
+change that the caller cannot make, registration fails before changing the
+tree. Use `--storage-mode move` to relocate `SOURCE` into
 `$NDR_DATA_ROOT/datasets`. Use `--storage-mode copy` to preserve `SOURCE`
 while creating a managed duplicate.
 Before validating or moving `SOURCE`, it rejects a duplicate canonical name or

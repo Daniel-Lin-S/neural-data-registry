@@ -6,13 +6,16 @@ import os
 import re
 import shutil
 import stat
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
 from neural_data_registry.config import Settings, get_settings
 
 EXECUTE_PERMISSION_BITS = stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH
+REFERENCE_DIRECTORY_PUBLIC_MODE = stat.S_IROTH | stat.S_IXOTH
+REFERENCE_FILE_PUBLIC_MODE = stat.S_IROTH
+ROOT_USER_ID = 0
 IGNORED_ACL_ERROR_NUMBERS = {
     errno.ENODATA,
     errno.ENOTSUP,
@@ -117,6 +120,125 @@ def _normalize_managed_entry(
     os.chmod(path, mode, follow_symlinks=False)
 
 
+def _resolve_dataset_root(path: Path) -> Path:
+    """Resolve one non-symbolic-link dataset directory.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        Dataset directory to resolve.
+
+    Returns
+    -------
+    pathlib.Path
+        Resolved dataset directory.
+
+    Raises
+    ------
+    ValueError
+        If the path is a symbolic link, cannot be resolved, or is not a
+        directory.
+    """
+    requested_path = path.expanduser()
+    if requested_path.is_symlink():
+        raise ValueError(
+            "Dataset root must not be a symbolic link: "
+            f"{requested_path.absolute()}"
+        )
+    try:
+        root = requested_path.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(
+            "Dataset root could not be resolved: "
+            f"{requested_path.absolute()}"
+        ) from exc
+    if not root.is_dir():
+        raise ValueError(f"Dataset root must be a directory: {root}")
+    return root
+
+
+def _iter_dataset_entries(
+    path: Path,
+) -> Iterator[tuple[Path, os.stat_result]]:
+    """Yield dataset entries without following symbolic links."""
+    pending = [path]
+    while pending:
+        current = pending.pop()
+        current_stat = current.lstat()
+        yield current, current_stat
+        with os.scandir(current) as entries:
+            for entry in entries:
+                entry_path = Path(entry.path)
+                entry_stat = entry.stat(follow_symlinks=False)
+                if stat.S_ISDIR(entry_stat.st_mode):
+                    pending.append(entry_path)
+                else:
+                    yield entry_path, entry_stat
+
+
+def _reference_public_mode(entry_mode: int) -> int | None:
+    """Return the mode that publishes one reference entry."""
+    if stat.S_ISLNK(entry_mode):
+        return None
+    current_mode = stat.S_IMODE(entry_mode)
+    if stat.S_ISDIR(entry_mode):
+        return current_mode | REFERENCE_DIRECTORY_PUBLIC_MODE
+    return current_mode | REFERENCE_FILE_PUBLIC_MODE
+
+
+def _validate_reference_publication_access(root: Path) -> None:
+    """Reject a reference whose public permissions cannot be changed."""
+    effective_uid = os.geteuid()
+    for entry_path, entry_stat in _iter_dataset_entries(root):
+        public_mode = _reference_public_mode(entry_stat.st_mode)
+        if public_mode is None:
+            continue
+        if public_mode == stat.S_IMODE(entry_stat.st_mode):
+            continue
+        if effective_uid in (ROOT_USER_ID, entry_stat.st_uid):
+            continue
+        raise PermissionError(
+            errno.EPERM,
+            "Reference publication requires changing public permissions, "
+            "but the effective user does not own this entry",
+            str(entry_path),
+        )
+
+
+def normalize_reference_dataset_access(path: Path) -> None:
+    """Publish a reference tree without changing ownership or existing rights.
+
+    Directories gain missing other-read and other-execute permissions. Files
+    gain missing other-read permission. Owner and group bits, POSIX ACLs, and
+    symbolic links are preserved. Already-public external trees can register
+    read-only without modification.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        Referenced dataset directory.
+
+    Raises
+    ------
+    ValueError
+        If the dataset root is invalid.
+    PermissionError
+        If publication requires changing an entry not owned by the effective
+        user.
+    OSError
+        If an entry cannot be inspected or its permissions cannot be updated.
+    """
+    root = _resolve_dataset_root(path)
+    _validate_reference_publication_access(root)
+    for entry_path, entry_stat in _iter_dataset_entries(root):
+        public_mode = _reference_public_mode(entry_stat.st_mode)
+        if public_mode is None:
+            continue
+        if public_mode == stat.S_IMODE(entry_stat.st_mode):
+            continue
+        os.chmod(entry_path, public_mode, follow_symlinks=False)
+
+
 def normalize_managed_dataset_access(
     path: Path,
     *,
@@ -155,25 +277,8 @@ def normalize_managed_dataset_access(
         raise ValueError(
             "Managed ownership requires both owner_uid and owner_gid"
         )
-    requested_path = path.expanduser()
-    if requested_path.is_symlink():
-        raise ValueError(
-            "Dataset root must not be a symbolic link: "
-            f"{requested_path.absolute()}"
-        )
-    try:
-        root = requested_path.resolve(strict=True)
-    except OSError as exc:
-        raise ValueError(
-            "Dataset root could not be resolved: "
-            f"{requested_path.absolute()}"
-        ) from exc
-    if not root.is_dir():
-        raise ValueError(
-            f"Dataset root must be a directory: {root}"
-        )
+    root = _resolve_dataset_root(path)
 
-    pending = [root]
     normalized_count = 0
 
     def report_progress(entry_path: Path) -> None:
@@ -182,30 +287,14 @@ def normalize_managed_dataset_access(
         if progress_callback is not None:
             progress_callback(normalized_count, entry_path)
 
-    while pending:
-        current = pending.pop()
-        current_stat = current.lstat()
+    for entry_path, entry_stat in _iter_dataset_entries(root):
         _normalize_managed_entry(
-            current,
-            current_stat.st_mode,
+            entry_path,
+            entry_stat.st_mode,
             owner_uid,
             owner_gid,
         )
-        report_progress(current)
-        with os.scandir(current) as entries:
-            for entry in entries:
-                entry_path = Path(entry.path)
-                entry_stat = entry.stat(follow_symlinks=False)
-                if stat.S_ISDIR(entry_stat.st_mode):
-                    pending.append(entry_path)
-                else:
-                    _normalize_managed_entry(
-                        entry_path,
-                        entry_stat.st_mode,
-                        owner_uid,
-                        owner_gid,
-                    )
-                    report_progress(entry_path)
+        report_progress(entry_path)
 
 
 def safe_component(value: str) -> str: return re.sub(r"[^a-zA-Z0-9._-]+", "-", value).strip(".-").lower() or "dataset"

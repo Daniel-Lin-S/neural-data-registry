@@ -280,11 +280,12 @@ def ingest_local_command(
     """
     if storage_mode is StorageMode.REFERENCE:
         console.print(
-            "[yellow]Warning: reference mode makes every directory "
-            "traversable and every file publicly readable. Ownership and "
-            "your write access are preserved; files are not moved or "
-            "removed. Symbolic links are preserved, but their targets may "
-            "retain separate access restrictions.[/yellow]"
+            "[yellow]Warning: reference mode makes every directory publicly "
+            "readable and traversable. Ownership, existing owner and group "
+            "permissions, and ACLs are preserved. Already-public external "
+            "trees can be registered read-only. Files are not moved or "
+            "removed; symbolic-link targets may retain separate access "
+            "restrictions.[/yellow]"
         )
         if not typer.confirm(
             "Make this reference dataset public?",

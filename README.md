@@ -75,9 +75,10 @@ pending files, or `--retry-attempts 0` to retry transient failures until
 Ctrl-C.
 
 For unstable Mihomo routes, the downloader can rank a selector by repeated
-HTTPS success, bounded throughput, and latency. Ranking starts only when both
-`--mihomo-group` and `--mihomo-speed-test-url` are set. The controller is then
-required, while the node marker remains an optional name filter:
+HTTPS success, bounded throughput, and latency. Supplying
+`--mihomo-speed-test-url` activates ranking. Supply the controller explicitly;
+the selector is discovered from the live route used by the speed-test URL.
+The group and node marker remain optional overrides:
 
 ```bash
 /ABSOLUTE/PATH/TO/REPOSITORY/scripts/download_huggingface.sh \
@@ -85,18 +86,25 @@ required, while the node marker remains an optional name filter:
   --dest /ABSOLUTE/PATH/TO/DESTINATION \
   --proxy-port PROXY_PORT \
   --retry-attempts 0 \
-  --mihomo-controller CONTROLLER_URL \
-  --mihomo-group DEDICATED_SELECTOR \
-  --mihomo-node-marker REQUIRED_NAME_TEXT \
+  --mihomo-controller http://127.0.0.1:CONTROLLER_PORT \
   --mihomo-speed-test-url LARGE_HTTPS_FILE_URL
 ```
 
 Every Hub and CDN domain must route through the selector. Without
 `--mihomo-node-marker`, every direct node in the selector is eligible. With a
-marker, the downloader never selects an unmarked node. If either the group or
-speed-test URL is omitted, ranking and failover are skipped while ordinary
-proxying remains active. Export an optional controller secret as
-`MIHOMO_SECRET`; its value is never printed.
+marker, the downloader never selects an unmarked node. If the speed-test URL
+is omitted, ranking and failover are skipped while ordinary proxying remains
+active. The initial throughput test consumes at most 1.5 MiB,
+uses one sample for each of at most three candidates, limits each sample to
+eight seconds, and caches the ranking for six hours. Export an optional
+controller address as `MIHOMO_CONTROLLER`, an optional selector override as
+`MIHOMO_GROUP`, and an optional controller secret as `MIHOMO_SECRET`; secret
+values are never printed. CLI values override their environment counterparts.
+
+Every continued command line must end with `\` as its final character. A
+missing continuation, or spaces after it, causes the next option to run as a
+separate command and produces errors such as
+`--mihomo-group: command not found`.
 
 ## OSF dataset downloads
 
@@ -132,9 +140,9 @@ inspect the manifest without creating the destination, `--storage NAME` for a
 different provider, or `--retry-attempts 0` for retries until Ctrl-C. Export
 `OSF_TOKEN` for private projects; its value is never printed.
 
-Ranked Mihomo failover is optional. Supply the controller, group, and speed
-URL, and keep one file worker so switching nodes cannot interrupt another
-active file. The node marker shown below is optional:
+Ranked Mihomo failover is optional. Supply the speed URL and controller to
+activate it, and keep one file worker so switching nodes cannot interrupt
+another active file. Group and node-marker options are optional overrides:
 
 ```bash
 /ABSOLUTE/PATH/TO/REPOSITORY/scripts/download_osf.sh \
@@ -142,16 +150,17 @@ active file. The node marker shown below is optional:
   --dest /ABSOLUTE/PATH/TO/DESTINATION \
   --proxy-port PROXY_PORT \
   --retry-attempts 0 \
-  --mihomo-controller CONTROLLER_URL \
-  --mihomo-group DEDICATED_SELECTOR \
-  --mihomo-node-marker REQUIRED_NAME_TEXT \
+  --mihomo-controller http://127.0.0.1:CONTROLLER_PORT \
   --mihomo-speed-test-url LARGE_OSF_HTTPS_FILE_URL
 ```
 
 The `api.osf.io` and `files.osf.io` domains must route through the named
 selector. Without `--mihomo-node-marker`, all direct selector members are
-eligible. If either the group or speed-test URL is omitted, ranking is skipped
-and `--proxy-port` still provides ordinary proxy access.
+eligible. Without a speed-test URL, ranking is skipped and `--proxy-port`
+still provides ordinary proxy access. OSF ranking uses the same bounded
+1.5 MiB initial benchmark and six-hour cache as Hugging Face ranking. The
+`MIHOMO_CONTROLLER`, `MIHOMO_GROUP`, and `MIHOMO_SECRET` environment variables
+have the same behavior as in the Hugging Face downloader.
 
 ## CLI commands
 

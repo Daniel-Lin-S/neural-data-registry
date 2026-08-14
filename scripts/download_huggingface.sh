@@ -27,7 +27,7 @@ readonly DEFAULT_RETRY_ATTEMPTS="8"
 readonly DEFAULT_RETRY_BASE_DELAY="5"
 readonly DEFAULT_RETRY_MAX_DELAY="300"
 readonly DEFAULT_XET_RANGE_CONCURRENCY="2"
-readonly DEFAULT_MIHOMO_PROBE_TIMEOUT="15"
+readonly DEFAULT_MIHOMO_PROBE_TIMEOUT="8"
 
 REPO_ID=""
 DEST=""
@@ -44,8 +44,8 @@ RETRY_ATTEMPTS="${DEFAULT_RETRY_ATTEMPTS}"
 RETRY_BASE_DELAY="${DEFAULT_RETRY_BASE_DELAY}"
 RETRY_MAX_DELAY="${DEFAULT_RETRY_MAX_DELAY}"
 XET_RANGE_CONCURRENCY="${DEFAULT_XET_RANGE_CONCURRENCY}"
-MIHOMO_CONTROLLER=""
-MIHOMO_GROUP=""
+MIHOMO_CONTROLLER="${MIHOMO_CONTROLLER-}"
+MIHOMO_GROUP="${MIHOMO_GROUP-}"
 MIHOMO_NODE_MARKER=""
 MIHOMO_SPEED_TEST_URL=""
 MIHOMO_PROBE_TIMEOUT="${DEFAULT_MIHOMO_PROBE_TIMEOUT}"
@@ -119,19 +119,20 @@ Optional:
         Default: ${DEFAULT_XET_RANGE_CONCURRENCY}
 
   --mihomo-controller URL
-        External-controller URL for ranked node selection. Required only
-        when both --mihomo-group and --mihomo-speed-test-url are set.
+        External-controller URL for ranked node selection.
+        Required with --mihomo-speed-test-url unless MIHOMO_CONTROLLER is set.
 
   --mihomo-group NAME
-        Selector containing eligible direct nodes. Omit to skip ranking.
+        Optional selector override containing eligible direct nodes. When
+        omitted, discover the selector used by the speed-test URL.
 
   --mihomo-node-marker TEXT
         Optional literal filter for eligible node names. When omitted, all
         direct nodes in the selector are eligible.
 
   --mihomo-speed-test-url URL
-        Large HTTPS file used for bounded throughput tests. Omit to skip
-        ranking.
+        HTTPS file used for bounded throughput tests. Supplying this option
+        activates ranking; omitting it skips ranking.
 
   --mihomo-probe-timeout SEC
         Timeout for node probes and bounded speed tests.
@@ -225,11 +226,11 @@ validate_configuration()
         || fail "--retry-max-delay must be a positive integer."
     is_positive_integer "${XET_RANGE_CONCURRENCY}" \
         || fail "--xet-range-concurrency must be a positive integer."
-    if [[ -n "${MIHOMO_GROUP}" && -n "${MIHOMO_SPEED_TEST_URL}" ]]; then
-        [[ -n "${MIHOMO_CONTROLLER}" ]] \
-            || fail "Mihomo ranking requires --mihomo-controller."
+    if [[ -n "${MIHOMO_SPEED_TEST_URL}" ]]; then
         [[ "${USE_PROXY}" == "1" ]] \
             || fail "Mihomo ranking requires --proxy-port."
+        [[ -n "${MIHOMO_CONTROLLER}" ]] \
+            || fail "Set --mihomo-controller or MIHOMO_CONTROLLER for ranking."
         [[ "${MIHOMO_CONTROLLER}" =~ ^https?://[^[:space:]]+$ ]] \
             || fail "--mihomo-controller must be an HTTP or HTTPS URL."
         [[ "${MIHOMO_SPEED_TEST_URL}" =~ ^https://[^[:space:]]+$ ]] \
@@ -318,7 +319,9 @@ print_configuration()
 
     if [[ "${MIHOMO_ENABLED}" == "1" ]]; then
         printf 'Mihomo API   : %s\n' "${MIHOMO_CONTROLLER}"
-        printf 'Mihomo group : %s\n' "${MIHOMO_GROUP}"
+        if [[ -n "${MIHOMO_GROUP}" ]]; then
+            printf 'Mihomo group : %s\n' "${MIHOMO_GROUP}"
+        fi
         if [[ -n "${MIHOMO_NODE_MARKER}" ]]; then
             printf 'Node filter  : %s\n' "${MIHOMO_NODE_MARKER}"
         else

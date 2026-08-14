@@ -36,6 +36,7 @@ from mihomo_ranker import MihomoConfig, MihomoNodeManager
 
 DEFAULT_PAGE_SIZE = 100
 DOWNLOAD_CHUNK_SIZE = 1024 * 1024
+DEFAULT_MIHOMO_PROBE_TIMEOUT = 8.0
 OSF_PROJECT_ID_PATTERN = re.compile(r"^[A-Za-z0-9]+$")
 OSF_URL_HOSTS = frozenset({"osf.io", "www.osf.io"})
 
@@ -163,17 +164,18 @@ def parse_project_id(value: str) -> str:
 def load_mihomo_config() -> MihomoConfig | None:
     """Load optional Mihomo ranking settings exported by the shell."""
 
-    group = optional_environment("DOWNLOAD_MIHOMO_GROUP")
     speed_test_url = optional_environment(
         "DOWNLOAD_MIHOMO_SPEED_TEST_URL"
     )
-    if group is None or speed_test_url is None:
+    if speed_test_url is None:
         return None
     controller = optional_environment("DOWNLOAD_MIHOMO_CONTROLLER")
     if controller is None:
         raise ValueError(
-            "Mihomo ranking requires DOWNLOAD_MIHOMO_CONTROLLER."
+            "Mihomo ranking requires --mihomo-controller or "
+            "MIHOMO_CONTROLLER."
         )
+    group = optional_environment("DOWNLOAD_MIHOMO_GROUP")
     return MihomoConfig(
         controller_url=controller,
         group_name=group,
@@ -182,7 +184,8 @@ def load_mihomo_config() -> MihomoConfig | None:
         ),
         speed_test_url=speed_test_url,
         probe_timeout=float(
-            os.environ["DOWNLOAD_MIHOMO_PROBE_TIMEOUT"]
+            optional_environment("DOWNLOAD_MIHOMO_PROBE_TIMEOUT")
+            or DEFAULT_MIHOMO_PROBE_TIMEOUT
         ),
         secret=optional_environment("MIHOMO_SECRET"),
     )

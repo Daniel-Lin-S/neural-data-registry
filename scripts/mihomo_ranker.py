@@ -2,8 +2,8 @@
 
 Input
 -----
-The module receives an explicit Mihomo controller URL, selector group, node
-optional node-name marker, proxy URL, probe URL, and large-file URL suitable
+The module receives an explicit Mihomo controller URL, optional selector
+group, optional node-name marker, proxy URL, probe URL, and HTTPS URL suitable
 for bounded range tests.
 
 Output
@@ -23,18 +23,20 @@ import statistics
 import sys
 import time
 from typing import Callable, Iterable
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import httpx
 
 
-LATENCY_PROBE_COUNT = 3
-LATENCY_PROBE_WORKERS = 4
-SHORTLIST_SIZE = 5
-THROUGHPUT_SAMPLE_COUNT = 2
-THROUGHPUT_SAMPLE_BYTES = 4 * 1024 * 1024
-FAILOVER_SAMPLE_BYTES = 1024 * 1024
-RANKING_TTL_SECONDS = 30 * 60
+LATENCY_PROBE_COUNT = 2
+LATENCY_PROBE_WORKERS = 8
+SHORTLIST_SIZE = 3
+THROUGHPUT_SAMPLE_COUNT = 1
+THROUGHPUT_SAMPLE_BYTES = 512 * 1024
+FAILOVER_SAMPLE_BYTES = 256 * 1024
+MAX_THROUGHPUT_PROBE_SECONDS = 8.0
+DISCOVERY_RANGE_BYTES = 1
+RANKING_TTL_SECONDS = 6 * 60 * 60
 NODE_COOLDOWN_SECONDS = 30 * 60
 MIB = 1024 * 1024
 GROUP_PROXY_TYPES = frozenset(
@@ -62,8 +64,9 @@ class MihomoConfig:
     ----------
     controller_url : str
         Mihomo external-controller HTTP URL.
-    group_name : str
-        Selector group dedicated to the download.
+    group_name : str or None
+        Selector group dedicated to the download, optional. When omitted, the
+        selector is discovered from the speed-test connection chain.
     node_marker : str
         Literal substring required in eligible node names. An empty value
         allows every direct node in the selector.
@@ -76,7 +79,7 @@ class MihomoConfig:
     """
 
     controller_url: str
-    group_name: str
+    group_name: str | None
     node_marker: str
     speed_test_url: str
     probe_timeout: float
@@ -193,6 +196,31 @@ class MihomoController:
                 f"{type(payload).__name__}."
             )
         return payload
+
+    def connections(self) -> list[dict[str, object]]:
+        """Return validated active Mihomo connection objects."""
+
+        response = self._client.get("/connections")
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise ValueError(
+                "expected Mihomo connections response to be an object, "
+                f"but got {type(payload).__name__}."
+            )
+        connections = payload.get("connections")
+        if connections is None:
+            return []
+        if not isinstance(connections, list):
+            raise ValueError(
+                "expected Mihomo connections to be a list, but got "
+                f"{type(connections).__name__}."
+            )
+        if not all(isinstance(item, dict) for item in connections):
+            raise ValueError(
+                "expected every Mihomo connection to be an object."
+            )
+        return connections
 
     def delay(self, name: str, url: str, timeout: float) -> float:
         """Measure one node against an HTTPS URL through Mihomo."""
@@ -313,6 +341,57 @@ def count_bounded_bytes(chunks: Iterable[bytes], byte_limit: int) -> int:
     return transferred
 
 
+def connection_ids(connections: Iterable[dict[str, object]]) -> set[str]:
+    """Return validated connection identifiers."""
+
+    identifiers = set()
+    for connection in connections:
+        identifier = connection.get("id")
+        if not isinstance(identifier, str) or not identifier:
+            raise ValueError(
+                "expected every Mihomo connection to have a non-empty "
+                "string ID."
+            )
+        identifiers.add(identifier)
+    return identifiers
+
+
+def connection_matches_host(
+    connection: dict[str, object],
+    hostname: str,
+) -> bool:
+    """Return whether a connection targets the requested hostname."""
+
+    metadata = connection.get("metadata")
+    if not isinstance(metadata, dict):
+        raise ValueError(
+            "expected Mihomo connection metadata to be an object."
+        )
+    host_fields = ("host", "sniffHost", "destinationIP")
+    hosts = {
+        str(metadata.get(field, "")).lower()
+        for field in host_fields
+        if metadata.get(field)
+    }
+    return hostname.lower() in hosts
+
+
+def connection_chain(connection: dict[str, object]) -> list[str]:
+    """Return a validated non-empty proxy chain."""
+
+    chain = connection.get("chains")
+    if (
+        not isinstance(chain, list)
+        or not chain
+        or not all(isinstance(name, str) and name for name in chain)
+    ):
+        raise ValueError(
+            "expected the matching Mihomo connection to have a non-empty "
+            "string chain."
+        )
+    return chain
+
+
 class MihomoNodeManager:
     """Benchmark, rank, and fail over among permitted direct nodes."""
 
@@ -333,22 +412,96 @@ class MihomoNodeManager:
         self.proxy_url = proxy_url
         self.probe_url = probe_url
         self.request_headers = dict(request_headers or {})
+        owns_controller = controller is None
         self.controller = controller or MihomoController(config)
         self.time_fn = time_fn
         self.throughput_fn = throughput_fn
         self.ranked_nodes: list[NodeScore] = []
         self.ranked_at: float | None = None
         self.cooldowns: dict[str, float] = {}
+        try:
+            self.group_name = config.group_name or self._discover_group()
+        except Exception:
+            if owns_controller:
+                self.controller.close()
+            raise
 
     def close(self) -> None:
         """Close controller resources."""
 
         self.controller.close()
 
+    def _discover_group(self) -> str:
+        """Discover the outermost selector used by the speed-test URL."""
+
+        parsed = urlparse(self.config.speed_test_url)
+        hostname = parsed.hostname
+        if parsed.scheme != "https" or hostname is None:
+            raise ValueError(
+                "expected an HTTPS speed-test URL with a hostname, but got "
+                f"{self.config.speed_test_url!r}."
+            )
+        existing = connection_ids(self.controller.connections())
+        headers = dict(self.request_headers)
+        headers["Range"] = (
+            f"bytes=0-{DISCOVERY_RANGE_BYTES - 1}"
+        )
+        with httpx.Client(
+            proxy=self.proxy_url,
+            verify=create_tls_context(),
+            follow_redirects=True,
+            timeout=httpx.Timeout(self.config.probe_timeout),
+            trust_env=False,
+        ) as client:
+            with client.stream(
+                "GET",
+                self.config.speed_test_url,
+                headers=headers,
+            ) as response:
+                response.raise_for_status()
+                response_hostname = response.url.host or hostname
+                current = self.controller.connections()
+        connection_ids(current)
+
+        matches = [
+            connection
+            for connection in current
+            if connection.get("id") not in existing
+            and connection_matches_host(connection, response_hostname)
+        ]
+        if not matches:
+            raise RuntimeError(
+                "could not discover the Mihomo selector because no new "
+                "connection matched speed-test host "
+                f"{response_hostname!r}."
+            )
+        if len(matches) != 1:
+            raise RuntimeError(
+                "could not discover the Mihomo selector because "
+                f"{len(matches)} new connections matched speed-test host "
+                f"{response_hostname!r}."
+            )
+
+        selectors = []
+        for name in connection_chain(matches[0]):
+            proxy_type = str(
+                self.controller.proxy(name).get("type", "")
+            ).lower()
+            if proxy_type == "selector":
+                selectors.append(name)
+        if not selectors:
+            raise RuntimeError(
+                "could not discover a Selector in the Mihomo connection "
+                f"chain for {response_hostname!r}."
+            )
+        group_name = selectors[-1]
+        print(f"Mihomo group discovered: {group_name}")
+        return group_name
+
     def eligible_nodes(self) -> list[str]:
         """Return direct group members allowed by the optional marker."""
 
-        group = self.controller.proxy(self.config.group_name)
+        group = self.controller.proxy(self.group_name)
         if str(group.get("type", "")).lower() != "selector":
             raise ValueError(
                 "expected the Mihomo download group to be a Selector, "
@@ -421,7 +574,7 @@ class MihomoNodeManager:
     ) -> tuple[float, ...]:
         """Collect bounded throughput samples on one selected node."""
 
-        self.controller.select(self.config.group_name, node_name)
+        self.controller.select(self.group_name, node_name)
         samples = []
         for _ in range(sample_count):
             try:
@@ -429,7 +582,10 @@ class MihomoNodeManager:
                     self.proxy_url,
                     self.config.speed_test_url,
                     byte_limit,
-                    self.config.probe_timeout,
+                    min(
+                        self.config.probe_timeout,
+                        MAX_THROUGHPUT_PROBE_SECONDS,
+                    ),
                     self.request_headers,
                 )
             except Exception:
@@ -506,7 +662,7 @@ class MihomoNodeManager:
         self.ranked_nodes = successful
         self.ranked_at = self.time_fn()
         winner = successful[0]
-        self.controller.select(self.config.group_name, winner.name)
+        self.controller.select(self.group_name, winner.name)
         self._print_ranking(successful)
         return winner
 
@@ -537,7 +693,7 @@ class MihomoNodeManager:
         if not self.ranked_nodes or self.rankings_stale():
             return self.benchmark().name
 
-        group = self.controller.proxy(self.config.group_name)
+        group = self.controller.proxy(self.group_name)
         selected = group.get("now")
         ranked_names = {score.name for score in self.ranked_nodes}
         if (
@@ -554,7 +710,7 @@ class MihomoNodeManager:
         for score in self.ranked_nodes:
             if self._available(score.name):
                 self.controller.select(
-                    self.config.group_name,
+                    self.group_name,
                     score.name,
                 )
                 return score.name
@@ -563,7 +719,7 @@ class MihomoNodeManager:
     def failover(self) -> str | None:
         """Cool down the failed node and select the next ranked candidate."""
 
-        group = self.controller.proxy(self.config.group_name)
+        group = self.controller.proxy(self.group_name)
         failed = group.get("now")
         if isinstance(failed, str):
             self.cooldowns[failed] = (

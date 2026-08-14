@@ -43,6 +43,8 @@ from mihomo_ranker import (
     MihomoNodeManager,
 )
 
+DEFAULT_MIHOMO_PROBE_TIMEOUT = 8.0
+
 SnapshotFunction = Callable[..., str | list[Any]]
 SleepFunction = Callable[[float], None]
 CloseSessionFunction = Callable[[], None]
@@ -106,17 +108,18 @@ def optional_environment(name: str) -> str | None:
 def load_mihomo_config() -> MihomoConfig | None:
     """Load optional Mihomo configuration exported by the shell."""
 
-    group = optional_environment("DOWNLOAD_MIHOMO_GROUP")
     speed_test_url = optional_environment(
         "DOWNLOAD_MIHOMO_SPEED_TEST_URL"
     )
-    if group is None or speed_test_url is None:
+    if speed_test_url is None:
         return None
     controller = optional_environment("DOWNLOAD_MIHOMO_CONTROLLER")
     if controller is None:
         raise ValueError(
-            "Mihomo ranking requires DOWNLOAD_MIHOMO_CONTROLLER."
+            "Mihomo ranking requires --mihomo-controller or "
+            "MIHOMO_CONTROLLER."
         )
+    group = optional_environment("DOWNLOAD_MIHOMO_GROUP")
     return MihomoConfig(
         controller_url=controller,
         group_name=group,
@@ -125,7 +128,8 @@ def load_mihomo_config() -> MihomoConfig | None:
         ),
         speed_test_url=speed_test_url,
         probe_timeout=float(
-            os.environ["DOWNLOAD_MIHOMO_PROBE_TIMEOUT"]
+            optional_environment("DOWNLOAD_MIHOMO_PROBE_TIMEOUT")
+            or DEFAULT_MIHOMO_PROBE_TIMEOUT
         ),
         secret=optional_environment("MIHOMO_SECRET"),
     )

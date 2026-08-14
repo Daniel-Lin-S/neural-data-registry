@@ -7,6 +7,8 @@ from pathlib import Path
 import sys
 from typing import Any
 
+import pytest
+
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = REPOSITORY_ROOT / "scripts" / "mihomo_ranker.py"
@@ -66,6 +68,129 @@ class FakeController:
         self.selections.append(node_name)
 
 
+class DiscoveryController:
+    """Return before-and-after connection snapshots for discovery."""
+
+    def __init__(
+        self,
+        current: list[dict[str, object]],
+        proxy_types: dict[str, str],
+    ) -> None:
+        self.snapshots = [[], current]
+        self.proxy_types = proxy_types
+
+    def close(self) -> None:
+        """Match the production controller lifecycle."""
+
+    def connections(self) -> list[dict[str, object]]:
+        """Return the next active-connection snapshot."""
+
+        return self.snapshots.pop(0)
+
+    def proxy(self, name: str) -> dict[str, object]:
+        """Return the configured type for one chain entry."""
+
+        return {"name": name, "type": self.proxy_types[name]}
+
+
+class DiscoveryResponse:
+    """Keep a synthetic streamed response open during discovery."""
+
+    url = ranker.httpx.URL("https://example.com/large.bin")
+
+    def __enter__(self) -> "DiscoveryResponse":
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        del args
+
+    def raise_for_status(self) -> None:
+        """Represent a successful response."""
+
+
+class ControllerClient:
+    """Return one synthetic response from a controller request."""
+
+    def __init__(self, response: Any) -> None:
+        self.response = response
+
+    def get(self, path: str) -> Any:
+        """Return the configured response for the expected endpoint."""
+
+        assert path == "/connections"
+        return self.response
+
+
+def install_discovery_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[tuple[str, str, dict[str, str]]]:
+    """Install a proxy client that records the bounded discovery request."""
+
+    requests = []
+
+    class DiscoveryClient:
+        def __init__(self, **kwargs: object) -> None:
+            self.options = kwargs
+
+        def __enter__(self) -> "DiscoveryClient":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def stream(
+            self,
+            method: str,
+            url: str,
+            headers: dict[str, str],
+        ) -> DiscoveryResponse:
+            requests.append((method, url, headers))
+            return DiscoveryResponse()
+
+    monkeypatch.setattr(ranker.httpx, "Client", DiscoveryClient)
+    return requests
+
+
+def make_connection(
+    identifier: str,
+    hostname: str,
+    chain: list[str],
+) -> dict[str, object]:
+    """Build one active Mihomo connection fixture."""
+
+    return {
+        "id": identifier,
+        "metadata": {"host": hostname},
+        "chains": chain,
+    }
+
+
+def make_discovery_manager(
+    monkeypatch: pytest.MonkeyPatch,
+    connections: list[dict[str, object]],
+    proxy_types: dict[str, str],
+) -> tuple[Any, list[tuple[str, str, dict[str, str]]]]:
+    """Create a manager whose selector must be discovered."""
+
+    requests = install_discovery_client(monkeypatch)
+    config = ranker.MihomoConfig(
+        controller_url="http://127.0.0.1:9091",
+        group_name=None,
+        node_marker="",
+        speed_test_url="https://example.com/large.bin",
+        probe_timeout=8.0,
+        secret=None,
+    )
+    controller = DiscoveryController(connections, proxy_types)
+    manager = ranker.MihomoNodeManager(
+        config,
+        "http://127.0.0.1:7893",
+        "https://example.com/probe",
+        controller=controller,
+    )
+    return manager, requests
+
+
 def make_manager(
     controller: FakeController,
     node_marker: str = "0.1倍",
@@ -115,6 +240,143 @@ def test_empty_marker_allows_every_direct_node() -> None:
     )
 
     assert manager.eligible_nodes() == members
+
+
+def test_discovers_outermost_selector_with_one_byte_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Use the outermost live Selector without a throughput sample."""
+
+    connections = [
+        make_connection("other", "unrelated.example", ["DIRECT"]),
+        make_connection(
+            "new",
+            "example.com",
+            ["node", "automatic", "download"],
+        ),
+    ]
+    proxy_types = {
+        "node": "VLESS",
+        "automatic": "URLTest",
+        "download": "Selector",
+    }
+
+    manager, requests = make_discovery_manager(
+        monkeypatch,
+        connections,
+        proxy_types,
+    )
+
+    assert manager.group_name == "download"
+    assert requests == [
+        (
+            "GET",
+            "https://example.com/large.bin",
+            {"Range": "bytes=0-0"},
+        )
+    ]
+    assert manager.ranked_nodes == []
+
+
+@pytest.mark.parametrize(
+    ("connections", "proxy_types", "message"),
+    [
+        (
+            [make_connection("other", "unrelated.example", ["DIRECT"])],
+            {"DIRECT": "Direct"},
+            "no new connection matched",
+        ),
+        (
+            [
+                make_connection("one", "example.com", ["download"]),
+                make_connection("two", "example.com", ["download"]),
+            ],
+            {"download": "Selector"},
+            "2 new connections matched",
+        ),
+        (
+            [make_connection("new", "example.com", ["node"])],
+            {"node": "VLESS"},
+            "could not discover a Selector",
+        ),
+    ],
+)
+def test_discovery_rejects_ambiguous_or_missing_selector(
+    monkeypatch: pytest.MonkeyPatch,
+    connections: list[dict[str, object]],
+    proxy_types: dict[str, str],
+    message: str,
+) -> None:
+    """Fail when the live route cannot identify one selector."""
+
+    with pytest.raises(RuntimeError, match=message):
+        make_discovery_manager(
+            monkeypatch,
+            connections,
+            proxy_types,
+        )
+
+
+def test_connection_validation_rejects_malformed_metadata() -> None:
+    """Reject malformed controller connection payloads clearly."""
+
+    with pytest.raises(ValueError, match="metadata to be an object"):
+        ranker.connection_matches_host(
+            {"id": "new", "metadata": None},
+            "example.com",
+        )
+
+
+def test_connections_propagates_controller_authorization_failure() -> None:
+    """Expose an unauthorized controller instead of hiding discovery errors."""
+
+    request = ranker.httpx.Request(
+        "GET",
+        "http://127.0.0.1:9091/connections",
+    )
+    response = ranker.httpx.Response(401, request=request)
+    controller = object.__new__(ranker.MihomoController)
+    controller._client = ControllerClient(response)
+
+    with pytest.raises(ranker.httpx.HTTPStatusError):
+        controller.connections()
+
+
+def test_connections_rejects_malformed_controller_payload() -> None:
+    """Reject a controller response whose connections field is not a list."""
+
+    request = ranker.httpx.Request(
+        "GET",
+        "http://127.0.0.1:9091/connections",
+    )
+    response = ranker.httpx.Response(
+        200,
+        json={"connections": "invalid"},
+        request=request,
+    )
+    controller = object.__new__(ranker.MihomoController)
+    controller._client = ControllerClient(response)
+
+    with pytest.raises(ValueError, match="connections to be a list"):
+        controller.connections()
+
+
+def test_connections_treats_null_as_an_empty_snapshot() -> None:
+    """Accept Mihomo's null representation when no connections are active."""
+
+    request = ranker.httpx.Request(
+        "GET",
+        "http://127.0.0.1:9091/connections",
+    )
+    response = ranker.httpx.Response(
+        200,
+        json={"connections": None},
+        request=request,
+    )
+    controller = object.__new__(ranker.MihomoController)
+    controller._client = ControllerClient(response)
+
+    assert controller.connections() == []
 
 
 def test_stability_precedes_peak_throughput() -> None:
@@ -181,15 +443,31 @@ def test_bounded_byte_counter_never_exceeds_limit() -> None:
     assert ranker.count_bounded_bytes(chunks, 10) == 10
 
 
+def test_initial_speed_test_has_a_small_fixed_budget() -> None:
+    """Prevent ranking traffic and timeout from delaying real downloads."""
+
+    maximum_bytes = (
+        ranker.SHORTLIST_SIZE
+        * ranker.THROUGHPUT_SAMPLE_COUNT
+        * ranker.THROUGHPUT_SAMPLE_BYTES
+    )
+
+    assert maximum_bytes <= 2 * ranker.MIB
+    assert ranker.THROUGHPUT_SAMPLE_COUNT == 1
+    assert ranker.MAX_THROUGHPUT_PROBE_SECONDS <= 8.0
+    assert ranker.RANKING_TTL_SECONDS >= 6 * 60 * 60
+
+
 def test_benchmark_selects_fastest_equally_stable_node() -> None:
     """Exercise the complete deterministic shortlist and selection path."""
 
     members = ["slow-0.1倍", "fast-0.1倍"]
     controller = FakeController(members)
     manager = make_manager(controller)
+    calls: list[tuple[Any, ...]] = []
 
     def throughput(*args: Any) -> float:
-        del args
+        calls.append(args)
         if controller.selected == "fast-0.1倍":
             return 5.0
         return 1.0
@@ -199,3 +477,12 @@ def test_benchmark_selects_fastest_equally_stable_node() -> None:
 
     assert winner.name == "fast-0.1倍"
     assert controller.selected == "fast-0.1倍"
+    assert len(calls) == len(members)
+    assert all(
+        call[2] == ranker.THROUGHPUT_SAMPLE_BYTES
+        for call in calls
+    )
+    assert all(
+        call[3] <= ranker.MAX_THROUGHPUT_PROBE_SECONDS
+        for call in calls
+    )

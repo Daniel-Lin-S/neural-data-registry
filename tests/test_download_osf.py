@@ -58,55 +58,59 @@ def make_config(tmp_path: Path, *, retry_attempts: int = 3) -> Any:
     )
 
 
-@pytest.mark.parametrize(
-    "missing_name",
-    [
-        "DOWNLOAD_MIHOMO_GROUP",
-        "DOWNLOAD_MIHOMO_SPEED_TEST_URL",
-    ],
-)
-def test_load_mihomo_config_skips_incomplete_ranking(
+def test_load_mihomo_config_skips_without_speed_url(
     monkeypatch: pytest.MonkeyPatch,
-    missing_name: str,
 ) -> None:
-    """Skip node selection when either operational input is absent."""
+    """Skip node selection when no speed-test URL is configured."""
 
-    values = {
-        "DOWNLOAD_MIHOMO_CONTROLLER": "http://127.0.0.1:9091",
-        "DOWNLOAD_MIHOMO_GROUP": "download",
-        "DOWNLOAD_MIHOMO_SPEED_TEST_URL": (
-            "https://example.com/large.bin"
-        ),
-        "DOWNLOAD_MIHOMO_PROBE_TIMEOUT": "15",
-    }
-    for name, value in values.items():
-        monkeypatch.setenv(name, value)
-    monkeypatch.delenv(missing_name, raising=False)
+    monkeypatch.setenv("DOWNLOAD_MIHOMO_GROUP", "download")
+    monkeypatch.delenv(
+        "DOWNLOAD_MIHOMO_SPEED_TEST_URL",
+        raising=False,
+    )
 
     assert downloader.load_mihomo_config() is None
 
 
-def test_load_mihomo_config_allows_empty_marker(
+def test_load_mihomo_config_discovers_group_and_uses_empty_marker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Allow every direct selector node when no marker is configured."""
+    """Leave the selector unset for speed-triggered discovery."""
 
-    monkeypatch.setenv(
-        "DOWNLOAD_MIHOMO_CONTROLLER",
-        "http://127.0.0.1:9091",
-    )
-    monkeypatch.setenv("DOWNLOAD_MIHOMO_GROUP", "download")
     monkeypatch.setenv(
         "DOWNLOAD_MIHOMO_SPEED_TEST_URL",
         "https://example.com/large.bin",
     )
-    monkeypatch.setenv("DOWNLOAD_MIHOMO_PROBE_TIMEOUT", "15")
+    monkeypatch.setenv(
+        "DOWNLOAD_MIHOMO_CONTROLLER",
+        "http://127.0.0.1:9091",
+    )
+    monkeypatch.delenv("DOWNLOAD_MIHOMO_GROUP", raising=False)
     monkeypatch.delenv("DOWNLOAD_MIHOMO_NODE_MARKER", raising=False)
+    monkeypatch.delenv("DOWNLOAD_MIHOMO_PROBE_TIMEOUT", raising=False)
 
     config = downloader.load_mihomo_config()
 
     assert config is not None
+    assert config.controller_url == "http://127.0.0.1:9091"
+    assert config.group_name is None
     assert config.node_marker == ""
+    assert config.probe_timeout == downloader.DEFAULT_MIHOMO_PROBE_TIMEOUT
+
+
+def test_load_mihomo_config_requires_controller(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reject speed testing without an explicit controller."""
+
+    monkeypatch.setenv(
+        "DOWNLOAD_MIHOMO_SPEED_TEST_URL",
+        "https://example.com/large.bin",
+    )
+    monkeypatch.delenv("DOWNLOAD_MIHOMO_CONTROLLER", raising=False)
+
+    with pytest.raises(ValueError, match="requires --mihomo-controller"):
+        downloader.load_mihomo_config()
 
 
 def client_factory(
@@ -467,6 +471,8 @@ def test_help_documents_direct_and_mihomo_modes() -> None:
     assert "--project ID_OR_URL --dest PATH" in result.stdout
     assert "Omit for direct access" in result.stdout
     assert "--mihomo-controller" in result.stdout
+    assert "MIHOMO_CONTROLLER is set" in result.stdout
+    assert "discover the selector" in result.stdout
     assert "ag3kj" in result.stdout
     assert "7893" not in result.stdout
 
@@ -478,8 +484,8 @@ def test_help_documents_direct_and_mihomo_modes() -> None:
             (
                 "--mihomo-controller",
                 "http://127.0.0.1:9091",
-                "--mihomo-speed-test-url",
-                "https://example.com/large.bin",
+                "--mihomo-group",
+                "download",
                 "--mihomo-probe-timeout",
                 "unused",
             ),
@@ -489,12 +495,10 @@ def test_help_documents_direct_and_mihomo_modes() -> None:
             (
                 "--mihomo-controller",
                 "http://127.0.0.1:9091",
-                "--mihomo-group",
-                "download",
-                "--mihomo-probe-timeout",
-                "unused",
+                "--mihomo-speed-test-url",
+                "https://example.com/large.bin",
             ),
-            False,
+            True,
         ),
         (
             (
@@ -514,7 +518,7 @@ def test_mihomo_ranking_is_optional_and_marker_is_not_required(
     ranking_arguments: tuple[str, ...],
     ranking_enabled: bool,
 ) -> None:
-    """Keep proxying active while enabling ranking only with both inputs."""
+    """Use the speed URL as the sole ranking trigger."""
 
     result = run_script(
         "--project",
@@ -532,6 +536,35 @@ def test_mihomo_ranking_is_optional_and_marker_is_not_required(
     assert ("Mihomo API" in result.stdout) is ranking_enabled
     if ranking_enabled:
         assert "Node filter   : all direct nodes" in result.stdout
+        if "--mihomo-group" in ranking_arguments:
+            assert "Mihomo group  : download" in result.stdout
+        else:
+            assert "Mihomo group" not in result.stdout
+
+
+def test_mihomo_environment_and_cli_precedence(tmp_path: Path) -> None:
+    """Use environment overrides and prefer explicit CLI values."""
+
+    environment = python_stub_environment(tmp_path)
+    environment["MIHOMO_CONTROLLER"] = "http://127.0.0.1:9090"
+    environment["MIHOMO_GROUP"] = "environment-group"
+    result = run_script(
+        "--project",
+        "ag3kj",
+        "--dest",
+        str((tmp_path / "dataset").resolve()),
+        "--proxy-port",
+        "7893",
+        "--mihomo-controller",
+        "http://127.0.0.1:9091",
+        "--mihomo-speed-test-url",
+        "https://example.com/large.bin",
+        env=environment,
+    )
+
+    assert result.returncode == 0
+    assert "Mihomo API    : http://127.0.0.1:9091" in result.stdout
+    assert "Mihomo group  : environment-group" in result.stdout
 
 
 @pytest.mark.parametrize(
@@ -574,12 +607,25 @@ def test_mihomo_ranking_is_optional_and_marker_is_not_required(
                 "/tmp/test",
                 "--proxy-port",
                 "7893",
-                "--mihomo-group",
-                "download",
                 "--mihomo-speed-test-url",
                 "https://example.com/large.bin",
             ),
-            "Mihomo ranking requires --mihomo-controller",
+            "Set --mihomo-controller or MIHOMO_CONTROLLER",
+        ),
+        (
+            (
+                "--project",
+                "ag3kj",
+                "--dest",
+                "/tmp/test",
+                "--proxy-port",
+                "7893",
+                "--mihomo-controller",
+                "ftp://bad",
+                "--mihomo-speed-test-url",
+                "https://example.com/large.bin",
+            ),
+            "--mihomo-controller must be an HTTP or HTTPS URL",
         ),
         (("--unknown",), "Unknown option: --unknown"),
     ],

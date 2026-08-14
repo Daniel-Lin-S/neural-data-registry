@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import importlib.util
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -12,7 +13,11 @@ from typing import Any
 
 import httpx
 import pytest
-from huggingface_hub.errors import HfHubHTTPError
+from huggingface_hub.errors import (
+    DryRunError,
+    HfHubHTTPError,
+    IncompleteSnapshotError,
+)
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -23,6 +28,7 @@ MODULE_PATH = REPOSITORY_ROOT / "scripts" / "download_huggingface.py"
 def load_downloader_module() -> Any:
     """Load the downloader companion module from its repository path."""
 
+    sys.path.insert(0, str(MODULE_PATH.parent))
     spec = importlib.util.spec_from_file_location(
         "download_huggingface",
         MODULE_PATH,
@@ -50,14 +56,67 @@ def make_config(
         repo_id="owner/dataset",
         destination=str(tmp_path.resolve()),
         endpoint="https://huggingface.co",
-        max_workers=2,
+        max_workers=1,
         timeout=300.0,
         dry_run=False,
         transport=transport,
         retry_attempts=retry_attempts,
         retry_base_delay=5.0,
-        retry_max_delay=60.0,
+        retry_max_delay=300.0,
+        proxy_url=None,
+        mihomo=None,
     )
+
+
+@pytest.mark.parametrize(
+    "missing_name",
+    [
+        "DOWNLOAD_MIHOMO_GROUP",
+        "DOWNLOAD_MIHOMO_SPEED_TEST_URL",
+    ],
+)
+def test_load_mihomo_config_skips_incomplete_ranking(
+    monkeypatch: pytest.MonkeyPatch,
+    missing_name: str,
+) -> None:
+    """Skip node selection when either operational input is absent."""
+
+    values = {
+        "DOWNLOAD_MIHOMO_CONTROLLER": "http://127.0.0.1:9091",
+        "DOWNLOAD_MIHOMO_GROUP": "download",
+        "DOWNLOAD_MIHOMO_SPEED_TEST_URL": (
+            "https://example.com/large.bin"
+        ),
+        "DOWNLOAD_MIHOMO_PROBE_TIMEOUT": "15",
+    }
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv(missing_name, raising=False)
+
+    assert downloader.load_mihomo_config() is None
+
+
+def test_load_mihomo_config_allows_empty_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Allow every direct selector node when no marker is configured."""
+
+    monkeypatch.setenv(
+        "DOWNLOAD_MIHOMO_CONTROLLER",
+        "http://127.0.0.1:9091",
+    )
+    monkeypatch.setenv("DOWNLOAD_MIHOMO_GROUP", "download")
+    monkeypatch.setenv(
+        "DOWNLOAD_MIHOMO_SPEED_TEST_URL",
+        "https://example.com/large.bin",
+    )
+    monkeypatch.setenv("DOWNLOAD_MIHOMO_PROBE_TIMEOUT", "15")
+    monkeypatch.delenv("DOWNLOAD_MIHOMO_NODE_MARKER", raising=False)
+
+    config = downloader.load_mihomo_config()
+
+    assert config is not None
+    assert config.node_marker == ""
 
 
 def hub_error(status_code: int) -> HfHubHTTPError:
@@ -68,7 +127,10 @@ def hub_error(status_code: int) -> HfHubHTTPError:
     return HfHubHTTPError("test failure", response=response)
 
 
-def run_script(*arguments: str) -> subprocess.CompletedProcess[str]:
+def run_script(
+    *arguments: str,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     """Run the shell entrypoint and capture its user-facing output."""
 
     return subprocess.run(
@@ -76,7 +138,24 @@ def run_script(*arguments: str) -> subprocess.CompletedProcess[str]:
         check=False,
         capture_output=True,
         text=True,
+        env=env,
     )
+
+
+def python_stub_environment(tmp_path: Path) -> dict[str, str]:
+    """Return an environment whose Python command performs no work."""
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    python_stub = bin_dir / "python"
+    python_stub.write_text(
+        "#!/usr/bin/env bash\nexit 0\n",
+        encoding="utf-8",
+    )
+    python_stub.chmod(0o755)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{bin_dir}:{environment['PATH']}"
+    return environment
 
 
 def test_transient_failure_resumes_snapshot(tmp_path: Path) -> None:
@@ -124,6 +203,124 @@ def test_retry_exhaustion_is_nonzero_failure(tmp_path: Path) -> None:
         )
 
     assert delays == [5.0, 10.0]
+
+
+def test_incomplete_snapshot_with_connection_cause_is_retried(
+    tmp_path: Path,
+) -> None:
+    """Retry the Hugging Face wrapper observed on the unstable proxy."""
+
+    request = httpx.Request("GET", "https://huggingface.co/api/test")
+    cause = httpx.ConnectError("SSL EOF", request=request)
+    wrapped = IncompleteSnapshotError("incomplete", str(tmp_path))
+    wrapped.__cause__ = cause
+
+    assert downloader.is_retryable_download_error(wrapped, "http")
+
+
+def test_dry_run_wrapper_with_connection_cause_is_retried() -> None:
+    """Retry verification metadata failures through their cause chain."""
+
+    request = httpx.Request("GET", "https://huggingface.co/api/test")
+    cause = httpx.ConnectError("SSL EOF", request=request)
+    wrapped = DryRunError("metadata unavailable")
+    wrapped.__cause__ = cause
+
+    assert downloader.is_retryable_download_error(wrapped, "http")
+
+
+def test_unlimited_retries_continue_until_success(tmp_path: Path) -> None:
+    """Treat zero attempts as retry-until-interrupted mode."""
+
+    config = make_config(tmp_path, retry_attempts=0)
+    calls = 0
+
+    def snapshot_fn(**kwargs: Any) -> str:
+        nonlocal calls
+        del kwargs
+        calls += 1
+        if calls < 5:
+            raise httpx.RemoteProtocolError("truncated")
+        return str(tmp_path)
+
+    result = downloader.download_with_retries(
+        config,
+        dry_run=False,
+        snapshot_fn=snapshot_fn,
+        sleep_fn=lambda delay: None,
+        close_session_fn=lambda: None,
+    )
+
+    assert result == str(tmp_path)
+    assert calls == 5
+
+
+def test_retry_closes_stale_hugging_face_session(tmp_path: Path) -> None:
+    """Close pooled connections before the next snapshot attempt."""
+
+    config = make_config(tmp_path)
+    calls = 0
+    close_calls = 0
+
+    def snapshot_fn(**kwargs: Any) -> str:
+        nonlocal calls
+        del kwargs
+        calls += 1
+        if calls == 1:
+            raise httpx.ConnectError("failed")
+        return str(tmp_path)
+
+    def close_fn() -> None:
+        nonlocal close_calls
+        close_calls += 1
+
+    downloader.download_with_retries(
+        config,
+        dry_run=False,
+        snapshot_fn=snapshot_fn,
+        sleep_fn=lambda delay: None,
+        close_session_fn=close_fn,
+    )
+
+    assert close_calls == 1
+
+
+def test_repeated_server_errors_trigger_node_failover(
+    tmp_path: Path,
+) -> None:
+    """Keep one 5xx on-node, then rotate after a repeated server failure."""
+
+    config = make_config(tmp_path)
+    calls = 0
+    manager = SimpleNamespace(
+        prepare_attempt=lambda: "allowed-0.1倍",
+        failover_calls=0,
+    )
+
+    def failover() -> str:
+        manager.failover_calls += 1
+        return "next-0.1倍"
+
+    manager.failover = failover
+
+    def snapshot_fn(**kwargs: Any) -> str:
+        nonlocal calls
+        del kwargs
+        calls += 1
+        if calls <= 2:
+            raise hub_error(503)
+        return str(tmp_path)
+
+    downloader.download_with_retries(
+        config,
+        dry_run=False,
+        snapshot_fn=snapshot_fn,
+        sleep_fn=lambda delay: None,
+        close_session_fn=lambda: None,
+        node_manager=manager,
+    )
+
+    assert manager.failover_calls == 1
 
 
 @pytest.mark.parametrize("status_code", [401, 403, 404])
@@ -190,14 +387,15 @@ def test_verification_rejects_pending_files() -> None:
 def test_retry_delay_is_capped(tmp_path: Path) -> None:
     """Cap exponential retry delays at the configured maximum."""
 
-    config = replace(make_config(tmp_path), retry_max_delay=60.0)
+    config = replace(make_config(tmp_path), retry_max_delay=300.0)
 
     assert downloader.retry_delay(config, 1) == 5.0
     assert downloader.retry_delay(config, 2) == 10.0
     assert downloader.retry_delay(config, 3) == 20.0
     assert downloader.retry_delay(config, 4) == 40.0
-    assert downloader.retry_delay(config, 5) == 60.0
-    assert downloader.retry_delay(config, 8) == 60.0
+    assert downloader.retry_delay(config, 5) == 80.0
+    assert downloader.retry_delay(config, 7) == 300.0
+    assert downloader.retry_delay(config, 8) == 300.0
 
 
 def test_help_reports_balanced_defaults() -> None:
@@ -206,12 +404,77 @@ def test_help_reports_balanced_defaults() -> None:
     result = run_script("--help")
 
     assert result.returncode == 0
-    assert "Default: 2" in result.stdout
+    assert "Default: 1" in result.stdout
     assert "Default: 300" in result.stdout
     assert "File transport: http or xet" in result.stdout
+    assert "Default: xet" in result.stdout
+    assert "Default: 127.0.0.1" in result.stdout
     assert "--repo REPO_ID --dest PATH" in result.stdout
     assert "pnpl/LibriBrain" not in result.stdout
     assert "7893" not in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("ranking_arguments", "ranking_enabled"),
+    [
+        (
+            (
+                "--mihomo-controller",
+                "http://127.0.0.1:9091",
+                "--mihomo-speed-test-url",
+                "https://example.com/large.bin",
+                "--mihomo-probe-timeout",
+                "unused",
+            ),
+            False,
+        ),
+        (
+            (
+                "--mihomo-controller",
+                "http://127.0.0.1:9091",
+                "--mihomo-group",
+                "download",
+                "--mihomo-probe-timeout",
+                "unused",
+            ),
+            False,
+        ),
+        (
+            (
+                "--mihomo-controller",
+                "http://127.0.0.1:9091",
+                "--mihomo-group",
+                "download",
+                "--mihomo-speed-test-url",
+                "https://example.com/large.bin",
+            ),
+            True,
+        ),
+    ],
+)
+def test_mihomo_ranking_is_optional_and_marker_is_not_required(
+    tmp_path: Path,
+    ranking_arguments: tuple[str, ...],
+    ranking_enabled: bool,
+) -> None:
+    """Keep proxying active while enabling ranking only with both inputs."""
+
+    result = run_script(
+        "--repo",
+        "owner/dataset",
+        "--dest",
+        str((tmp_path / "dataset").resolve()),
+        "--proxy-port",
+        "7893",
+        *ranking_arguments,
+        env=python_stub_environment(tmp_path),
+    )
+
+    assert result.returncode == 0
+    assert "Proxy         : http://127.0.0.1:7893" in result.stdout
+    assert ("Mihomo API" in result.stdout) is ranking_enabled
+    if ranking_enabled:
+        assert "Node filter  : all direct nodes" in result.stdout
 
 
 @pytest.mark.parametrize(
@@ -232,8 +495,8 @@ def test_help_reports_balanced_defaults() -> None:
           "--timeout", "none"),
          "--timeout must be a positive integer"),
         (("--repo", "owner/dataset", "--dest", "/tmp/test",
-          "--retry-attempts", "0"),
-         "--retry-attempts must be a positive integer"),
+          "--retry-attempts", "-1"),
+         "--retry-attempts must be a non-negative integer"),
         (("--repo", "owner/dataset", "--dest", "/tmp/test",
           "--proxy-scheme", "ftp"),
          "--proxy-scheme must be http, https, socks5, or socks5h"),
@@ -241,11 +504,12 @@ def test_help_reports_balanced_defaults() -> None:
           "--proxy-port", "65536", "--proxy-host", "localhost"),
          "--proxy-port must not exceed 65535"),
         (("--repo", "owner/dataset", "--dest", "/tmp/test",
-          "--proxy-port", "7893"),
-         "--proxy-host is required when proxying is enabled"),
-        (("--repo", "owner/dataset", "--dest", "/tmp/test",
           "--proxy-host", "localhost"),
          "--proxy-port is required when proxying is enabled"),
+        (("--repo", "owner/dataset", "--dest", "/tmp/test",
+          "--proxy-port", "7893", "--mihomo-group", "download",
+          "--mihomo-speed-test-url", "https://example.com/large.bin"),
+         "Mihomo ranking requires --mihomo-controller"),
         (("--unknown",), "Unknown option: --unknown"),
     ],
 )

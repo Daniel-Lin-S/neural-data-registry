@@ -48,6 +48,111 @@ pip install -e '.[download,dev]'
 ```
 The `download` extra installs both DataLad and `git-annex` (`>=10.20230126`).
 
+## Hugging Face dataset downloads
+
+Install the Hub client and its chunked Xet transport in the download
+environment:
+
+```bash
+python -m pip install -U huggingface_hub hf_xet httpx
+```
+
+The repository and absolute destination are always explicit. Xet, loopback
+proxy host, one file worker, a 300-second timeout, and a 300-second maximum
+retry delay are operational defaults:
+
+```bash
+/ABSOLUTE/PATH/TO/REPOSITORY/scripts/download_huggingface.sh \
+  --repo OWNER/DATASET \
+  --dest /ABSOLUTE/PATH/TO/DESTINATION \
+  --proxy-port PROXY_PORT
+```
+
+Authentication is inherited from `HF_TOKEN` or `hf auth login`. Re-running
+the same command against the same destination reuses completed and partial
+files. Use `--transport http` for the TLS 1.2 HTTP path, `--dry-run` to inspect
+pending files, or `--retry-attempts 0` to retry transient failures until
+Ctrl-C.
+
+For unstable Mihomo routes, the downloader can rank a selector by repeated
+HTTPS success, bounded throughput, and latency. Ranking starts only when both
+`--mihomo-group` and `--mihomo-speed-test-url` are set. The controller is then
+required, while the node marker remains an optional name filter:
+
+```bash
+/ABSOLUTE/PATH/TO/REPOSITORY/scripts/download_huggingface.sh \
+  --repo OWNER/DATASET \
+  --dest /ABSOLUTE/PATH/TO/DESTINATION \
+  --proxy-port PROXY_PORT \
+  --retry-attempts 0 \
+  --mihomo-controller CONTROLLER_URL \
+  --mihomo-group DEDICATED_SELECTOR \
+  --mihomo-node-marker REQUIRED_NAME_TEXT \
+  --mihomo-speed-test-url LARGE_HTTPS_FILE_URL
+```
+
+Every Hub and CDN domain must route through the selector. Without
+`--mihomo-node-marker`, every direct node in the selector is eligible. With a
+marker, the downloader never selects an unmarked node. If either the group or
+speed-test URL is omitted, ranking and failover are skipped while ordinary
+proxying remains active. Export an optional controller secret as
+`MIHOMO_SECRET`; its value is never printed.
+
+## OSF dataset downloads
+
+Install the HTTP client used by the OSF downloader:
+
+```bash
+python -m pip install -U httpx
+```
+
+### Usage
+
+Pass either an OSF node ID or project URL and an absolute destination. Direct
+access is the default, so no Mihomo setting is required:
+
+```bash
+/ABSOLUTE/PATH/TO/REPOSITORY/scripts/download_osf.sh \
+  --project https://osf.io/ag3kj/overview \
+  --dest /ABSOLUTE/PATH/TO/DESTINATION
+```
+
+To send requests through a local Mihomo mixed port, add only the proxy port:
+
+```bash
+/ABSOLUTE/PATH/TO/REPOSITORY/scripts/download_osf.sh \
+  --project https://osf.io/ag3kj/overview \
+  --dest /ABSOLUTE/PATH/TO/DESTINATION \
+  --proxy-port PROXY_PORT
+```
+
+The default storage provider is `osfstorage`. Re-running the command verifies
+completed file sizes and resumes sibling `.part` files. Use `--dry-run` to
+inspect the manifest without creating the destination, `--storage NAME` for a
+different provider, or `--retry-attempts 0` for retries until Ctrl-C. Export
+`OSF_TOKEN` for private projects; its value is never printed.
+
+Ranked Mihomo failover is optional. Supply the controller, group, and speed
+URL, and keep one file worker so switching nodes cannot interrupt another
+active file. The node marker shown below is optional:
+
+```bash
+/ABSOLUTE/PATH/TO/REPOSITORY/scripts/download_osf.sh \
+  --project PROJECT_ID_OR_URL \
+  --dest /ABSOLUTE/PATH/TO/DESTINATION \
+  --proxy-port PROXY_PORT \
+  --retry-attempts 0 \
+  --mihomo-controller CONTROLLER_URL \
+  --mihomo-group DEDICATED_SELECTOR \
+  --mihomo-node-marker REQUIRED_NAME_TEXT \
+  --mihomo-speed-test-url LARGE_OSF_HTTPS_FILE_URL
+```
+
+The `api.osf.io` and `files.osf.io` domains must route through the named
+selector. Without `--mihomo-node-marker`, all direct selector members are
+eligible. If either the group or speed-test URL is omitted, ranking is skipped
+and `--proxy-port` still provides ordinary proxy access.
+
 ## CLI commands
 
 All commands read `NDR_DATA_ROOT` and operate on the same registry database.

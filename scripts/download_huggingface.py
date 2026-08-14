@@ -22,24 +22,30 @@ import ssl
 import sys
 import time
 from typing import Any, Callable
+from urllib.parse import quote
 
 import httpx
-from huggingface_hub import get_token, set_client_factory, snapshot_download
-from huggingface_hub.errors import HfHubHTTPError
+from huggingface_hub import (
+    close_session,
+    get_token,
+    set_client_factory,
+    snapshot_download,
+)
 
+from download_retry import (
+    is_retryable_download_error,
+    retry_delay,
+    run_with_retries,
+)
 
-RETRYABLE_HTTP_STATUS_CODES = frozenset({408, 429})
-RETRYABLE_XET_ERROR_MARKERS = (
-    "cas service error",
-    "connection",
-    "network",
-    "reqwest",
-    "timed out",
-    "timeout",
+from mihomo_ranker import (
+    MihomoConfig,
+    MihomoNodeManager,
 )
 
 SnapshotFunction = Callable[..., str | list[Any]]
 SleepFunction = Callable[[float], None]
+CloseSessionFunction = Callable[[], None]
 
 
 @dataclass(frozen=True)
@@ -68,6 +74,10 @@ class DownloadConfig:
         Initial retry delay in seconds.
     retry_max_delay : float
         Maximum retry delay in seconds.
+    proxy_url : str or None
+        Explicit proxy URL used by Mihomo throughput tests, optional.
+    mihomo : MihomoConfig or None
+        Mihomo node-ranking configuration, optional.
     """
 
     repo_id: str
@@ -80,6 +90,45 @@ class DownloadConfig:
     retry_attempts: int
     retry_base_delay: float
     retry_max_delay: float
+    proxy_url: str | None
+    mihomo: MihomoConfig | None
+
+
+def optional_environment(name: str) -> str | None:
+    """Return a non-empty environment variable, or ``None``."""
+
+    value = os.environ.get(name, "")
+    if value:
+        return value
+    return None
+
+
+def load_mihomo_config() -> MihomoConfig | None:
+    """Load optional Mihomo configuration exported by the shell."""
+
+    group = optional_environment("DOWNLOAD_MIHOMO_GROUP")
+    speed_test_url = optional_environment(
+        "DOWNLOAD_MIHOMO_SPEED_TEST_URL"
+    )
+    if group is None or speed_test_url is None:
+        return None
+    controller = optional_environment("DOWNLOAD_MIHOMO_CONTROLLER")
+    if controller is None:
+        raise ValueError(
+            "Mihomo ranking requires DOWNLOAD_MIHOMO_CONTROLLER."
+        )
+    return MihomoConfig(
+        controller_url=controller,
+        group_name=group,
+        node_marker=(
+            optional_environment("DOWNLOAD_MIHOMO_NODE_MARKER") or ""
+        ),
+        speed_test_url=speed_test_url,
+        probe_timeout=float(
+            os.environ["DOWNLOAD_MIHOMO_PROBE_TIMEOUT"]
+        ),
+        secret=optional_environment("MIHOMO_SECRET"),
+    )
 
 
 def load_config_from_environment() -> DownloadConfig:
@@ -104,6 +153,8 @@ def load_config_from_environment() -> DownloadConfig:
             os.environ["DOWNLOAD_RETRY_BASE_DELAY"]
         ),
         retry_max_delay=float(os.environ["DOWNLOAD_RETRY_MAX_DELAY"]),
+        proxy_url=optional_environment("DOWNLOAD_PROXY_URL"),
+        mihomo=load_mihomo_config(),
     )
     validate_config(config)
     return config
@@ -139,7 +190,6 @@ def validate_config(config: DownloadConfig) -> None:
     positive_values = {
         "max_workers": config.max_workers,
         "timeout": config.timeout,
-        "retry_attempts": config.retry_attempts,
         "retry_base_delay": config.retry_base_delay,
         "retry_max_delay": config.retry_max_delay,
     }
@@ -148,6 +198,15 @@ def validate_config(config: DownloadConfig) -> None:
             raise ValueError(
                 f"expected {name} to be positive, but got {value}."
             )
+    if config.retry_attempts < 0:
+        raise ValueError(
+            "expected retry_attempts to be non-negative, but got "
+            f"{config.retry_attempts}."
+        )
+    if config.mihomo is not None and config.proxy_url is None:
+        raise ValueError(
+            "Mihomo ranking requires an explicit local proxy URL."
+        )
 
 
 def ensure_transport_available(transport: str) -> None:
@@ -223,83 +282,11 @@ def authentication_status(token: str | None) -> str:
     return "not configured"
 
 
-def http_status_code(error: BaseException) -> int | None:
-    """Return an HTTP response status associated with an exception.
+def repository_probe_url(endpoint: str, repo_id: str) -> str:
+    """Build the dataset metadata URL used for Mihomo node probes."""
 
-    Parameters
-    ----------
-    error : BaseException
-        Exception raised by Hugging Face or HTTPX.
-
-    Returns
-    -------
-    int or None
-        HTTP status code when a response is attached.
-    """
-
-    response = getattr(error, "response", None)
-    return getattr(response, "status_code", None)
-
-
-def is_retryable_download_error(
-    error: BaseException,
-    transport: str,
-) -> bool:
-    """Classify whether a failed snapshot attempt should be retried.
-
-    Parameters
-    ----------
-    error : BaseException
-        Failure raised by the download operation.
-    transport : str
-        Active file transport.
-
-    Returns
-    -------
-    bool
-        Whether retrying the complete snapshot is appropriate.
-    """
-
-    status_code = http_status_code(error)
-    if status_code is not None:
-        return (
-            status_code in RETRYABLE_HTTP_STATUS_CODES
-            or 500 <= status_code <= 599
-        )
-
-    if isinstance(error, httpx.TransportError):
-        return True
-    if isinstance(error, (ConnectionError, TimeoutError)):
-        return True
-
-    if transport == "xet" and isinstance(error, RuntimeError):
-        message = str(error).lower()
-        return any(
-            marker in message
-            for marker in RETRYABLE_XET_ERROR_MARKERS
-        )
-
-    return False
-
-
-def retry_delay(config: DownloadConfig, failed_attempt: int) -> float:
-    """Calculate a capped exponential retry delay.
-
-    Parameters
-    ----------
-    config : DownloadConfig
-        Active downloader configuration.
-    failed_attempt : int
-        One-based attempt number that just failed.
-
-    Returns
-    -------
-    float
-        Delay in seconds before the next attempt.
-    """
-
-    delay = config.retry_base_delay * (2 ** (failed_attempt - 1))
-    return min(delay, config.retry_max_delay)
+    encoded_repo = quote(repo_id, safe="/")
+    return f"{endpoint.rstrip('/')}/api/datasets/{encoded_repo}"
 
 
 def call_snapshot(
@@ -339,8 +326,10 @@ def download_with_retries(
     dry_run: bool,
     snapshot_fn: SnapshotFunction = snapshot_download,
     sleep_fn: SleepFunction = time.sleep,
+    close_session_fn: CloseSessionFunction = close_session,
+    node_manager: MihomoNodeManager | None = None,
 ) -> str | list[Any]:
-    """Run a resumable snapshot operation with bounded retries.
+    """Run a resumable snapshot operation with bounded or unlimited retries.
 
     Parameters
     ----------
@@ -366,38 +355,15 @@ def download_with_retries(
     """
 
     operation = "verification" if dry_run else "download"
-
-    for attempt in range(1, config.retry_attempts + 1):
-        try:
-            return call_snapshot(config, dry_run, snapshot_fn)
-        except Exception as error:
-            retryable = is_retryable_download_error(
-                error,
-                config.transport,
-            )
-            if not retryable:
-                raise
-            if attempt == config.retry_attempts:
-                raise RuntimeError(
-                    f"{operation} failed after {attempt} attempts; "
-                    f"last error was {type(error).__name__}: {error}"
-                ) from error
-
-            delay = retry_delay(config, attempt)
-            print(
-                f"WARNING: {operation} attempt {attempt} of "
-                f"{config.retry_attempts} failed with "
-                f"{type(error).__name__}: {error}",
-                file=sys.stderr,
-            )
-            print(
-                f"Retrying in {delay:g} seconds using existing "
-                "partial files.",
-                file=sys.stderr,
-            )
-            sleep_fn(delay)
-
-    raise RuntimeError("retry loop ended without a result.")
+    return run_with_retries(
+        config,
+        operation,
+        lambda: call_snapshot(config, dry_run, snapshot_fn),
+        transport=config.transport,
+        node_manager=node_manager,
+        before_retry=close_session_fn,
+        sleep_fn=sleep_fn,
+    )
 
 
 def require_dry_run_records(result: str | list[Any]) -> list[Any]:
@@ -536,27 +502,60 @@ def run(config: DownloadConfig) -> None:
 
     ensure_transport_available(config.transport)
     configure_http_client(config.timeout)
-    print(f"Authentication: {authentication_status(get_token())}")
+    token = get_token()
+    print(f"Authentication: {authentication_status(token)}")
 
-    if config.dry_run:
-        result = download_with_retries(config, dry_run=True)
-        print_dry_run_summary(require_dry_run_records(result))
-        return
-
-    result = download_with_retries(config, dry_run=False)
-    if not isinstance(result, str) or not result:
-        raise TypeError(
-            "expected snapshot_download() to return a non-empty path, "
-            f"but got {result!r}."
+    node_manager = None
+    if config.mihomo is not None:
+        if config.proxy_url is None:
+            raise ValueError("Mihomo ranking requires a proxy URL.")
+        request_headers = {}
+        if token:
+            request_headers["Authorization"] = f"Bearer {token}"
+        node_manager = MihomoNodeManager(
+            config.mihomo,
+            config.proxy_url,
+            repository_probe_url(config.endpoint, config.repo_id),
+            request_headers,
         )
 
-    verification_result = download_with_retries(config, dry_run=True)
-    verification_records = require_dry_run_records(verification_result)
-    verify_complete(verification_records)
+    try:
+        if config.dry_run:
+            result = download_with_retries(
+                config,
+                dry_run=True,
+                node_manager=node_manager,
+            )
+            print_dry_run_summary(require_dry_run_records(result))
+            return
 
-    print()
-    print(f"Download location: {result}")
-    print("Verification     : complete")
+        result = download_with_retries(
+            config,
+            dry_run=False,
+            node_manager=node_manager,
+        )
+        if not isinstance(result, str) or not result:
+            raise TypeError(
+                "expected snapshot_download() to return a non-empty path, "
+                f"but got {result!r}."
+            )
+
+        verification_result = download_with_retries(
+            config,
+            dry_run=True,
+            node_manager=node_manager,
+        )
+        verification_records = require_dry_run_records(
+            verification_result
+        )
+        verify_complete(verification_records)
+
+        print()
+        print(f"Download location: {result}")
+        print("Verification     : complete")
+    finally:
+        if node_manager is not None:
+            node_manager.close()
 
 
 def main() -> int:

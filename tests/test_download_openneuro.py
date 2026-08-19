@@ -162,6 +162,7 @@ def test_clone_command_pins_version_tag(tmp_path: Path) -> None:
         "install",
         "--branch",
         "2.0.0",
+        "--source",
         "https://github.com/OpenNeuroDatasets/ds005261.git",
         config.destination,
     ]
@@ -174,6 +175,38 @@ def test_clone_command_uses_default_snapshot_without_version(
 
     config = make_config(tmp_path, version=None)
     assert "--branch" not in downloader.clone_command(config)
+
+
+def test_install_retry_reuses_successfully_cloned_destination(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Reuse a valid destination created before an install command failed."""
+
+    config = make_config(tmp_path)
+    calls: list[list[str]] = []
+    validations: list[str] = []
+
+    def runner(
+        command: Sequence[str],
+        environment: dict[str, str],
+    ) -> str:
+        del environment
+        calls.append(list(command))
+        Path(config.destination).mkdir()
+        raise downloader.NetworkCommandError("annex setup timed out")
+
+    def validate(candidate: Any) -> None:
+        validations.append(candidate.destination)
+
+    monkeypatch.setattr(downloader, "validate_existing_dataset", validate)
+
+    with pytest.raises(downloader.NetworkCommandError):
+        downloader.install_dataset_once(config, runner)
+    downloader.install_dataset_once(config, runner)
+
+    assert len(calls) == 1
+    assert validations == [config.destination]
 
 
 def test_retrieve_content_passes_worker_count(tmp_path: Path) -> None:

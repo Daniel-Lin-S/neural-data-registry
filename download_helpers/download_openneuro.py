@@ -403,7 +403,9 @@ def clone_command(config: DownloadConfig) -> list[str]:
     command = ["datalad", "install"]
     if config.version is not None:
         command.extend(["--branch", config.version])
-    command.extend([repository_url(config), config.destination])
+    command.extend(
+        ["--source", repository_url(config), config.destination]
+    )
     return command
 
 

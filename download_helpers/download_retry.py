@@ -15,28 +15,68 @@ rotated and preserve a valid HTTP ``Retry-After`` delay.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
+import http.client
+import socket
 import ssl
 import sys
 import time
-from typing import Callable, Protocol, TypeVar
+import urllib.error
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from typing import Protocol, TypeVar
 
 import httpx
-
+from download_diagnostics import log_event, log_exception
 from mihomo_ranker import MihomoUnavailableError
 
-
-RETRYABLE_XET_ERROR_MARKERS = (
+RETRYABLE_NETWORK_ERROR_MARKERS = (
+    "broken pipe",
     "cas service error",
+    "channel closed",
     "connection",
+    "connection reset",
+    "connection refused",
+    "could not resolve",
+    "failed to connect",
+    "dispatch failure",
+    "dns",
+    "error sending request",
+    "gnutls",
+    "http/2 stream",
+    "incomplete",
     "network",
     "reqwest",
+    "rpc failed",
+    "reset by peer",
+    "transport",
+    "remote end hung up",
+    "temporary failure in name resolution",
     "timed out",
     "timeout",
+    "unexpected eof",
 )
-TERMINAL_HTTP_STATUS_CODES = frozenset({400, 401, 403, 404})
+RETRYABLE_HTTP_STATUS_CODES = frozenset({408, 425, 429})
+TERMINAL_HTTP_STATUS_CODES = frozenset({400, 401, 403, 404, 405, 410})
+NETWORK_EXCEPTION_NAMES = frozenset(
+    {
+        "ConnectTimeout",
+        "MaxRetryError",
+        "NewConnectionError",
+        "ProtocolError",
+        "ReadTimeout",
+        "ReadTimeoutError",
+    }
+)
+
+RETRYABLE_WRAPPER_NAMES = frozenset(
+    {
+        "DryRunError",
+        "IncompleteRead",
+        "IncompleteSnapshotError",
+    }
+)
 
 
 Result = TypeVar("Result")
@@ -119,6 +159,7 @@ def classify_download_error(
     """Classify chained failures and whether node rotation is appropriate."""
 
     chain = exception_chain(error)
+    exception_names = {type(item).__name__ for item in chain}
     statuses = [
         status
         for item in chain
@@ -136,30 +177,45 @@ def classify_download_error(
             None,
         )
         return RetryDecision(True, False, "rate_limit", delay)
+    if any(
+        status in RETRYABLE_HTTP_STATUS_CODES
+        for status in statuses
+    ):
+        return RetryDecision(True, True, "network")
     if any(500 <= status <= 599 for status in statuses):
         return RetryDecision(True, False, "server")
-    if 408 in statuses:
-        return RetryDecision(True, True, "network")
     if any(isinstance(item, MihomoUnavailableError) for item in chain):
         return RetryDecision(True, False, "mihomo")
 
     network_types = (
+        BrokenPipeError,
+        ConnectionAbortedError,
+        ConnectionRefusedError,
+        ConnectionResetError,
+        EOFError,
+        http.client.IncompleteRead,
         httpx.TransportError,
         ConnectionError,
+        socket.gaierror,
         TimeoutError,
         ssl.SSLError,
+        urllib.error.URLError,
     )
     if any(isinstance(item, network_types) for item in chain):
         return RetryDecision(True, True, "network")
+    if exception_names & NETWORK_EXCEPTION_NAMES:
+        return RetryDecision(True, True, "network")
+    if exception_names & RETRYABLE_WRAPPER_NAMES:
+        return RetryDecision(True, True, "network")
 
-    if transport == "xet":
+    if transport in {"http", "xet", "datalad"}:
         for item in chain:
-            if not isinstance(item, RuntimeError):
+            if isinstance(item, (FileExistsError, PermissionError)):
                 continue
             message = str(item).lower()
             if any(
                 marker in message
-                for marker in RETRYABLE_XET_ERROR_MARKERS
+                for marker in RETRYABLE_NETWORK_ERROR_MARKERS
             ):
                 return RetryDecision(True, True, "network")
     return RetryDecision(False, False, "terminal")
@@ -224,10 +280,26 @@ def run_with_retries(
     while config.retry_attempts == 0 or attempt <= config.retry_attempts:
         try:
             if node_manager is not None:
-                node_manager.prepare_attempt()
+                selected_node = node_manager.prepare_attempt()
+                log_event("mihomo_attempt_prepared", node=selected_node)
+            log_event(
+                "download_attempt_started",
+                attempt=attempt,
+                operation=operation,
+                transport=transport,
+            )
             return callback()
         except Exception as error:
             decision = classify_download_error(error, transport)
+            log_exception(
+                "download_attempt_failed",
+                error,
+                attempt=attempt,
+                category=decision.category,
+                operation=operation,
+                retryable=decision.retryable,
+                transport=transport,
+            )
             if not decision.retryable:
                 raise
             if (
@@ -249,8 +321,10 @@ def run_with_retries(
                 consecutive_server_failures = 0
             if node_manager is not None and rotate_node:
                 try:
-                    node_manager.failover()
-                except Exception as failover_error:
+                    selected_node = node_manager.failover()
+                    log_event("mihomo_failover", node=selected_node)
+                except Exception as failover_error:  # noqa: BLE001
+                    log_exception("mihomo_failover_failed", failover_error)
                     print(
                         "WARNING: Mihomo failover preparation failed with "
                         f"{type(failover_error).__name__}: "
@@ -265,6 +339,15 @@ def run_with_retries(
                 "unlimited"
                 if config.retry_attempts == 0
                 else str(config.retry_attempts)
+            )
+            log_event(
+                "download_retry_scheduled",
+                attempt=attempt,
+                attempt_limit=attempt_limit,
+                category=decision.category,
+                delay_seconds=delay,
+                operation=operation,
+                rotate_node=rotate_node,
             )
             print(
                 f"WARNING: {operation} attempt {attempt} of "

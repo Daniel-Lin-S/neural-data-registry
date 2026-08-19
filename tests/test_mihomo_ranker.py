@@ -11,7 +11,7 @@ import pytest
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
-MODULE_PATH = REPOSITORY_ROOT / "scripts" / "mihomo_ranker.py"
+MODULE_PATH = REPOSITORY_ROOT / "download_helpers" / "mihomo_ranker.py"
 
 
 def load_ranker_module() -> Any:

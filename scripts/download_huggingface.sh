@@ -15,6 +15,14 @@ set -Eeuo pipefail
 #
 # For long downloads through Mihomo, pin one stable node. Do not use an
 # automatic URL-test group that may change nodes during active transfers.
+#
+# Usage:
+#   /ABSOLUTE/PATH/TO/REPOSITORY/scripts/download_huggingface.sh \
+#     --repo OWNER/DATASET --dest /ABSOLUTE/DESTINATION [OPTIONS]
+#
+# Common options include --mirror, proxy or --no-proxy, --max-workers,
+# --timeout, retry controls, Mihomo controls, and --dry-run. Hugging Face also
+# accepts --transport and --xet-range-concurrency. Run with --help for details.
 
 
 readonly DEFAULT_ENDPOINT="https://huggingface.co"
@@ -485,4 +493,5 @@ export DOWNLOAD_MIHOMO_SPEED_TEST_URL="${MIHOMO_SPEED_TEST_URL}"
 export DOWNLOAD_MIHOMO_PROBE_TIMEOUT="${MIHOMO_PROBE_TIMEOUT}"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-python "${SCRIPT_DIR}/download_huggingface.py"
+readonly REPOSITORY_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
+python "${REPOSITORY_ROOT}/download_helpers/download_huggingface.py"

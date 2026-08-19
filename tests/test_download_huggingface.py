@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
 import importlib.util
 import os
-from pathlib import Path
+import socket
+import ssl
 import subprocess
 import sys
+import urllib.error
+from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -19,10 +22,11 @@ from huggingface_hub.errors import (
     IncompleteSnapshotError,
 )
 
-
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = REPOSITORY_ROOT / "scripts" / "download_huggingface.sh"
-MODULE_PATH = REPOSITORY_ROOT / "scripts" / "download_huggingface.py"
+MODULE_PATH = (
+    REPOSITORY_ROOT / "download_helpers" / "download_huggingface.py"
+)
 
 
 def load_downloader_module() -> Any:
@@ -335,7 +339,7 @@ def test_terminal_http_status_is_not_retried(status_code: int) -> None:
     assert not downloader.is_retryable_download_error(error, "http")
 
 
-@pytest.mark.parametrize("status_code", [408, 429, 500, 502, 599])
+@pytest.mark.parametrize("status_code", [408, 425, 429, 500, 502, 599])
 def test_transient_http_status_is_retried(status_code: int) -> None:
     """Retry throttling, timeout, and server-side HTTP responses."""
 
@@ -560,3 +564,89 @@ def test_invalid_shell_arguments_fail_before_download(
 
     assert result.returncode == 1
     assert expected_error in result.stderr
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        socket.gaierror("temporary DNS failure"),
+        ConnectionResetError("connection reset"),
+        ConnectionRefusedError("connection refused"),
+        BrokenPipeError("broken pipe"),
+        ssl.SSLError("TLS EOF"),
+        urllib.error.URLError("name resolution failure"),
+        httpx.ReadError("unexpected EOF"),
+    ],
+)
+def test_all_standard_network_errors_are_retried(
+    error: BaseException,
+) -> None:
+    """Recognize standard DNS, socket, TLS, URL, and HTTPX failures."""
+
+    assert downloader.is_retryable_download_error(error, "http")
+
+
+def test_incomplete_snapshot_without_explicit_cause_is_retried() -> None:
+    """Retry the Hub incomplete-snapshot wrapper on its own."""
+
+    error = IncompleteSnapshotError("incomplete", "/tmp/dataset")
+    assert downloader.is_retryable_download_error(error, "http")
+
+
+def test_dry_run_wrapper_without_explicit_cause_is_retried() -> None:
+    """Retry the Hub metadata wrapper when no lower cause is retained."""
+
+    assert downloader.is_retryable_download_error(
+        DryRunError("metadata request failed"),
+        "http",
+    )
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "reqwest error sending request",
+        "CAS service channel closed",
+        "transport unexpected EOF",
+        "DNS dispatch failure",
+    ],
+)
+def test_xet_network_wrapper_messages_are_retried(message: str) -> None:
+    """Recognize common native Xet network failure messages."""
+
+    assert downloader.is_retryable_download_error(
+        RuntimeError(message),
+        "xet",
+    )
+
+
+def test_unlimited_retries_include_xet_runtime_wrappers(
+    tmp_path: Path,
+) -> None:
+    """Keep retrying wrapped Xet failures when the attempt limit is zero."""
+
+    config = make_config(
+        tmp_path,
+        retry_attempts=0,
+        transport="xet",
+    )
+    calls = 0
+
+    def snapshot_fn(**kwargs: Any) -> str:
+        nonlocal calls
+        del kwargs
+        calls += 1
+        if calls < 4:
+            raise RuntimeError("reqwest connection reset by peer")
+        return str(tmp_path)
+
+    result = downloader.download_with_retries(
+        config,
+        dry_run=False,
+        snapshot_fn=snapshot_fn,
+        sleep_fn=lambda delay: None,
+        close_session_fn=lambda: None,
+    )
+
+    assert result == str(tmp_path)
+    assert calls == 4

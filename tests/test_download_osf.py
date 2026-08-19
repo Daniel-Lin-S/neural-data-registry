@@ -2,21 +2,21 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
 import importlib.util
 import os
-from pathlib import Path
 import subprocess
 import sys
-from typing import Any, Callable
+from collections.abc import Callable
+from dataclasses import replace
+from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
 
-
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = REPOSITORY_ROOT / "scripts" / "download_osf.sh"
-MODULE_PATH = REPOSITORY_ROOT / "scripts" / "download_osf.py"
+MODULE_PATH = REPOSITORY_ROOT / "download_helpers" / "download_osf.py"
 
 
 def load_downloader_module() -> Any:
@@ -468,7 +468,7 @@ def test_help_documents_direct_and_mihomo_modes() -> None:
     result = run_script("--help")
 
     assert result.returncode == 0
-    assert "--project ID_OR_URL --dest PATH" in result.stdout
+    assert "--repo ID_OR_URL --dest PATH" in result.stdout
     assert "Omit for direct access" in result.stdout
     assert "--mihomo-controller" in result.stdout
     assert "MIHOMO_CONTROLLER is set" in result.stdout
@@ -521,7 +521,7 @@ def test_mihomo_ranking_is_optional_and_marker_is_not_required(
     """Use the speed URL as the sole ranking trigger."""
 
     result = run_script(
-        "--project",
+        "--repo",
         "ag3kj",
         "--dest",
         str((tmp_path / "dataset").resolve()),
@@ -549,7 +549,7 @@ def test_mihomo_environment_and_cli_precedence(tmp_path: Path) -> None:
     environment["MIHOMO_CONTROLLER"] = "http://127.0.0.1:9090"
     environment["MIHOMO_GROUP"] = "environment-group"
     result = run_script(
-        "--project",
+        "--repo",
         "ag3kj",
         "--dest",
         str((tmp_path / "dataset").resolve()),
@@ -571,7 +571,7 @@ def test_mihomo_environment_and_cli_precedence(tmp_path: Path) -> None:
     ("arguments", "expected_error"),
     [
         (("--dest",), "--dest requires a value"),
-        (("--dest", "/tmp/test"), "--project is required"),
+        (("--dest", "/tmp/test"), "--repo is required"),
         (("--project", "ag3kj"), "--dest is required"),
         (
             ("--project", "ag3kj", "--dest", "relative/path"),

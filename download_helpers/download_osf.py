@@ -18,24 +18,43 @@ size-mismatched files.
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
 import os
-from pathlib import Path, PurePosixPath
 import re
 import ssl
 import sys
-from typing import Any, Callable, Iterable
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
+from typing import Any
 from urllib.parse import quote, urlparse
 
 import httpx
-
+from download_diagnostics import (
+    DownloadInterrupted,
+    configure_diagnostics,
+    current_log_path,
+    log_event,
+    log_exception,
+)
+from download_http_manifest import (
+    destination_path,  # noqa: F401
+    partial_path,  # noqa: F401
+    pending_files,
+    print_dry_run_summary,
+)
+from download_http_manifest import (
+    download_file as download_manifest_file,
+)
+from download_http_manifest import (
+    download_file_once as download_manifest_file_once,
+)
+from download_http_manifest import (
+    download_manifest as download_http_manifest,
+)
 from download_retry import run_with_retries
 from mihomo_ranker import MihomoConfig, MihomoNodeManager
 
-
 DEFAULT_PAGE_SIZE = 100
-DOWNLOAD_CHUNK_SIZE = 1024 * 1024
 DEFAULT_MIHOMO_PROBE_TIMEOUT = 8.0
 OSF_PROJECT_ID_PATTERN = re.compile(r"^[A-Za-z0-9]+$")
 OSF_URL_HOSTS = frozenset({"osf.io", "www.osf.io"})
@@ -60,6 +79,7 @@ class OSFFile:
     relative_path: str
     size: int
     download_url: str
+    checksum: str | None = None
 
 
 @dataclass(frozen=True)
@@ -325,7 +345,7 @@ def require_payload(response: httpx.Response) -> dict[str, Any]:
     response.raise_for_status()
     payload = response.json()
     if not isinstance(payload, dict):
-        raise ValueError(
+        raise TypeError(
             "expected the OSF API response to be an object, but got "
             f"{type(payload).__name__}."
         )
@@ -377,7 +397,7 @@ def file_from_entry(entry: dict[str, Any]) -> OSFFile:
     attributes = entry.get("attributes")
     links = entry.get("links")
     if not isinstance(attributes, dict) or not isinstance(links, dict):
-        raise ValueError(
+        raise TypeError(
             "expected every OSF file to contain attributes and links objects."
         )
     relative_path = validate_relative_path(
@@ -411,7 +431,7 @@ def next_page_url(payload: dict[str, Any]) -> str | None:
     if links is None:
         return None
     if not isinstance(links, dict):
-        raise ValueError("expected OSF pagination links to be an object.")
+        raise TypeError("expected OSF pagination links to be an object.")
     next_url = links.get("next")
     if next_url is None:
         return None
@@ -440,18 +460,18 @@ def collect_manifest_once(
             payload = require_payload(client.get(current_url))
             entries = payload.get("data")
             if not isinstance(entries, list):
-                raise ValueError(
+                raise TypeError(
                     "expected OSF collection data to be a list, but got "
                     f"{type(entries).__name__}."
                 )
             for raw_entry in entries:
                 if not isinstance(raw_entry, dict):
-                    raise ValueError(
+                    raise TypeError(
                         "expected every OSF collection entry to be an object."
                     )
                 attributes = raw_entry.get("attributes")
                 if not isinstance(attributes, dict):
-                    raise ValueError(
+                    raise TypeError(
                         "expected every OSF entry to contain attributes."
                     )
                 kind = attributes.get("kind")
@@ -503,67 +523,6 @@ def collect_manifest(
     )
 
 
-def destination_path(destination: str, relative_path: str) -> Path:
-    """Resolve a manifest path while preventing destination traversal."""
-
-    root = Path(destination).resolve()
-    candidate = root.joinpath(*PurePosixPath(relative_path).parts)
-    resolved = candidate.resolve()
-    if os.path.commonpath([root, resolved]) != str(root):
-        raise ValueError(
-            f"refusing OSF path outside destination: {relative_path!r}."
-        )
-    return candidate
-
-
-def partial_path(destination: Path) -> Path:
-    """Return the sibling partial-transfer path for a destination file."""
-
-    return destination.with_name(f"{destination.name}.part")
-
-
-def validate_existing_file(path: Path, expected_size: int) -> bool:
-    """Return whether a completed destination file can be skipped."""
-
-    if not path.exists():
-        return False
-    if path.is_symlink() or not path.is_file():
-        raise FileExistsError(
-            f"expected a regular destination file, but got {path}."
-        )
-    actual_size = path.stat().st_size
-    if actual_size != expected_size:
-        raise FileExistsError(
-            f"existing file {path} has {actual_size} bytes; expected "
-            f"{expected_size}. Move it aside before downloading."
-        )
-    return True
-
-
-def validate_content_range(response: httpx.Response, offset: int) -> None:
-    """Require a resumed response to begin at the requested byte offset."""
-
-    value = response.headers.get("Content-Range", "")
-    if not value.startswith(f"bytes {offset}-"):
-        raise httpx.RemoteProtocolError(
-            "expected resumed response Content-Range to start with "
-            f"'bytes {offset}-', but got {value!r}."
-        )
-
-
-def write_response_body(
-    response: httpx.Response,
-    output_path: Path,
-    mode: str,
-) -> None:
-    """Stream one HTTP response body to a partial file."""
-
-    with output_path.open(mode) as output:
-        for chunk in response.iter_bytes(DOWNLOAD_CHUNK_SIZE):
-            if chunk:
-                output.write(chunk)
-
-
 def download_file_once(
     config: DownloadConfig,
     record: OSFFile,
@@ -571,54 +530,12 @@ def download_file_once(
 ) -> Path:
     """Resume, verify, and atomically publish one OSF file once."""
 
-    destination = destination_path(
-        config.destination,
-        record.relative_path,
+    return download_manifest_file_once(
+        config,
+        record,
+        client_factory,
+        "OSF",
     )
-    if validate_existing_file(destination, record.size):
-        return destination
-    temporary = partial_path(destination)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if temporary.exists() and (
-        temporary.is_symlink() or not temporary.is_file()
-    ):
-        raise FileExistsError(
-            f"expected a regular partial file, but got {temporary}."
-        )
-    offset = temporary.stat().st_size if temporary.exists() else 0
-    if offset > record.size:
-        raise OSError(
-            f"partial file {temporary} has {offset} bytes; expected at most "
-            f"{record.size}. Move it aside before downloading."
-        )
-    if offset == record.size:
-        os.replace(temporary, destination)
-        return destination
-
-    headers = {}
-    if offset:
-        headers["Range"] = f"bytes={offset}-"
-    with client_factory() as client:
-        with client.stream(
-            "GET",
-            record.download_url,
-            headers=headers,
-        ) as response:
-            response.raise_for_status()
-            mode = "wb"
-            if offset and response.status_code == 206:
-                validate_content_range(response, offset)
-                mode = "ab"
-            write_response_body(response, temporary, mode)
-
-    actual_size = temporary.stat().st_size
-    if actual_size != record.size:
-        raise httpx.RemoteProtocolError(
-            f"incomplete OSF file {record.relative_path!r}: received "
-            f"{actual_size} bytes, expected {record.size}."
-        )
-    os.replace(temporary, destination)
-    return destination
 
 
 def download_file(
@@ -630,48 +547,13 @@ def download_file(
     """Download one OSF file with shared retry and failover behavior."""
 
     factory = client_factory or (lambda: create_client(config))
-    return run_with_retries(
+    return download_manifest_file(
         config,
-        f"OSF file {record.relative_path}",
-        lambda: download_file_once(config, record, factory),
-        node_manager=node_manager,
+        record,
+        node_manager,
+        factory,
+        "OSF",
     )
-
-
-def pending_files(
-    config: DownloadConfig,
-    manifest: Iterable[OSFFile],
-) -> list[OSFFile]:
-    """Return files absent from the destination or having a wrong size."""
-
-    pending = []
-    for record in manifest:
-        path = destination_path(config.destination, record.relative_path)
-        if not path.is_file() or path.stat().st_size != record.size:
-            pending.append(record)
-    return pending
-
-
-def print_dry_run_summary(
-    config: DownloadConfig,
-    manifest: list[OSFFile],
-) -> None:
-    """Print pending OSF paths and aggregate byte size."""
-
-    pending = pending_files(config, manifest)
-    total_bytes = sum(record.size for record in pending)
-    print()
-    print("Dry-run summary")
-    print("----------------------------------------")
-    print(f"Files in manifest : {len(manifest)}")
-    print(f"Files to download : {len(pending)}")
-    print(f"GiB to download   : {total_bytes / 1024**3:.2f}")
-    print()
-    for record in pending:
-        print(
-            f"{record.size / 1024**2:10.2f} MiB  "
-            f"{record.relative_path}"
-        )
 
 
 def download_manifest(
@@ -679,26 +561,15 @@ def download_manifest(
     manifest: list[OSFFile],
     node_manager: MihomoNodeManager | None,
 ) -> None:
-    """Download every pending manifest file with bounded concurrency."""
+    """Download every pending OSF file with bounded concurrency."""
 
-    pending = pending_files(config, manifest)
-    if not pending:
-        return
-    print(f"Downloading {len(pending)} OSF file(s)...")
-    with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
-        futures = [
-            executor.submit(download_file, config, record, node_manager)
-            for record in pending
-        ]
-        for index, (record, future) in enumerate(
-            zip(pending, futures),
-            1,
-        ):
-            path = future.result()
-            print(
-                f"[{index}/{len(pending)}] {record.relative_path} -> "
-                f"{path}"
-            )
+    download_http_manifest(
+        config,
+        manifest,
+        node_manager,
+        lambda: create_client(config),
+        "OSF",
+    )
 
 
 def authentication_status(token: str | None) -> str:
@@ -755,16 +626,54 @@ def run(config: DownloadConfig) -> None:
             node_manager.close()
 
 
+def diagnostic_configuration(config: DownloadConfig) -> dict[str, Any]:
+    """Return safe OSF configuration fields for diagnostics."""
+
+    return {
+        "destination": config.destination,
+        "dry_run": config.dry_run,
+        "endpoint": config.api_base,
+        "max_workers": config.max_workers,
+        "provider": "osf",
+        "proxy_url": config.proxy_url,
+        "repo": config.project_id,
+        "retry_attempts": config.retry_attempts,
+        "retry_base_delay": config.retry_base_delay,
+        "retry_max_delay": config.retry_max_delay,
+        "storage": config.storage,
+        "timeout": config.timeout,
+        "transport": "http",
+    }
+
+
 def main() -> int:
     """Run the OSF downloader and return a shell-compatible status."""
 
     try:
-        run(load_config_from_environment())
-    except Exception as error:
+        config = load_config_from_environment()
+        log_path = configure_diagnostics(
+            "osf",
+            diagnostic_configuration(config),
+        )
+        print(f"Debug log     : {log_path}")
+        run(config)
+        log_event("download_completed", status="success")
+    except (DownloadInterrupted, KeyboardInterrupt) as error:
+        log_exception("download_interrupted", error)
+        path = current_log_path()
+        print("ERROR: download interrupted.", file=sys.stderr)
+        if path is not None:
+            print(f"Debug log: {path}", file=sys.stderr)
+        return 130
+    except Exception as error:  # noqa: BLE001
+        log_exception("download_failed", error)
         print(
             f"ERROR: {type(error).__name__}: {error}",
             file=sys.stderr,
         )
+        path = current_log_path()
+        if path is not None:
+            print(f"Debug log: {path}", file=sys.stderr)
         return 1
     return 0
 

@@ -121,7 +121,7 @@ access is the default, so no Mihomo setting is required:
 
 ```bash
 /ABSOLUTE/PATH/TO/REPOSITORY/scripts/download_osf.sh \
-  --project https://osf.io/ag3kj/overview \
+  --repo https://osf.io/ag3kj/overview \
   --dest /ABSOLUTE/PATH/TO/DESTINATION
 ```
 
@@ -129,7 +129,7 @@ To send requests through a local Mihomo mixed port, add only the proxy port:
 
 ```bash
 /ABSOLUTE/PATH/TO/REPOSITORY/scripts/download_osf.sh \
-  --project https://osf.io/ag3kj/overview \
+  --repo https://osf.io/ag3kj/overview \
   --dest /ABSOLUTE/PATH/TO/DESTINATION \
   --proxy-port PROXY_PORT
 ```
@@ -146,7 +146,7 @@ another active file. Group and node-marker options are optional overrides:
 
 ```bash
 /ABSOLUTE/PATH/TO/REPOSITORY/scripts/download_osf.sh \
-  --project PROJECT_ID_OR_URL \
+  --repo PROJECT_ID_OR_URL \
   --dest /ABSOLUTE/PATH/TO/DESTINATION \
   --proxy-port PROXY_PORT \
   --retry-attempts 0 \
@@ -167,6 +167,46 @@ incompatible with the repository endpoint or returns too few usable nodes,
 the ranker automatically checks candidates through the same local HTTPS proxy
 path used by the download. These checks are range-bounded and require no
 additional option or Mihomo configuration-file path.
+
+## Zenodo dataset downloads
+
+Use the same common downloader options with a Zenodo record ID or URL:
+
+```bash
+/ABSOLUTE/PATH/TO/REPOSITORY/scripts/download_zenodo.sh \
+  --repo https://zenodo.org/records/583331 \
+  --dest /ABSOLUTE/PATH/TO/DESTINATION \
+  --proxy-port PROXY_PORT
+```
+
+Existing files are verified against Zenodo metadata and interrupted transfers
+resume from sibling `.part` files. `--dry-run`, unlimited retries, and optional
+Mihomo ranking behave as in the OSF downloader.
+
+## OpenNeuro dataset downloads
+
+Install the `download` extra, then pass an accession number, dataset URL, or
+version URL. A version URL pins the corresponding DataLad snapshot tag:
+
+```bash
+/ABSOLUTE/PATH/TO/REPOSITORY/scripts/download_openneuro.sh \
+  --repo https://openneuro.org/datasets/ds005261/versions/2.0.0 \
+  --dest /ABSOLUTE/PATH/TO/DESTINATION \
+  --proxy-port PROXY_PORT
+```
+
+DataLad and git-annex reuse existing content on retries. Public snapshots use
+the remotes configured by OpenNeuro; private access may additionally require
+OpenNeuro credentials and its git-annex special-remote helper.
+
+## Download diagnostics
+
+Every provider downloader writes a unique sanitized diagnostic log beneath
+`/ABSOLUTE/PATH/TO/REPOSITORY/logs/downloads/`. This directory is ignored by
+git. The absolute log path is printed when a run starts and whenever it fails.
+Retry attempts, exception chains, dependency versions, interruptions, and
+Mihomo failovers are recorded without authentication secrets or signed URL
+queries.
 
 ## CLI commands
 

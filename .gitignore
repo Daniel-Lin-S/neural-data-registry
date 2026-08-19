@@ -32,6 +32,7 @@ ENV/
 .env.*
 !.env.example
 deployment/*.local.env
+*local.sh
 
 # Runtime registry data when a repository-local root is used
 /data/

@@ -15,29 +15,35 @@ partial files are retained for retry and resume operations.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import importlib.util
 import os
 import ssl
 import sys
 import time
-from typing import Any, Callable
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
 from urllib.parse import quote
 
 import httpx
+from download_diagnostics import (
+    DownloadInterrupted,
+    configure_diagnostics,
+    current_log_path,
+    log_event,
+    log_exception,
+)
+from download_retry import (
+    is_retryable_download_error,  # noqa: F401
+    retry_delay,  # noqa: F401
+    run_with_retries,
+)
 from huggingface_hub import (
     close_session,
     get_token,
     set_client_factory,
     snapshot_download,
 )
-
-from download_retry import (
-    is_retryable_download_error,
-    retry_delay,
-    run_with_retries,
-)
-
 from mihomo_ranker import (
     MihomoConfig,
     MihomoNodeManager,
@@ -562,22 +568,53 @@ def run(config: DownloadConfig) -> None:
             node_manager.close()
 
 
-def main() -> int:
-    """Run the downloader and translate failures into a clear exit status.
+def diagnostic_configuration(config: DownloadConfig) -> dict[str, Any]:
+    """Return safe Hugging Face configuration fields for diagnostics."""
 
-    Returns
-    -------
-    int
-        Zero for success and one for failure.
-    """
+    return {
+        "destination": config.destination,
+        "dry_run": config.dry_run,
+        "endpoint": config.endpoint,
+        "max_workers": config.max_workers,
+        "provider": "huggingface",
+        "proxy_url": config.proxy_url,
+        "repo": config.repo_id,
+        "retry_attempts": config.retry_attempts,
+        "retry_base_delay": config.retry_base_delay,
+        "retry_max_delay": config.retry_max_delay,
+        "timeout": config.timeout,
+        "transport": config.transport,
+    }
+
+
+def main() -> int:
+    """Run the downloader and translate failures into a clear exit status."""
 
     try:
-        run(load_config_from_environment())
-    except Exception as error:
+        config = load_config_from_environment()
+        log_path = configure_diagnostics(
+            "huggingface",
+            diagnostic_configuration(config),
+        )
+        print(f"Debug log     : {log_path}")
+        run(config)
+        log_event("download_completed", status="success")
+    except (DownloadInterrupted, KeyboardInterrupt) as error:
+        log_exception("download_interrupted", error)
+        path = current_log_path()
+        print("ERROR: download interrupted.", file=sys.stderr)
+        if path is not None:
+            print(f"Debug log: {path}", file=sys.stderr)
+        return 130
+    except Exception as error:  # noqa: BLE001
+        log_exception("download_failed", error)
         print(
             f"ERROR: {type(error).__name__}: {error}",
             file=sys.stderr,
         )
+        path = current_log_path()
+        if path is not None:
+            print(f"Debug log: {path}", file=sys.stderr)
         return 1
     return 0
 

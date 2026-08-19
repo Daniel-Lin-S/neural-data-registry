@@ -162,6 +162,12 @@ still provides ordinary proxy access. OSF ranking uses the same bounded
 `MIHOMO_CONTROLLER`, `MIHOMO_GROUP`, and `MIHOMO_SECRET` environment variables
 have the same behavior as in the Hugging Face downloader.
 
+The controller delay API is used only as a fast ranking hint. If it is
+incompatible with the repository endpoint or returns too few usable nodes,
+the ranker automatically checks candidates through the same local HTTPS proxy
+path used by the download. These checks are range-bounded and require no
+additional option or Mihomo configuration-file path.
+
 ## CLI commands
 
 All commands read `NDR_DATA_ROOT` and operate on the same registry database.

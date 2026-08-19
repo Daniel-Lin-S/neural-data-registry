@@ -35,6 +35,7 @@ THROUGHPUT_SAMPLE_COUNT = 1
 THROUGHPUT_SAMPLE_BYTES = 512 * 1024
 FAILOVER_SAMPLE_BYTES = 256 * 1024
 MAX_THROUGHPUT_PROBE_SECONDS = 8.0
+MAX_REAL_LATENCY_PROBE_SECONDS = 8.0
 DISCOVERY_RANGE_BYTES = 1
 RANKING_TTL_SECONDS = 6 * 60 * 60
 NODE_COOLDOWN_SECONDS = 30 * 60
@@ -50,6 +51,7 @@ GROUP_PROXY_TYPES = frozenset(
 )
 
 TimeFunction = Callable[[], float]
+LatencyFunction = Callable[..., float]
 
 
 class MihomoUnavailableError(RuntimeError):
@@ -327,6 +329,51 @@ def measure_throughput(
     return transferred / MIB / elapsed
 
 
+def measure_proxy_latency(
+    proxy_url: str,
+    url: str,
+    timeout: float,
+    request_headers: dict[str, str] | None,
+) -> float:
+    """Measure response latency through the active selected proxy node.
+
+    Parameters
+    ----------
+    proxy_url : str
+        Explicit local Mihomo proxy URL.
+    url : str
+        HTTPS repository endpoint used by the real downloader.
+    timeout : float
+        Request timeout in seconds.
+    request_headers : dict or None
+        Additional request headers, optional. Their values are never printed.
+
+    Returns
+    -------
+    float
+        Time to a successful response in milliseconds.
+    """
+
+    headers = dict(request_headers or {})
+    headers["Range"] = f"bytes=0-{DISCOVERY_RANGE_BYTES - 1}"
+    start = time.monotonic()
+    with httpx.Client(
+        proxy=proxy_url,
+        verify=create_tls_context(),
+        follow_redirects=True,
+        timeout=httpx.Timeout(timeout),
+        trust_env=False,
+    ) as client:
+        with client.stream("GET", url, headers=headers) as response:
+            response.raise_for_status()
+    elapsed = time.monotonic() - start
+    if elapsed <= 0:
+        raise RuntimeError(
+            f"expected a positive proxy-probe duration, but got {elapsed}."
+        )
+    return elapsed * 1000
+
+
 def count_bounded_bytes(chunks: Iterable[bytes], byte_limit: int) -> int:
     """Count streamed bytes without consuming beyond a fixed limit."""
 
@@ -404,6 +451,7 @@ class MihomoNodeManager:
         *,
         controller: MihomoController | None = None,
         time_fn: TimeFunction = time.monotonic,
+        latency_fn: LatencyFunction = measure_proxy_latency,
         throughput_fn: Callable[..., float] = measure_throughput,
     ) -> None:
         """Create a process-local ranking manager."""
@@ -415,6 +463,7 @@ class MihomoNodeManager:
         owns_controller = controller is None
         self.controller = controller or MihomoController(config)
         self.time_fn = time_fn
+        self.latency_fn = latency_fn
         self.throughput_fn = throughput_fn
         self.ranked_nodes: list[NodeScore] = []
         self.ranked_at: float | None = None
@@ -566,6 +615,68 @@ class MihomoNodeManager:
             latencies_ms=tuple(latencies),
         )
 
+    def _real_latency_profile(
+        self,
+        name: str,
+        order: int,
+    ) -> LatencyProfile:
+        """Probe one selected node through the real local proxy path."""
+
+        latencies = []
+        try:
+            self.controller.select(self.group_name, name)
+            delay = self.latency_fn(
+                self.proxy_url,
+                self.probe_url,
+                min(
+                    self.config.probe_timeout,
+                    MAX_REAL_LATENCY_PROBE_SECONDS,
+                ),
+                self.request_headers,
+            )
+        except Exception:
+            pass
+        else:
+            latencies.append(delay)
+        return LatencyProfile(
+            name=name,
+            order=order,
+            successes=len(latencies),
+            attempts=1,
+            latencies_ms=tuple(latencies),
+        )
+
+    def _supplement_latency_profiles(
+        self,
+        candidates: list[str],
+        profiles: list[LatencyProfile],
+    ) -> list[LatencyProfile]:
+        """Fill an incomplete shortlist using bounded real proxy probes."""
+
+        target_size = min(SHORTLIST_SIZE, len(candidates))
+        passing = [profile for profile in profiles if profile.successes]
+        if len(passing) >= target_size:
+            return passing
+
+        print(
+            "WARNING: Mihomo controller probes produced only "
+            f"{len(passing)} usable node(s); validating candidates through "
+            "the real proxy path.",
+            file=sys.stderr,
+        )
+        passing_names = {profile.name for profile in passing}
+        for order, name in enumerate(candidates):
+            if name in passing_names:
+                continue
+            profile = self._real_latency_profile(name, order)
+            if not profile.successes:
+                continue
+            passing.append(profile)
+            passing_names.add(name)
+            if len(passing) >= target_size:
+                break
+        return passing
+
     def _throughput_samples(
         self,
         node_name: str,
@@ -614,7 +725,10 @@ class MihomoNodeManager:
                     indexed,
                 )
             )
-        passing = [profile for profile in profiles if profile.successes]
+        passing = self._supplement_latency_profiles(
+            candidates,
+            profiles,
+        )
         passing.sort(
             key=lambda profile: (
                 -profile.success_ratio,
@@ -731,11 +845,6 @@ class MihomoNodeManager:
             if not self._available(score.name):
                 continue
             try:
-                self.controller.delay(
-                    score.name,
-                    self.probe_url,
-                    self.config.probe_timeout,
-                )
                 samples = self._throughput_samples(
                     score.name,
                     FAILOVER_SAMPLE_BYTES,

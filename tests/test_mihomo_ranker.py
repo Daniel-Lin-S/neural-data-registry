@@ -443,6 +443,39 @@ def test_bounded_byte_counter_never_exceeds_limit() -> None:
     assert ranker.count_bounded_bytes(chunks, 10) == 10
 
 
+def test_real_proxy_latency_probe_uses_one_byte_range(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep fallback repository probes bounded to response headers."""
+
+    requests = install_discovery_client(monkeypatch)
+    moments = iter([10.0, 10.25])
+    monkeypatch.setattr(
+        ranker.time,
+        "monotonic",
+        lambda: next(moments),
+    )
+
+    delay = ranker.measure_proxy_latency(
+        "http://127.0.0.1:7893",
+        "https://example.com/probe",
+        8.0,
+        {"Authorization": "Bearer hidden"},
+    )
+
+    assert delay == 250.0
+    assert requests == [
+        (
+            "GET",
+            "https://example.com/probe",
+            {
+                "Authorization": "Bearer hidden",
+                "Range": "bytes=0-0",
+            },
+        )
+    ]
+
+
 def test_initial_speed_test_has_a_small_fixed_budget() -> None:
     """Prevent ranking traffic and timeout from delaying real downloads."""
 
@@ -455,6 +488,7 @@ def test_initial_speed_test_has_a_small_fixed_budget() -> None:
     assert maximum_bytes <= 2 * ranker.MIB
     assert ranker.THROUGHPUT_SAMPLE_COUNT == 1
     assert ranker.MAX_THROUGHPUT_PROBE_SECONDS <= 8.0
+    assert ranker.MAX_REAL_LATENCY_PROBE_SECONDS <= 8.0
     assert ranker.RANKING_TTL_SECONDS >= 6 * 60 * 60
 
 
@@ -486,3 +520,115 @@ def test_benchmark_selects_fastest_equally_stable_node() -> None:
         call[3] <= ranker.MAX_THROUGHPUT_PROBE_SECONDS
         for call in calls
     )
+
+
+def test_healthy_controller_probes_skip_real_proxy_fallback() -> None:
+    """Avoid extra repository requests when controller probes are usable."""
+
+    members = ["one", "two", "three"]
+    manager = make_manager(
+        FakeController(members),
+        node_marker="",
+    )
+
+    def unexpected_latency(*args: Any) -> float:
+        raise AssertionError(
+            "real proxy fallback ran after healthy controller probes."
+        )
+
+    manager.latency_fn = unexpected_latency
+
+    assert manager.benchmark().name == "one"
+
+
+def test_real_proxy_fallback_recovers_controller_probe_failures() -> None:
+    """Use the downloader path when Mihomo delay checks falsely fail."""
+
+    members = ["one", "two", "three", "four"]
+    controller = FakeController(members)
+    manager = make_manager(controller, node_marker="")
+    calls: list[tuple[str, float]] = []
+
+    def unavailable_delay(
+        name: str,
+        url: str,
+        timeout: float,
+    ) -> float:
+        del name, url, timeout
+        raise TimeoutError("synthetic controller timeout")
+
+    def proxy_latency(
+        proxy_url: str,
+        url: str,
+        timeout: float,
+        headers: dict[str, str],
+    ) -> float:
+        del proxy_url, url, headers
+        calls.append((controller.selected, timeout))
+        return float(members.index(controller.selected) + 10)
+
+    controller.delay = unavailable_delay
+    manager.latency_fn = proxy_latency
+
+    winner = manager.benchmark()
+
+    assert winner.name == "one"
+    assert [name for name, _ in calls] == members[:ranker.SHORTLIST_SIZE]
+    assert all(
+        timeout <= ranker.MAX_REAL_LATENCY_PROBE_SECONDS
+        for _, timeout in calls
+    )
+
+
+def test_real_proxy_fallback_preserves_clear_unavailable_error() -> None:
+    """Report failure when neither probe mechanism reaches a repository."""
+
+    controller = FakeController(["one", "two"])
+    manager = make_manager(controller, node_marker="")
+
+    def unavailable(*args: Any) -> float:
+        del args
+        raise TimeoutError("synthetic repository timeout")
+
+    controller.delay = unavailable
+    manager.latency_fn = unavailable
+
+    with pytest.raises(
+        ranker.MihomoUnavailableError,
+        match="no permitted Mihomo node passed the repository probes",
+    ):
+        manager.benchmark()
+
+
+def test_failover_uses_real_transfer_without_controller_delay() -> None:
+    """Do not reject failover nodes using an incompatible delay endpoint."""
+
+    members = ["failed", "next"]
+    controller = FakeController(members)
+    manager = make_manager(controller, node_marker="")
+    manager.ranked_nodes = [
+        ranker.NodeScore(
+            name=name,
+            order=order,
+            latency_successes=1,
+            latency_attempts=1,
+            latencies_ms=(10.0 + order,),
+            throughput_successes=1,
+            throughput_attempts=1,
+            throughputs_mib_s=(1.0,),
+        )
+        for order, name in enumerate(members)
+    ]
+
+    def unavailable_delay(
+        name: str,
+        url: str,
+        timeout: float,
+    ) -> float:
+        del name, url, timeout
+        raise AssertionError("failover called the controller delay endpoint")
+
+    controller.delay = unavailable_delay
+
+    assert manager.failover() == "next"
+    assert controller.selected == "next"

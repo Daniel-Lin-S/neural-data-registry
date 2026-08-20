@@ -7,6 +7,8 @@ from typing import Sequence
 class Provider(str, Enum):
     """Supported dataset providers, including automatically detected URL hosts."""
     OPENNEURO = "openneuro"
+    OSF = "osf"
+    ZENODO = "zenodo"
     DANDI = "dandi"
     PHYSIONET = "physionet"
     KAGGLE = "kaggle"

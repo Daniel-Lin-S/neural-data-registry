@@ -14,6 +14,11 @@ from neural_data_registry.enums import Provider
 CONNECTIVITY_TIMEOUT_SECONDS = 30
 HEAD_FALLBACK_STATUS_CODES = frozenset({405, 501})
 HTTP_SCHEMES = frozenset({"http", "https"})
+OSF_NODE_PATTERN = re.compile(r"^[a-z0-9]{5}$", re.IGNORECASE)
+ZENODO_RECORD_PATTERN = re.compile(r"^[0-9]+$")
+ZENODO_DOI_PATTERN = re.compile(
+    r"^10\.(?:5281|5072)/zenodo\.[0-9]+$", re.IGNORECASE
+)
 
 
 class ProviderDownloadError(RuntimeError):
@@ -63,9 +68,55 @@ def _find_command(name: str) -> str | None:
 
 
 
+def _path_segments(path: str) -> list[str]:
+    """Return non-empty URL path segments without query or fragment data."""
+
+    return [segment for segment in path.split("/") if segment]
+
+
+def _is_osf_dataset_url(host: str, path: str) -> bool:
+    """Return whether an OSF URL identifies a node or its storage tree."""
+
+    segments = _path_segments(path)
+    if host == "api.osf.io":
+        return (
+            len(segments) >= 3
+            and segments[0:2] == ["v2", "nodes"]
+            and bool(segments[2])
+        )
+    return host == "osf.io" and bool(
+        segments and OSF_NODE_PATTERN.fullmatch(segments[0])
+    )
+
+
+def _is_zenodo_record_url(host: str, path: str) -> bool:
+    """Return whether a Zenodo or DOI URL identifies a record."""
+
+    segments = _path_segments(path)
+    if host == "doi.org":
+        return bool(
+            segments and ZENODO_DOI_PATTERN.fullmatch("/".join(segments))
+        )
+    if host not in {"zenodo.org", "sandbox.zenodo.org"}:
+        return False
+    if len(segments) >= 2 and segments[0] in {"record", "records"}:
+        return bool(ZENODO_RECORD_PATTERN.fullmatch(segments[1]))
+    return (
+        len(segments) >= 3
+        and segments[0:2] == ["api", "records"]
+        and bool(ZENODO_RECORD_PATTERN.fullmatch(segments[2]))
+    )
+
+
 def provider_for_url(url: str) -> Provider:
-    """Identify a provider from a dataset URL, defaulting to ``other``."""
-    host = (urlparse(url).hostname or "").lower()
+    """Identify a provider from a valid dataset URL, defaulting to ``other``."""
+
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if _is_osf_dataset_url(host, parsed.path):
+        return Provider.OSF
+    if _is_zenodo_record_url(host, parsed.path):
+        return Provider.ZENODO
     providers = {
         "openneuro.org": Provider.OPENNEURO,
         "dandiarchive.org": Provider.DANDI,

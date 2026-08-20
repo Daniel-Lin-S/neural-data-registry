@@ -331,7 +331,7 @@ def test_repeated_server_errors_trigger_node_failover(
     assert manager.failover_calls == 1
 
 
-@pytest.mark.parametrize("status_code", [401, 403, 404])
+@pytest.mark.parametrize("status_code", [401, 403, 404, 407])
 def test_terminal_http_status_is_not_retried(status_code: int) -> None:
     """Fail immediately for authentication and missing-resource errors."""
 
@@ -345,6 +345,13 @@ def test_transient_http_status_is_retried(status_code: int) -> None:
 
     error = hub_error(status_code)
     assert downloader.is_retryable_download_error(error, "http")
+
+
+def test_proxy_authentication_error_stays_terminal() -> None:
+    """Do not retry a proxy until its invalid credentials change."""
+
+    error = RuntimeError("407 Proxy Authentication Required")
+    assert not downloader.is_retryable_download_error(error, "xet")
 
 
 def test_filesystem_error_is_not_retried() -> None:
@@ -609,6 +616,14 @@ def test_dry_run_wrapper_without_explicit_cause_is_retried() -> None:
         "CAS service channel closed",
         "transport unexpected EOF",
         "DNS dispatch failure",
+        "proxy tunnel stream closed",
+        "TLS handshake failure",
+        "server disconnected while reading response",
+        "HTTP2 error reading a body",
+        (
+            "Task error: File reconstruction error: CAS Client Error: "
+            "Format error: I/O error: error decoding response body"
+        ),
     ],
 )
 def test_xet_network_wrapper_messages_are_retried(message: str) -> None:
@@ -630,14 +645,32 @@ def test_unlimited_retries_include_xet_runtime_wrappers(
         retry_attempts=0,
         transport="xet",
     )
+    failures = [
+        (
+            "Task error: File reconstruction error: CAS Client Error: "
+            "Format error: I/O error: error decoding response body"
+        ),
+        "proxy tunnel stream closed",
+        "TLS handshake failure",
+    ]
+    manager = SimpleNamespace(
+        prepare_attempt=lambda: "allowed-0.1倍",
+        failover_calls=0,
+    )
+
+    def failover() -> str:
+        manager.failover_calls += 1
+        return "next-0.1倍"
+
+    manager.failover = failover
     calls = 0
 
     def snapshot_fn(**kwargs: Any) -> str:
         nonlocal calls
         del kwargs
         calls += 1
-        if calls < 4:
-            raise RuntimeError("reqwest connection reset by peer")
+        if failures:
+            raise RuntimeError(failures.pop(0))
         return str(tmp_path)
 
     result = downloader.download_with_retries(
@@ -646,7 +679,9 @@ def test_unlimited_retries_include_xet_runtime_wrappers(
         snapshot_fn=snapshot_fn,
         sleep_fn=lambda delay: None,
         close_session_fn=lambda: None,
+        node_manager=manager,
     )
 
     assert result == str(tmp_path)
     assert calls == 4
+    assert manager.failover_calls == 3

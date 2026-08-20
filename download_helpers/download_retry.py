@@ -32,33 +32,56 @@ from download_diagnostics import log_event, log_exception
 from mihomo_ranker import MihomoUnavailableError
 
 RETRYABLE_NETWORK_ERROR_MARKERS = (
+    "bad gateway",
     "broken pipe",
     "cas service error",
     "channel closed",
     "connection",
-    "connection reset",
-    "connection refused",
     "could not resolve",
-    "failed to connect",
     "dispatch failure",
     "dns",
+    "early eof",
+    "error decoding response body",
+    "error reading a body",
+    "error reading response",
     "error sending request",
+    "failed to connect",
+    "failed to receive",
+    "failed to send",
+    "gateway timeout",
     "gnutls",
+    "handshake failure",
+    "http2 error",
     "http/2 stream",
+    "hyper error",
     "incomplete",
     "network",
-    "reqwest",
-    "rpc failed",
-    "reset by peer",
-    "transport",
+    "peer closed",
+    "proxy",
     "remote end hung up",
+    "request middleware error",
+    "reqwest",
+    "reset by peer",
+    "rpc failed",
+    "server disconnected",
+    "service unavailable",
+    "stream",
     "temporary failure in name resolution",
     "timed out",
     "timeout",
+    "tls",
+    "transport",
+    "unexpected end of file",
     "unexpected eof",
 )
 RETRYABLE_HTTP_STATUS_CODES = frozenset({408, 425, 429})
-TERMINAL_HTTP_STATUS_CODES = frozenset({400, 401, 403, 404, 405, 410})
+TERMINAL_HTTP_STATUS_CODES = frozenset(
+    {400, 401, 403, 404, 405, 407, 410}
+)
+TERMINAL_ERROR_MARKERS = (
+    "invalid proxy url",
+    "proxy authentication required",
+)
 NETWORK_EXCEPTION_NAMES = frozenset(
     {
         "ConnectTimeout",
@@ -160,6 +183,13 @@ def classify_download_error(
 
     chain = exception_chain(error)
     exception_names = {type(item).__name__ for item in chain}
+    messages = [str(item).lower() for item in chain]
+    if any(
+        marker in message
+        for message in messages
+        for marker in TERMINAL_ERROR_MARKERS
+    ):
+        return RetryDecision(False, False, "terminal")
     statuses = [
         status
         for item in chain
@@ -209,10 +239,9 @@ def classify_download_error(
         return RetryDecision(True, True, "network")
 
     if transport in {"http", "xet", "datalad"}:
-        for item in chain:
+        for item, message in zip(chain, messages, strict=True):
             if isinstance(item, (FileExistsError, PermissionError)):
                 continue
-            message = str(item).lower()
             if any(
                 marker in message
                 for marker in RETRYABLE_NETWORK_ERROR_MARKERS

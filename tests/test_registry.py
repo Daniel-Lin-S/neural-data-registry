@@ -1744,6 +1744,11 @@ def test_failed_download_remains_in_incoming(config, monkeypatch):
         ("https://neurovault.org/collections/1234/", Provider.NEUROVAULT),
         ("https://www.kaggle.com/datasets/example/dataset", Provider.KAGGLE),
         ("https://www.synapse.org/Synapse:syn51549340", Provider.SYNAPSE),
+        ("https://osf.io/pq7vb/files/osfstorage/", Provider.OSF),
+        ("https://api.osf.io/v2/nodes/pq7vb/", Provider.OSF),
+        ("https://zenodo.org/records/583331", Provider.ZENODO),
+        ("https://sandbox.zenodo.org/records/123", Provider.ZENODO),
+        ("https://doi.org/10.5281/zenodo.583331", Provider.ZENODO),
     ],
 )
 def test_new_providers_are_recognized_but_not_downloaded(url, provider):
@@ -1751,6 +1756,24 @@ def test_new_providers_are_recognized_but_not_downloaded(url, provider):
     assert provider_base.provider_for_url(url) is provider
     with pytest.raises(provider_base.ProviderDownloadError, match="not configured"):
         provider_base.download_from_url(url, "1.0.0", Path("/tmp/incoming"))
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://osf.io/",
+        "https://osf.io/projects/",
+        "https://zenodo.org/",
+        "https://zenodo.org/communities/neuroscience/",
+        "https://zenodo.org/records/not-a-record-id",
+    ],
+)
+def test_provider_extraction_rejects_non_dataset_osf_and_zenodo_urls(
+    url: str,
+) -> None:
+    """Avoid classifying provider homepages and collections as datasets."""
+
+    assert provider_base.provider_for_url(url) is Provider.OTHER
 
 
 def test_download_requires_explicit_metadata(config):
@@ -1786,6 +1809,36 @@ def test_ingest_local_detects_provider_and_physionet_version_from_url(config, tm
     )
     assert item.provider is Provider.PHYSIONET
     assert item.version == "1.0.0"
+
+
+@pytest.mark.parametrize(
+    ("name", "url", "provider"),
+    [
+        ("OSF local", "https://osf.io/pq7vb/files/osfstorage/", Provider.OSF),
+        ("Zenodo local", "https://zenodo.org/records/583331", Provider.ZENODO),
+    ],
+)
+def test_ingest_local_detects_osf_and_zenodo_provider_from_url(
+    config,
+    tmp_path,
+    name: str,
+    url: str,
+    provider: Provider,
+) -> None:
+    """Replace a supplied provider with the recognized canonical source."""
+
+    item = ingest_local(
+        mock_dataset(tmp_path, provider.value),
+        name,
+        Provider.OPENNEURO,
+        url,
+        None,
+        ["meg"],
+        config,
+    )
+
+    assert item.provider is provider
+    assert item.version == "unknown"
 
 
 def test_ingest_local_uses_other_for_unknown_url(config, tmp_path):
@@ -2396,3 +2449,34 @@ def test_update_metadata_cli_and_api_statuses(config, tmp_path, monkeypatch):
     assert response.status_code == 200
     assert response.json()["modalities"] == ["eeg", "meg"]
     assert response.json()["aliases"] == ["API alias", "CLI alias"]
+
+
+def test_update_cli_accepts_osf_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Parse the provider replacement command without touching the registry."""
+
+    captured: dict[str, object] = {}
+
+    def capture_update(identifier: str, **kwargs: object) -> None:
+        captured["identifier"] = identifier
+        captured.update(kwargs)
+        raise RuntimeError("stop after CLI option parsing")
+
+    monkeypatch.setattr(cli, "update_dataset_metadata", capture_update)
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "update",
+            "MASC-MEG",
+            "--provider",
+            "osf",
+            "--force-replace",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert captured["identifier"] == "MASC-MEG"
+    assert captured["provider"] is Provider.OSF
+    assert captured["force_replace"] is True

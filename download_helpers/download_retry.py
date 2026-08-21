@@ -263,10 +263,19 @@ def retry_delay(
     config: RetryConfig,
     failed_attempt: int,
 ) -> float:
-    """Calculate a capped exponential retry delay in seconds."""
+    """Calculate a capped exponential retry delay without overflow."""
 
-    delay = config.retry_base_delay * (2 ** (failed_attempt - 1))
-    return min(delay, config.retry_max_delay)
+    if failed_attempt < 1:
+        raise ValueError(
+            "expected failed_attempt to be positive, but got "
+            f"{failed_attempt}."
+        )
+    delay = min(config.retry_base_delay, config.retry_max_delay)
+    for _ in range(1, failed_attempt):
+        if delay >= config.retry_max_delay / 2:
+            return config.retry_max_delay
+        delay *= 2
+    return delay
 
 
 def run_with_retries(

@@ -64,6 +64,7 @@ def make_config(
         timeout=300.0,
         dry_run=False,
         transport=transport,
+        xet_range_concurrency=16,
         retry_attempts=retry_attempts,
         retry_base_delay=5.0,
         retry_max_delay=300.0,
@@ -158,6 +159,36 @@ def python_stub_environment(tmp_path: Path) -> dict[str, str]:
     python_stub = bin_dir / "python"
     python_stub.write_text(
         "#!/usr/bin/env bash\nexit 0\n",
+        encoding="utf-8",
+    )
+    python_stub.chmod(0o755)
+    environment = os.environ.copy()
+    environment["PATH"] = f"{bin_dir}:{environment['PATH']}"
+    return environment
+
+
+def proxy_probe_environment(tmp_path: Path) -> dict[str, str]:
+    """Return an environment whose Python command prints proxy state."""
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    python_stub = bin_dir / "python"
+    python_stub.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf 'HTTP_PROXY=%s\\n' \"${HTTP_PROXY-unset}\"\n"
+        "printf 'HTTPS_PROXY=%s\\n' \"${HTTPS_PROXY-unset}\"\n"
+        "printf 'ALL_PROXY=%s\\n' \"${ALL_PROXY-unset}\"\n"
+        "printf 'http_proxy=%s\\n' \"${http_proxy-unset}\"\n"
+        "printf 'https_proxy=%s\\n' \"${https_proxy-unset}\"\n"
+        "printf 'all_proxy=%s\\n' \"${all_proxy-unset}\"\n"
+        "printf 'NO_PROXY=%s\\n' \"${NO_PROXY-unset}\"\n"
+        "printf 'no_proxy=%s\\n' \"${no_proxy-unset}\"\n"
+        "printf 'HF_XET_NUM_CONCURRENT_RANGE_GETS=%s\\n' "
+        "\"${HF_XET_NUM_CONCURRENT_RANGE_GETS-unset}\"\n"
+        "printf 'HF_XET_FIXED_DOWNLOAD_CONCURRENCY=%s\\n' "
+        "\"${HF_XET_FIXED_DOWNLOAD_CONCURRENCY-unset}\"\n"
+        "printf 'HF_XET_CLIENT_ENABLE_ADAPTIVE_CONCURRENCY=%s\\n' "
+        "\"${HF_XET_CLIENT_ENABLE_ADAPTIVE_CONCURRENCY-unset}\"\n",
         encoding="utf-8",
     )
     python_stub.chmod(0o755)
@@ -293,6 +324,119 @@ def test_retry_closes_stale_hugging_face_session(tmp_path: Path) -> None:
     assert close_calls == 1
 
 
+def test_retry_aborts_stale_xet_session(tmp_path: Path) -> None:
+    """Create a fresh native Xet session after a network failure."""
+
+    config = make_config(tmp_path, transport="xet")
+    calls = 0
+    close_calls = 0
+    abort_calls = 0
+    session_poisoned = False
+
+    def snapshot_fn(**kwargs: Any) -> str:
+        nonlocal calls, session_poisoned
+        del kwargs
+        calls += 1
+        if calls == 1:
+            session_poisoned = True
+            raise RuntimeError("Previous task error: Network error")
+        if session_poisoned:
+            raise RuntimeError("Previous task error: Network error")
+        return str(tmp_path)
+
+    def close_fn() -> None:
+        nonlocal close_calls
+        close_calls += 1
+
+    def abort_fn() -> None:
+        nonlocal abort_calls, session_poisoned
+        abort_calls += 1
+        session_poisoned = False
+
+    downloader.download_with_retries(
+        config,
+        dry_run=False,
+        snapshot_fn=snapshot_fn,
+        sleep_fn=lambda delay: None,
+        close_session_fn=close_fn,
+        abort_xet_session_fn=abort_fn,
+    )
+
+    assert close_calls == 1
+    assert abort_calls == 1
+
+
+def test_xet_session_is_aborted_before_mihomo_failover(
+    tmp_path: Path,
+) -> None:
+    """Reset the failed transport before selecting a different node."""
+
+    config = make_config(tmp_path, transport="xet")
+    calls = 0
+    events: list[str] = []
+    manager = SimpleNamespace(
+        prepare_attempt=lambda: "allowed-0.1倍",
+    )
+
+    def failover() -> str:
+        events.append("failover")
+        return "next-0.1倍"
+
+    manager.failover = failover
+
+    def snapshot_fn(**kwargs: Any) -> str:
+        nonlocal calls
+        del kwargs
+        calls += 1
+        if calls == 1:
+            raise httpx.ConnectError("proxy connection failed")
+        return str(tmp_path)
+
+    downloader.download_with_retries(
+        config,
+        dry_run=False,
+        snapshot_fn=snapshot_fn,
+        sleep_fn=lambda delay: None,
+        close_session_fn=lambda: events.append("close_http"),
+        abort_xet_session_fn=lambda: events.append("abort_xet"),
+        node_manager=manager,
+    )
+
+    assert events == ["close_http", "abort_xet", "failover"]
+
+
+def test_retry_continues_when_xet_session_reset_fails(
+    tmp_path: Path,
+) -> None:
+    """Do not replace a retryable transfer failure with cleanup failure."""
+
+    config = make_config(tmp_path, transport="xet")
+    calls = 0
+
+    def snapshot_fn(**kwargs: Any) -> str:
+        nonlocal calls
+        del kwargs
+        calls += 1
+        if calls == 1:
+            raise httpx.ConnectError("proxy connection failed")
+        return str(tmp_path)
+
+    def abort_fn() -> None:
+        raise RuntimeError("cleanup failed")
+
+    result = downloader.download_with_retries(
+        config,
+        dry_run=False,
+        snapshot_fn=snapshot_fn,
+        sleep_fn=lambda delay: None,
+        close_session_fn=lambda: None,
+        abort_xet_session_fn=abort_fn,
+    )
+
+    assert result == str(tmp_path)
+    assert calls == 2
+
+
 def test_repeated_server_errors_trigger_node_failover(
     tmp_path: Path,
 ) -> None:
@@ -411,6 +555,7 @@ def test_retry_delay_is_capped(tmp_path: Path) -> None:
     assert downloader.retry_delay(config, 5) == 80.0
     assert downloader.retry_delay(config, 7) == 300.0
     assert downloader.retry_delay(config, 8) == 300.0
+    assert downloader.retry_delay(config, 10_000) == 300.0
 
 
 def test_help_reports_balanced_defaults() -> None:
@@ -429,6 +574,102 @@ def test_help_reports_balanced_defaults() -> None:
     assert "--repo REPO_ID --dest PATH" in result.stdout
     assert "pnpl/LibriBrain" not in result.stdout
     assert "7893" not in result.stdout
+
+
+def test_explicit_proxy_replaces_all_ambient_proxy_routes(
+    tmp_path: Path,
+) -> None:
+    """Route HTTPX and native Xet through the same explicit proxy."""
+
+    environment = proxy_probe_environment(tmp_path)
+    environment["ALL_PROXY"] = "socks5://127.0.0.1:12891"
+    environment["all_proxy"] = "socks5://127.0.0.1:12891"
+    environment["NO_PROXY"] = "huggingface.co"
+    environment["no_proxy"] = "us.aws.cdn.hf.co"
+    result = run_script(
+        "--repo",
+        "owner/dataset",
+        "--dest",
+        str((tmp_path / "dataset").resolve()),
+        "--proxy-port",
+        "7893",
+        env=environment,
+    )
+
+    assert result.returncode == 0
+    proxy_url = "http://127.0.0.1:7893"
+    for variable in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ):
+        assert f"{variable}={proxy_url}" in result.stdout
+    assert "NO_PROXY=unset" in result.stdout
+    assert "no_proxy=unset" in result.stdout
+
+
+def test_no_proxy_clears_all_ambient_proxy_routes(
+    tmp_path: Path,
+) -> None:
+    """Clear uppercase and lowercase proxy routes in direct mode."""
+
+    environment = proxy_probe_environment(tmp_path)
+    for variable in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ):
+        environment[variable] = "http://ambient.example:8080"
+    result = run_script(
+        "--repo",
+        "owner/dataset",
+        "--dest",
+        str((tmp_path / "dataset").resolve()),
+        "--no-proxy",
+        env=environment,
+    )
+
+    assert result.returncode == 0
+    for variable in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ):
+        assert f"{variable}=unset" in result.stdout
+
+
+def test_xet_uses_adaptive_concurrency_with_documented_range_default(
+    tmp_path: Path,
+) -> None:
+    """Avoid pinning Xet's adaptive controller to a low fixed value."""
+
+    environment = proxy_probe_environment(tmp_path)
+    environment["HF_XET_FIXED_DOWNLOAD_CONCURRENCY"] = "2"
+    result = run_script(
+        "--repo",
+        "owner/dataset",
+        "--dest",
+        str((tmp_path / "dataset").resolve()),
+        env=environment,
+    )
+
+    assert result.returncode == 0
+    assert "Xet ranges    : 16" in result.stdout
+    assert "HF_XET_NUM_CONCURRENT_RANGE_GETS=16" in result.stdout
+    assert "HF_XET_FIXED_DOWNLOAD_CONCURRENCY=unset" in result.stdout
+    assert (
+        "HF_XET_CLIENT_ENABLE_ADAPTIVE_CONCURRENCY=1"
+        in result.stdout
+    )
 
 
 @pytest.mark.parametrize(

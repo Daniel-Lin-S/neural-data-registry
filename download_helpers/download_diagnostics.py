@@ -63,6 +63,8 @@ SAFE_CONFIGURATION_KEYS = frozenset(
         "timeout",
         "transport",
         "version",
+        "xet_adaptive_concurrency",
+        "xet_range_concurrency",
     }
 )
 DEPENDENCY_PACKAGES = (

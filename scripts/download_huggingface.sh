@@ -34,7 +34,7 @@ readonly DEFAULT_TRANSPORT="xet"
 readonly DEFAULT_RETRY_ATTEMPTS="8"
 readonly DEFAULT_RETRY_BASE_DELAY="5"
 readonly DEFAULT_RETRY_MAX_DELAY="300"
-readonly DEFAULT_XET_RANGE_CONCURRENCY="2"
+readonly DEFAULT_XET_RANGE_CONCURRENCY="16"
 readonly DEFAULT_MIHOMO_PROBE_TIMEOUT="8"
 
 REPO_ID=""
@@ -257,13 +257,16 @@ configure_proxy()
 
         export HTTP_PROXY="${PROXY_URL}"
         export HTTPS_PROXY="${PROXY_URL}"
+        export ALL_PROXY="${PROXY_URL}"
         export http_proxy="${PROXY_URL}"
         export https_proxy="${PROXY_URL}"
+        export all_proxy="${PROXY_URL}"
+        unset NO_PROXY no_proxy || true
         return
     fi
 
-    unset HTTP_PROXY HTTPS_PROXY || true
-    unset http_proxy https_proxy || true
+    unset HTTP_PROXY HTTPS_PROXY ALL_PROXY || true
+    unset http_proxy https_proxy all_proxy || true
 }
 
 
@@ -277,8 +280,9 @@ configure_transport()
     fi
 
     export HF_HUB_DISABLE_XET=0
+    export HF_XET_CLIENT_ENABLE_ADAPTIVE_CONCURRENCY=1
+    unset HF_XET_FIXED_DOWNLOAD_CONCURRENCY || true
     export HF_XET_NUM_CONCURRENT_RANGE_GETS="${XET_RANGE_CONCURRENCY}"
-    export HF_XET_FIXED_DOWNLOAD_CONCURRENCY="${XET_RANGE_CONCURRENCY}"
 }
 
 
@@ -482,6 +486,7 @@ export DOWNLOAD_MAX_WORKERS="${MAX_WORKERS}"
 export DOWNLOAD_TIMEOUT="${TIMEOUT}"
 export DOWNLOAD_DRY_RUN="${DRY_RUN}"
 export DOWNLOAD_TRANSPORT="${TRANSPORT}"
+export DOWNLOAD_XET_RANGE_CONCURRENCY="${XET_RANGE_CONCURRENCY}"
 export DOWNLOAD_RETRY_ATTEMPTS="${RETRY_ATTEMPTS}"
 export DOWNLOAD_RETRY_BASE_DELAY="${RETRY_BASE_DELAY}"
 export DOWNLOAD_RETRY_MAX_DELAY="${RETRY_MAX_DELAY}"

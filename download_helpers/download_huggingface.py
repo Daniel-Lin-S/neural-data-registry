@@ -54,6 +54,7 @@ DEFAULT_MIHOMO_PROBE_TIMEOUT = 8.0
 SnapshotFunction = Callable[..., str | list[Any]]
 SleepFunction = Callable[[float], None]
 CloseSessionFunction = Callable[[], None]
+AbortXetSessionFunction = Callable[[], None]
 
 
 @dataclass(frozen=True)
@@ -76,6 +77,8 @@ class DownloadConfig:
         Whether to report pending files without downloading.
     transport : str
         File transport, either ``http`` or ``xet``.
+    xet_range_concurrency : int
+        Concurrent Xet range requests per file.
     retry_attempts : int
         Maximum complete-snapshot attempts.
     retry_base_delay : float
@@ -95,6 +98,7 @@ class DownloadConfig:
     timeout: float
     dry_run: bool
     transport: str
+    xet_range_concurrency: int
     retry_attempts: int
     retry_base_delay: float
     retry_max_delay: float
@@ -158,6 +162,9 @@ def load_config_from_environment() -> DownloadConfig:
         timeout=float(os.environ["DOWNLOAD_TIMEOUT"]),
         dry_run=os.environ["DOWNLOAD_DRY_RUN"] == "1",
         transport=os.environ["DOWNLOAD_TRANSPORT"],
+        xet_range_concurrency=int(
+            os.environ["DOWNLOAD_XET_RANGE_CONCURRENCY"]
+        ),
         retry_attempts=int(os.environ["DOWNLOAD_RETRY_ATTEMPTS"]),
         retry_base_delay=float(
             os.environ["DOWNLOAD_RETRY_BASE_DELAY"]
@@ -202,6 +209,7 @@ def validate_config(config: DownloadConfig) -> None:
         "timeout": config.timeout,
         "retry_base_delay": config.retry_base_delay,
         "retry_max_delay": config.retry_max_delay,
+        "xet_range_concurrency": config.xet_range_concurrency,
     }
     for name, value in positive_values.items():
         if value <= 0:
@@ -331,12 +339,69 @@ def call_snapshot(
     )
 
 
+def reset_download_sessions(
+    transport: str,
+    close_session_fn: CloseSessionFunction,
+    abort_xet_session_fn: AbortXetSessionFunction | None,
+) -> None:
+    """Discard transport state after a retryable network failure.
+
+    Parameters
+    ----------
+    transport : str
+        Active transport, either ``http`` or ``xet``.
+    close_session_fn : callable
+        Hugging Face HTTP session cleanup.
+    abort_xet_session_fn : callable or None
+        Native Xet session cleanup, optional. When omitted, load the cleanup
+        supplied by the installed Hugging Face Hub version.
+
+    Notes
+    -----
+    Cleanup failures are logged without replacing the retryable download
+    error. A stale native session otherwise returns its previous task error
+    immediately on every later snapshot attempt.
+    """
+
+    cleanup_functions: list[tuple[str, CloseSessionFunction]] = [
+        ("http", close_session_fn),
+    ]
+    if transport == "xet":
+        if abort_xet_session_fn is None:
+            try:
+                from huggingface_hub.utils._xet import (
+                    abort_xet_session,
+                )
+            except (AttributeError, ImportError) as error:
+                log_exception("xet_session_reset_unavailable", error)
+            else:
+                cleanup_functions.append(("xet", abort_xet_session))
+        else:
+            cleanup_functions.append(("xet", abort_xet_session_fn))
+
+    for session_name, cleanup_fn in cleanup_functions:
+        try:
+            cleanup_fn()
+        except Exception as error:  # noqa: BLE001
+            log_exception(
+                "download_session_reset_failed",
+                error,
+                session=session_name,
+            )
+        else:
+            log_event(
+                "download_session_reset",
+                session=session_name,
+            )
+
+
 def download_with_retries(
     config: DownloadConfig,
     dry_run: bool,
     snapshot_fn: SnapshotFunction = snapshot_download,
     sleep_fn: SleepFunction = time.sleep,
     close_session_fn: CloseSessionFunction = close_session,
+    abort_xet_session_fn: AbortXetSessionFunction | None = None,
     node_manager: MihomoNodeManager | None = None,
 ) -> str | list[Any]:
     """Run a resumable snapshot operation with bounded or unlimited retries.
@@ -351,6 +416,10 @@ def download_with_retries(
         Snapshot function, injectable for focused tests.
     sleep_fn : callable, optional
         Sleep function, injectable for focused tests.
+    close_session_fn : callable, optional
+        Hugging Face HTTP session cleanup, injectable for focused tests.
+    abort_xet_session_fn : callable or None, optional
+        Native Xet session cleanup, injectable for focused tests.
 
     Returns
     -------
@@ -371,7 +440,11 @@ def download_with_retries(
         lambda: call_snapshot(config, dry_run, snapshot_fn),
         transport=config.transport,
         node_manager=node_manager,
-        before_retry=close_session_fn,
+        before_retry=lambda: reset_download_sessions(
+            config.transport,
+            close_session_fn,
+            abort_xet_session_fn,
+        ),
         sleep_fn=sleep_fn,
     )
 
@@ -584,6 +657,8 @@ def diagnostic_configuration(config: DownloadConfig) -> dict[str, Any]:
         "retry_max_delay": config.retry_max_delay,
         "timeout": config.timeout,
         "transport": config.transport,
+        "xet_adaptive_concurrency": True,
+        "xet_range_concurrency": config.xet_range_concurrency,
     }
 
 

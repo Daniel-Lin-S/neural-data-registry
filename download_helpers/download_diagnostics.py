@@ -52,6 +52,7 @@ SAFE_CONFIGURATION_KEYS = frozenset(
         "destination",
         "dry_run",
         "endpoint",
+        "http_accept_encoding",
         "max_workers",
         "provider",
         "proxy_url",

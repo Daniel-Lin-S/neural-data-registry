@@ -50,11 +50,17 @@ from mihomo_ranker import (
 )
 
 DEFAULT_MIHOMO_PROBE_TIMEOUT = 8.0
+HTTP_ACCEPT_ENCODING = "identity"
 
 SnapshotFunction = Callable[..., str | list[Any]]
+SnapshotResultValidator = Callable[[str | list[Any]], None]
 SleepFunction = Callable[[float], None]
 CloseSessionFunction = Callable[[], None]
 AbortXetSessionFunction = Callable[[], None]
+
+
+class IncompleteSnapshotVerificationError(ConnectionError):
+    """Represent a snapshot that still has remote files pending."""
 
 
 @dataclass(frozen=True)
@@ -262,6 +268,8 @@ def configure_http_client(timeout: float) -> None:
     -----
     File bodies also use this client in HTTP mode. Xet file bodies use Xet's
     separate network stack, while metadata continues to use this client.
+    Identity encoding avoids unrecoverable partial Brotli representations
+    returned by an upstream server or proxy cache.
     """
 
     ssl_context = ssl.create_default_context()
@@ -272,6 +280,7 @@ def configure_http_client(timeout: float) -> None:
         """Create the shared Hugging Face HTTPX client."""
 
         return httpx.Client(
+            headers={"Accept-Encoding": HTTP_ACCEPT_ENCODING},
             verify=ssl_context,
             trust_env=True,
             follow_redirects=True,
@@ -403,6 +412,7 @@ def download_with_retries(
     close_session_fn: CloseSessionFunction = close_session,
     abort_xet_session_fn: AbortXetSessionFunction | None = None,
     node_manager: MihomoNodeManager | None = None,
+    result_validator: SnapshotResultValidator | None = None,
 ) -> str | list[Any]:
     """Run a resumable snapshot operation with bounded or unlimited retries.
 
@@ -420,6 +430,8 @@ def download_with_retries(
         Hugging Face HTTP session cleanup, injectable for focused tests.
     abort_xet_session_fn : callable or None, optional
         Native Xet session cleanup, injectable for focused tests.
+    result_validator : callable or None, optional
+        Validation executed inside the retry boundary, default ``None``.
 
     Returns
     -------
@@ -434,10 +446,17 @@ def download_with_retries(
     """
 
     operation = "verification" if dry_run else "download"
+
+    def attempt_snapshot() -> str | list[Any]:
+        result = call_snapshot(config, dry_run, snapshot_fn)
+        if result_validator is not None:
+            result_validator(result)
+        return result
+
     return run_with_retries(
         config,
         operation,
-        lambda: call_snapshot(config, dry_run, snapshot_fn),
+        attempt_snapshot,
         transport=config.transport,
         node_manager=node_manager,
         before_retry=lambda: reset_download_sessions(
@@ -558,7 +577,7 @@ def verify_complete(records: list[Any]) -> None:
 
     Raises
     ------
-    RuntimeError
+    IncompleteSnapshotVerificationError
         If one or more files still require download.
     """
 
@@ -567,11 +586,39 @@ def verify_complete(records: list[Any]) -> None:
         return
 
     first_filename = getattr(pending[0], "filename", "<unknown>")
-    raise RuntimeError(
+    raise IncompleteSnapshotVerificationError(
         "download verification found "
         f"{len(pending)} pending files; first pending file: "
         f"{first_filename}."
     )
+
+
+def require_download_path(result: str | list[Any]) -> str:
+    """Return the non-empty path produced by a snapshot download."""
+
+    if not isinstance(result, str) or not result:
+        raise TypeError(
+            "expected snapshot_download() to return a non-empty path, "
+            f"but got {result!r}."
+        )
+    return result
+
+
+def verify_download_result(
+    config: DownloadConfig,
+    result: str | list[Any],
+    snapshot_fn: SnapshotFunction = snapshot_download,
+) -> None:
+    """Verify one downloaded snapshot inside its retry attempt."""
+
+    require_download_path(result)
+    verification_result = call_snapshot(
+        config,
+        True,
+        snapshot_fn,
+    )
+    records = require_dry_run_records(verification_result)
+    verify_complete(records)
 
 
 def run(config: DownloadConfig) -> None:
@@ -616,25 +663,15 @@ def run(config: DownloadConfig) -> None:
             config,
             dry_run=False,
             node_manager=node_manager,
+            result_validator=lambda candidate: verify_download_result(
+                config,
+                candidate,
+            ),
         )
-        if not isinstance(result, str) or not result:
-            raise TypeError(
-                "expected snapshot_download() to return a non-empty path, "
-                f"but got {result!r}."
-            )
-
-        verification_result = download_with_retries(
-            config,
-            dry_run=True,
-            node_manager=node_manager,
-        )
-        verification_records = require_dry_run_records(
-            verification_result
-        )
-        verify_complete(verification_records)
+        download_path = require_download_path(result)
 
         print()
-        print(f"Download location: {result}")
+        print(f"Download location: {download_path}")
         print("Verification     : complete")
     finally:
         if node_manager is not None:
@@ -648,6 +685,7 @@ def diagnostic_configuration(config: DownloadConfig) -> dict[str, Any]:
         "destination": config.destination,
         "dry_run": config.dry_run,
         "endpoint": config.endpoint,
+        "http_accept_encoding": HTTP_ACCEPT_ENCODING,
         "max_workers": config.max_workers,
         "provider": "huggingface",
         "proxy_url": config.proxy_url,

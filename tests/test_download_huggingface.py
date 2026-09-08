@@ -9,6 +9,7 @@ import ssl
 import subprocess
 import sys
 import urllib.error
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -26,6 +27,16 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = REPOSITORY_ROOT / "scripts" / "download_huggingface.sh"
 MODULE_PATH = (
     REPOSITORY_ROOT / "download_helpers" / "download_huggingface.py"
+)
+XET_SIGNED_STORAGE_403_PREFIX = (
+    "Task error: File reconstruction error: CAS Client Error: "
+    "Request error: HTTP status client error (403 Forbidden), "
+    "domain: "
+)
+XET_SIGNED_CDN_403_MESSAGE = (
+    XET_SIGNED_STORAGE_403_PREFIX
+    + "https://us.aws.cdn.hf.co/xorbs/default/"
+    "d8fa4a5b043efce85f851389de18276ed"
 )
 
 
@@ -324,6 +335,27 @@ def test_retry_closes_stale_hugging_face_session(tmp_path: Path) -> None:
     assert close_calls == 1
 
 
+def test_http_client_disables_compressed_responses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Avoid repeatedly decoding a corrupted Brotli representation."""
+
+    factories: list[Callable[[], httpx.Client]] = []
+    monkeypatch.setattr(
+        downloader,
+        "set_client_factory",
+        factories.append,
+    )
+
+    downloader.configure_http_client(30.0)
+
+    client = factories[0]()
+    try:
+        assert client.headers["Accept-Encoding"] == "identity"
+    finally:
+        client.close()
+
+
 def test_retry_aborts_stale_xet_session(tmp_path: Path) -> None:
     """Create a fresh native Xet session after a network failure."""
 
@@ -366,12 +398,17 @@ def test_retry_aborts_stale_xet_session(tmp_path: Path) -> None:
     assert abort_calls == 1
 
 
-def test_xet_session_is_aborted_before_mihomo_failover(
+def assert_unlimited_xet_retry_recovers(
     tmp_path: Path,
+    error: Exception,
 ) -> None:
-    """Reset the failed transport before selecting a different node."""
+    """Assert retry cleanup, failover, and resumable recovery."""
 
-    config = make_config(tmp_path, transport="xet")
+    config = make_config(
+        tmp_path,
+        retry_attempts=0,
+        transport="xet",
+    )
     calls = 0
     events: list[str] = []
     manager = SimpleNamespace(
@@ -389,10 +426,10 @@ def test_xet_session_is_aborted_before_mihomo_failover(
         del kwargs
         calls += 1
         if calls == 1:
-            raise httpx.ConnectError("proxy connection failed")
+            raise error
         return str(tmp_path)
 
-    downloader.download_with_retries(
+    result = downloader.download_with_retries(
         config,
         dry_run=False,
         snapshot_fn=snapshot_fn,
@@ -402,7 +439,104 @@ def test_xet_session_is_aborted_before_mihomo_failover(
         node_manager=manager,
     )
 
+    assert result == str(tmp_path)
+    assert calls == 2
     assert events == ["close_http", "abort_xet", "failover"]
+
+
+def test_xet_session_is_aborted_before_mihomo_failover(
+    tmp_path: Path,
+) -> None:
+    """Reset the failed transport before selecting a different node."""
+
+    assert_unlimited_xet_retry_recovers(
+        tmp_path,
+        httpx.ConnectError("proxy connection failed"),
+    )
+
+
+def test_unlimited_retry_recovers_from_signed_xet_cdn_403(
+    tmp_path: Path,
+) -> None:
+    """Refresh Xet state after an expired signed Xorb request."""
+
+    assert_unlimited_xet_retry_recovers(
+        tmp_path,
+        RuntimeError(XET_SIGNED_CDN_403_MESSAGE),
+    )
+
+
+def test_unlimited_retry_recovers_from_httpx_decoding_error(
+    tmp_path: Path,
+) -> None:
+    """Retry the Brotli response failure observed in the LibriBrain log."""
+
+    decoder_cause = ValueError(
+        "decoder process called after accepting the response body"
+    )
+    decoding_error = httpx.DecodingError(
+        "brotli: decoder process called with data when "
+        "'can_accept_more_data()' is False"
+    )
+    decoding_error.__cause__ = decoder_cause
+
+    assert_unlimited_xet_retry_recovers(tmp_path, decoding_error)
+
+
+def test_signed_xet_cdn_403_is_not_generic_http_retry() -> None:
+    """Restrict signed-Xorb recovery to the native Xet transport."""
+
+    error = RuntimeError(XET_SIGNED_CDN_403_MESSAGE)
+
+    assert downloader.is_retryable_download_error(error, "xet")
+    assert not downloader.is_retryable_download_error(error, "http")
+
+
+@pytest.mark.parametrize(
+    "storage_url",
+    (
+        "https://us.gcp.cdn.hf.co/xet-bridge-us/owner/repo/hash",
+        "https://transfer.xethub.hf.co/xorbs/default/hash",
+    ),
+)
+def test_signed_xet_storage_hosts_are_retried(
+    storage_url: str,
+) -> None:
+    """Retry signed reconstruction failures from every Xet storage host."""
+
+    error = RuntimeError(
+        f"{XET_SIGNED_STORAGE_403_PREFIX}{storage_url}"
+    )
+
+    assert downloader.is_retryable_download_error(error, "xet")
+
+
+def test_structured_signed_xet_storage_403_is_retried() -> None:
+    """Prefer signed-storage recovery over a generic terminal 403."""
+
+    storage_url = (
+        "https://transfer.xethub.hf.co/xorbs/default/hash"
+    )
+    request = httpx.Request("GET", storage_url)
+    response = httpx.Response(403, request=request)
+    error = HfHubHTTPError(
+        f"{XET_SIGNED_STORAGE_403_PREFIX}{storage_url}",
+        response=response,
+    )
+
+    assert downloader.is_retryable_download_error(error, "xet")
+
+
+def test_xet_api_permission_403_stays_terminal() -> None:
+    """Do not confuse Hub authorization with signed CDN expiration."""
+
+    error = RuntimeError(
+        "Request error: HTTP status client error (403 Forbidden), "
+        "domain: https://huggingface.co/api/datasets/owner/dataset/"
+        "xet-read-token/main"
+    )
+
+    assert not downloader.is_retryable_download_error(error, "xet")
 
 
 def test_retry_continues_when_xet_session_reset_fails(
@@ -481,6 +615,7 @@ def test_terminal_http_status_is_not_retried(status_code: int) -> None:
 
     error = hub_error(status_code)
     assert not downloader.is_retryable_download_error(error, "http")
+    assert not downloader.is_retryable_download_error(error, "xet")
 
 
 @pytest.mark.parametrize("status_code", [408, 425, 429, 500, 502, 599])
@@ -539,8 +674,62 @@ def test_verification_rejects_pending_files() -> None:
         will_download=True,
     )
 
-    with pytest.raises(RuntimeError, match="1 pending files"):
+    with pytest.raises(
+        downloader.IncompleteSnapshotVerificationError,
+        match="1 pending files",
+    ):
         downloader.verify_complete([record])
+
+
+def test_unlimited_retry_redownloads_incomplete_snapshot(
+    tmp_path: Path,
+) -> None:
+    """Repeat the download when post-download verification is incomplete."""
+
+    config = make_config(
+        tmp_path,
+        retry_attempts=0,
+        transport="xet",
+    )
+    download_calls = 0
+    verification_calls = 0
+    resets: list[str] = []
+
+    def snapshot_fn(**kwargs: Any) -> str | list[Any]:
+        nonlocal download_calls, verification_calls
+        if kwargs["dry_run"]:
+            verification_calls += 1
+            return [
+                SimpleNamespace(
+                    filename="large.fif",
+                    file_size=100,
+                    will_download=verification_calls == 1,
+                )
+            ]
+        download_calls += 1
+        return str(tmp_path)
+
+    def validate(result: str | list[Any]) -> None:
+        downloader.verify_download_result(
+            config,
+            result,
+            snapshot_fn,
+        )
+
+    result = downloader.download_with_retries(
+        config,
+        dry_run=False,
+        snapshot_fn=snapshot_fn,
+        sleep_fn=lambda _delay: None,
+        close_session_fn=lambda: resets.append("http"),
+        abort_xet_session_fn=lambda: resets.append("xet"),
+        result_validator=validate,
+    )
+
+    assert result == str(tmp_path)
+    assert download_calls == 2
+    assert verification_calls == 2
+    assert resets == ["http", "xet"]
 
 
 def test_retry_delay_is_capped(tmp_path: Path) -> None:

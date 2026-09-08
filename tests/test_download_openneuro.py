@@ -62,6 +62,52 @@ def make_config(
     )
 
 
+def install_git_metadata_stub(
+    monkeypatch: pytest.MonkeyPatch,
+    config: Any,
+    *,
+    head: str = "0123456789abcdef",
+    origin: str | None = None,
+    annex_uuid: str = "annex-uuid",
+    version: str | None = None,
+) -> list[list[str]]:
+    """Install a deterministic Git metadata runner for one checkout."""
+
+    commands: list[list[str]] = []
+    values = {
+        ("rev-parse", "--verify", "HEAD"): head,
+        ("config", "--get", "remote.origin.url"): (
+            origin
+            if origin is not None
+            else downloader.repository_url(config)
+        ),
+        ("config", "--get", "annex.uuid"): annex_uuid,
+        ("describe", "--tags", "--exact-match"): (
+            version
+            if version is not None
+            else config.version or ""
+        ),
+    }
+
+    def fake_run(
+        command: Sequence[str],
+        **kwargs: Any,
+    ) -> subprocess.CompletedProcess[str]:
+        del kwargs
+        commands.append(list(command))
+        arguments = tuple(command[3:])
+        value = values.get(arguments, "")
+        return subprocess.CompletedProcess(
+            command,
+            0 if value else 1,
+            stdout=f"{value}\n" if value else "",
+            stderr="" if value else "metadata unavailable\n",
+        )
+
+    monkeypatch.setattr(downloader.subprocess, "run", fake_run)
+    return commands
+
+
 def run_script(
     *arguments: str,
     env: dict[str, str] | None = None,
@@ -177,15 +223,44 @@ def test_clone_command_uses_default_snapshot_without_version(
     assert "--branch" not in downloader.clone_command(config)
 
 
-def test_install_retry_reuses_successfully_cloned_destination(
+def test_clone_workspaces_are_unique_destination_siblings(
+    tmp_path: Path,
+) -> None:
+    """Create a distinct sibling staging root for every invocation."""
+
+    config = make_config(tmp_path)
+    first = downloader.create_clone_workspace(config)
+    second = downloader.create_clone_workspace(config)
+    try:
+        assert first.staging_root is not None
+        assert second.staging_root is not None
+        assert first.staging_root != second.staging_root
+        assert first.staging_root.parent == Path(config.destination).parent
+        assert second.staging_root.parent == Path(config.destination).parent
+        assert first.staged_destination == (
+            first.staging_root / downloader.STAGED_DATASET_NAME
+        )
+    finally:
+        downloader.cleanup_clone_workspace(first)
+        downloader.cleanup_clone_workspace(second)
+
+
+def test_partial_staged_clone_is_replaced_on_retry(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Reuse a valid destination created before an install command failed."""
+    """Delete only an owned partial clone before retrying the install."""
 
-    config = make_config(tmp_path)
+    config = replace(
+        make_config(tmp_path),
+        retry_attempts=0,
+        retry_base_delay=0.001,
+        retry_max_delay=0.001,
+    )
+    install_git_metadata_stub(monkeypatch, config)
+    workspace = downloader.create_clone_workspace(config)
+    staging_root = workspace.staging_root
     calls: list[list[str]] = []
-    validations: list[str] = []
 
     def runner(
         command: Sequence[str],
@@ -193,20 +268,143 @@ def test_install_retry_reuses_successfully_cloned_destination(
     ) -> str:
         del environment
         calls.append(list(command))
-        Path(config.destination).mkdir()
+        staged_destination = Path(command[-1])
+        assert staged_destination == workspace.staged_destination
+        if len(calls) == 1:
+            staged_destination.mkdir()
+            (staged_destination / "partial").write_text(
+                "incomplete",
+                encoding="utf-8",
+            )
+            raise downloader.NetworkCommandError("clone disconnected")
+        assert not staged_destination.exists()
+        (staged_destination / ".git").mkdir(parents=True)
+        return ""
+
+    try:
+        downloader.run_with_retries(
+            config,
+            "OpenNeuro repository clone",
+            lambda: downloader.install_dataset_once(
+                config,
+                runner,
+                workspace,
+            ),
+            transport="datalad",
+            sleep_fn=lambda _delay: None,
+        )
+
+        destination = Path(config.destination)
+        assert len(calls) == 2
+        assert (destination / ".git").is_dir()
+        assert not (destination / "partial").exists()
+    finally:
+        downloader.cleanup_clone_workspace(workspace)
+
+    assert staging_root is not None
+    assert not staging_root.exists()
+
+
+def test_valid_staged_clone_is_promoted_after_runner_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Keep a complete clone when DataLad reports a trailing error."""
+
+    config = make_config(tmp_path)
+    install_git_metadata_stub(monkeypatch, config)
+    workspace = downloader.create_clone_workspace(config)
+    calls = 0
+
+    def runner(
+        command: Sequence[str],
+        environment: dict[str, str],
+    ) -> str:
+        nonlocal calls
+        del environment
+        calls += 1
+        (Path(command[-1]) / ".git").mkdir(parents=True)
         raise downloader.NetworkCommandError("annex setup timed out")
 
-    def validate(candidate: Any) -> None:
-        validations.append(candidate.destination)
+    try:
+        downloader.install_dataset_once(config, runner, workspace)
+    finally:
+        downloader.cleanup_clone_workspace(workspace)
 
-    monkeypatch.setattr(downloader, "validate_existing_dataset", validate)
+    assert calls == 1
+    assert (Path(config.destination) / ".git").is_dir()
 
-    with pytest.raises(downloader.NetworkCommandError):
-        downloader.install_dataset_once(config, runner)
-    downloader.install_dataset_once(config, runner)
 
-    assert len(calls) == 1
-    assert validations == [config.destination]
+def test_preexisting_invalid_destination_is_preserved(
+    tmp_path: Path,
+) -> None:
+    """Reject an initial conflicting destination without modifying it."""
+
+    config = make_config(tmp_path)
+    destination = Path(config.destination)
+    destination.mkdir()
+    sentinel = destination / "keep.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+    workspace = downloader.create_clone_workspace(config)
+
+    def runner(
+        command: Sequence[str],
+        environment: dict[str, str],
+    ) -> str:
+        del command, environment
+        raise AssertionError("provider command must not run")
+
+    with pytest.raises(FileExistsError, match="not a DataLad dataset"):
+        downloader.install_dataset_once(config, runner, workspace)
+    downloader.cleanup_clone_workspace(workspace)
+
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+    assert workspace.staging_root is None
+
+
+def test_destination_race_is_preserved_and_terminal(tmp_path: Path) -> None:
+    """Refuse promotion when a destination appears during this invocation."""
+
+    config = make_config(tmp_path)
+    workspace = downloader.create_clone_workspace(config)
+    destination = Path(config.destination)
+    destination.mkdir()
+    sentinel = destination / "keep.txt"
+    sentinel.write_text("keep", encoding="utf-8")
+
+    def runner(
+        command: Sequence[str],
+        environment: dict[str, str],
+    ) -> str:
+        del command, environment
+        raise AssertionError("provider command must not run")
+
+    try:
+        with pytest.raises(FileExistsError, match="appeared while cloning"):
+            downloader.install_dataset_once(config, runner, workspace)
+    finally:
+        downloader.cleanup_clone_workspace(workspace)
+
+    assert sentinel.read_text(encoding="utf-8") == "keep"
+    assert workspace.staging_root is not None
+    assert not workspace.staging_root.exists()
+
+
+def test_atomic_promotion_does_not_replace_empty_destination(
+    tmp_path: Path,
+) -> None:
+    """Use a no-clobber rename even when the competing path is empty."""
+
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.mkdir()
+    destination.mkdir()
+
+    with pytest.raises(FileExistsError):
+        downloader.rename_without_replacement(source, destination)
+
+    assert source.is_dir()
+    assert destination.is_dir()
 
 
 def test_retrieve_content_passes_worker_count(tmp_path: Path) -> None:
@@ -282,18 +480,124 @@ def test_network_command_failures_are_retryable(message: str) -> None:
 
 @pytest.mark.parametrize(
     "message",
+    ["", "transfer helper exited without a recognized diagnostic"],
+)
+def test_unknown_provider_command_failure_is_retryable(message: str) -> None:
+    """Retry provider subprocess failures without known terminal evidence."""
+
+    error = downloader.classify_command_failure(["datalad"], 1, message)
+
+    assert isinstance(error, downloader.NetworkCommandError)
+
+
+@pytest.mark.parametrize(
+    "message",
     [
         "authentication failed",
         "repository not found",
         "no space left on device",
         "permission denied",
+        (
+            "destination path 'dataset' already exists and is not an "
+            "empty directory"
+        ),
+        "path not associated with any dataset",
+        "fatal: not a git repository",
+        "Target path already exists and not empty, refuse to clone into",
+        "fatal: couldn't find remote ref 9.9.9",
     ],
 )
 def test_terminal_command_failures_stay_terminal(message: str) -> None:
     """Do not hide credentials, dataset, or local storage errors in retries."""
 
     error = downloader.classify_command_failure(["datalad"], 1, message)
-    assert type(error) is RuntimeError
+    assert type(error) is downloader.TerminalDownloadError
+
+
+def test_missing_annex_content_is_retryable(tmp_path: Path) -> None:
+    """Treat an incomplete annex result as an interrupted transfer."""
+
+    config = make_config(tmp_path)
+    outputs = iter(["", "sub-01/eeg/file.edf\n"])
+
+    def runner(
+        command: Sequence[str],
+        environment: dict[str, str],
+    ) -> str:
+        del command, environment
+        return next(outputs)
+
+    with pytest.raises(
+        downloader.NetworkCommandError,
+        match="1 unavailable annex files",
+    ):
+        downloader.retrieve_and_verify_content_once(config, runner)
+
+
+def test_run_retries_retrieval_verification_with_datalad_transport(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Keep retrieval and annex verification in one DataLad retry unit."""
+
+    config = replace(
+        make_config(tmp_path),
+        retry_attempts=2,
+        retry_base_delay=0.001,
+        retry_max_delay=0.001,
+    )
+    original_run_with_retries = downloader.run_with_retries
+    transports: list[str] = []
+    retrieval_attempts = 0
+    verification_attempts = 0
+
+    def run_immediately(
+        retry_config: Any,
+        operation: str,
+        callback: Any,
+        *,
+        transport: str = "http",
+        node_manager: Any = None,
+    ) -> Any:
+        transports.append(transport)
+        return original_run_with_retries(
+            retry_config,
+            operation,
+            callback,
+            transport=transport,
+            node_manager=node_manager,
+            sleep_fn=lambda _delay: None,
+        )
+
+    def runner(
+        command: Sequence[str],
+        environment: dict[str, str],
+    ) -> str:
+        nonlocal retrieval_attempts, verification_attempts
+        del environment
+        if "get" in command:
+            retrieval_attempts += 1
+            return ""
+        if "find" in command:
+            verification_attempts += 1
+            if verification_attempts == 1:
+                return "sub-01/eeg/file.edf\n"
+            return ""
+        raise AssertionError(f"unexpected command: {command!r}")
+
+    monkeypatch.setattr(downloader, "check_dependencies", lambda: None)
+    monkeypatch.setattr(downloader, "install_dataset_once", lambda *_: None)
+    monkeypatch.setattr(
+        downloader,
+        "run_with_retries",
+        run_immediately,
+    )
+
+    downloader.run(config, runner)
+
+    assert transports == ["datalad", "datalad"]
+    assert retrieval_attempts == 2
+    assert verification_attempts == 2
 
 
 def test_mihomo_ranking_requires_serial_datalad_jobs(tmp_path: Path) -> None:
@@ -381,3 +685,295 @@ def test_no_proxy_clears_ambient_proxy(tmp_path: Path) -> None:
 
     assert result.returncode == 0
     assert "stub:|unset" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("return_code", "message"),
+    (
+        (2, "connection reset while parsing arguments"),
+        (126, "permission denied"),
+        (127, "command not found"),
+        (129, "usage: git clone [options]"),
+        (130, "connection reset by peer"),
+        (-9, "command produced no diagnostic output"),
+    ),
+)
+def test_deterministic_command_exit_is_terminal(
+    return_code: int,
+    message: str,
+) -> None:
+    """Do not retry usage, missing-command, or signal exits."""
+
+    error = downloader.classify_command_failure(
+        ["datalad"],
+        return_code,
+        message,
+    )
+
+    assert type(error) is downloader.TerminalDownloadError
+
+
+@pytest.mark.parametrize(
+    "message",
+    (
+        "remote HEAD refers to nonexistent ref",
+        "not enough free space to retrieve content",
+        "curl: (3) URL rejected: malformed input",
+        "pathspec 'missing' did not match any file known to git",
+        "Traceback (most recent call last): TypeError: invalid state",
+        (
+            "server certificate verification failed. CAfile: none "
+            "CRLfile: none"
+        ),
+        "curl: (60) SSL peer certificate or SSH remote key was not OK",
+        "fatal: Operation not permitted",
+        "fatal: File name too long",
+        "fatal: Filename too long",
+        "fatal: Is a directory",
+    ),
+)
+def test_deterministic_command_message_is_terminal(message: str) -> None:
+    """Recognize deterministic provider diagnostics before retrying."""
+
+    error = downloader.classify_command_failure(["datalad"], 1, message)
+
+    assert type(error) is downloader.TerminalDownloadError
+
+
+@pytest.mark.parametrize(
+    "message",
+    (
+        "CONNECT tunnel failed, response 407",
+        "curl: (56) Received HTTP code 407 from proxy after CONNECT",
+        "All offered SOCKS5 authentication methods were rejected",
+    ),
+)
+def test_proxy_authentication_command_failure_is_terminal(
+    message: str,
+) -> None:
+    """Stop retries for explicit proxy authentication failures."""
+
+    error = downloader.classify_command_failure(["datalad"], 1, message)
+    decision = downloader.classify_download_error(error, "datalad")
+
+    assert type(error) is downloader.TerminalDownloadError
+    assert not decision.retryable
+
+
+def test_decorated_missing_remote_branch_is_terminal() -> None:
+    """Recognize the missing-branch message inside DataLad decoration."""
+
+    output = (
+        "[ERROR] Failed to clone dataset [status=error]\n"
+        "stderr='fatal: Remote branch 9.9.9 not found in upstream "
+        "origin']]"
+    )
+    assert "\n" in output
+
+    error = downloader.classify_command_failure(["datalad"], 1, output)
+
+    assert type(error) is downloader.TerminalDownloadError
+
+
+def test_other_remote_branch_failure_remains_retryable() -> None:
+    """Do not make unrelated remote-branch transfer failures terminal."""
+
+    output = (
+        "Remote branch 9.9.9 lookup failed after upstream origin timed out"
+    )
+
+    error = downloader.classify_command_failure(["datalad"], 1, output)
+
+    assert isinstance(error, downloader.NetworkCommandError)
+
+
+def test_terminal_command_type_overrides_network_words() -> None:
+    """Keep a local provider failure terminal despite proxy text."""
+
+    error = downloader.classify_command_failure(
+        ["datalad"],
+        1,
+        "not enough free space; proxy connection failed",
+    )
+    decision = downloader.classify_download_error(error, "datalad")
+
+    assert type(error) is downloader.TerminalDownloadError
+    assert not decision.retryable
+    assert decision.reason == "terminal_exception"
+
+
+def test_unknown_provider_traceback_is_retryable() -> None:
+    """Retry future transfer exceptions not known to be deterministic."""
+
+    error = downloader.classify_command_failure(
+        ["datalad"],
+        1,
+        "Traceback (most recent call last): "
+        "NewTransferError: provider stream failed",
+    )
+
+    assert isinstance(error, downloader.NetworkCommandError)
+
+
+def test_warning_filesystem_text_does_not_mask_network_failure() -> None:
+    """Ignore DataLad warning records when a later transfer record fails."""
+
+    output = (
+        "[WARNING] Failed to (re)set permissions: OSError: [Errno 30] "
+        "Read-only file system\n"
+        "error: RPC failed; curl 56 Recv failure: Connection reset by peer"
+    )
+
+    error = downloader.classify_command_failure(["datalad"], 1, output)
+
+    assert isinstance(error, downloader.NetworkCommandError)
+
+
+def test_http_status_on_another_record_does_not_override_auth() -> None:
+    """Keep fatal authentication terminal despite an earlier HTTP 503."""
+
+    output = "mirror: server returned status 503\nfatal: authentication failed"
+
+    error = downloader.classify_command_failure(["datalad"], 1, output)
+    assert type(error) is downloader.TerminalDownloadError
+
+
+def test_server_status_overrides_terminal_looking_command_text(
+    tmp_path: Path,
+) -> None:
+    """Retry a real server error even when its body mentions a repository."""
+
+    config = replace(
+        make_config(tmp_path),
+        retry_attempts=2,
+        retry_base_delay=0.001,
+        retry_max_delay=0.001,
+    )
+    error = downloader.classify_command_failure(
+        ["datalad"],
+        1,
+        "server returned status 503: repository not found",
+    )
+    calls = 0
+
+    def callback() -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise error
+        return "complete"
+
+    result = downloader.run_with_retries(
+        config,
+        "OpenNeuro test transfer",
+        callback,
+        transport="datalad",
+        sleep_fn=lambda _delay: None,
+    )
+
+    assert result == "complete"
+    assert calls == 2
+
+
+def test_unversioned_existing_checkout_requires_valid_head(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Reject a clone directory left before Git created HEAD."""
+
+    config = make_config(tmp_path, version=None)
+    destination = Path(config.destination)
+    (destination / ".git").mkdir(parents=True)
+    commands = install_git_metadata_stub(
+        monkeypatch,
+        config,
+        head="",
+    )
+
+    with pytest.raises(FileExistsError, match="could not read Git HEAD"):
+        downloader.validate_existing_dataset(config)
+
+    assert commands == [
+        [
+            "git",
+            "-C",
+            config.destination,
+            "rev-parse",
+            "--verify",
+            "HEAD",
+        ]
+    ]
+
+
+def test_unversioned_existing_checkout_reuses_valid_head(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Reuse a successfully cloned unversioned repository."""
+
+    config = make_config(tmp_path, version=None)
+    destination = Path(config.destination)
+    (destination / ".git").mkdir(parents=True)
+    commands = install_git_metadata_stub(monkeypatch, config)
+
+    downloader.validate_existing_dataset(config)
+
+    assert [command[3:] for command in commands] == [
+        ["rev-parse", "--verify", "HEAD"],
+        ["config", "--get", "remote.origin.url"],
+        ["config", "--get", "annex.uuid"],
+    ]
+
+
+def test_existing_checkout_rejects_different_origin(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Do not reuse a valid Git repository for another dataset."""
+
+    config = make_config(tmp_path, version=None)
+    destination = Path(config.destination)
+    (destination / ".git").mkdir(parents=True)
+    install_git_metadata_stub(
+        monkeypatch,
+        config,
+        origin=(
+            "https://github.com/OpenNeuroDatasets/"
+            "ds000001.git"
+        ),
+    )
+
+    with pytest.raises(FileExistsError, match="different repository"):
+        downloader.validate_existing_dataset(config)
+
+
+def test_existing_checkout_requires_git_annex_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Reject an ordinary Git clone without initialized annex state."""
+
+    config = make_config(tmp_path, version=None)
+    destination = Path(config.destination)
+    (destination / ".git").mkdir(parents=True)
+    install_git_metadata_stub(
+        monkeypatch,
+        config,
+        annex_uuid="",
+    )
+
+    with pytest.raises(FileExistsError, match="git-annex UUID"):
+        downloader.validate_existing_dataset(config)
+
+
+def test_repository_url_identity_accepts_git_syntax() -> None:
+    """Treat common Git URL spellings as the same repository."""
+
+    https_url = (
+        "https://github.com/OpenNeuroDatasets/ds005261.git"
+    )
+    ssh_url = "git@github.com:OpenNeuroDatasets/ds005261.git"
+
+    assert downloader.normalized_repository_url(https_url) == (
+        downloader.normalized_repository_url(ssh_url)
+    )

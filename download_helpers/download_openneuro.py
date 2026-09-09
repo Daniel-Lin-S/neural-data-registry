@@ -10,7 +10,9 @@ Output
 ------
 A DataLad dataset is installed beneath the absolute destination. Snapshot tags
 are pinned when supplied, annexed content is retrieved with bounded jobs, and
-existing git-annex state is reused by later attempts and invocations.
+existing git-annex state is reused by later attempts and invocations. Optional
+repository-relative git-annex globs can omit content from the current run while
+leaving its tracked paths available for later retrieval.
 """
 
 from __future__ import annotations
@@ -169,6 +171,8 @@ class DownloadConfig:
         Explicit HTTP or SOCKS proxy URL, optional.
     mihomo : MihomoConfig or None
         Mihomo ranking configuration, optional.
+    exclude_patterns : tuple of str
+        Repository-relative git-annex globs omitted from retrieval.
     """
 
     dataset_id: str
@@ -183,6 +187,7 @@ class DownloadConfig:
     retry_max_delay: float
     proxy_url: str | None
     mihomo: MihomoConfig | None
+    exclude_patterns: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -199,6 +204,13 @@ def optional_environment(name: str) -> str | None:
 
     value = os.environ.get(name, "")
     return value or None
+
+
+def load_exclude_patterns() -> tuple[str, ...]:
+    """Load newline-delimited OpenNeuro annex exclusion patterns."""
+
+    value = os.environ.get("DOWNLOAD_EXCLUDE_PATTERNS", "")
+    return tuple(line for line in value.splitlines() if line)
 
 
 def parse_repository(value: str) -> RepositoryReference:
@@ -286,6 +298,7 @@ def load_config_from_environment() -> DownloadConfig:
         retry_max_delay=float(os.environ["DOWNLOAD_RETRY_MAX_DELAY"]),
         proxy_url=optional_environment("DOWNLOAD_PROXY_URL"),
         mihomo=load_mihomo_config(),
+        exclude_patterns=load_exclude_patterns(),
     )
     validate_config(config)
     return config
@@ -333,6 +346,21 @@ def validate_config(config: DownloadConfig) -> None:
             "Mihomo ranking requires max_workers=1 so node failover does "
             "not interrupt concurrent DataLad jobs."
         )
+    if len(set(config.exclude_patterns)) != len(config.exclude_patterns):
+        raise ValueError("OpenNeuro exclusion patterns must be unique.")
+    for pattern in config.exclude_patterns:
+        if not pattern:
+            raise ValueError("OpenNeuro exclusion patterns must not be empty.")
+        if pattern.startswith("/"):
+            raise ValueError(
+                "OpenNeuro exclusion patterns must be repository-relative, "
+                f"but got {pattern!r}."
+            )
+        if ".." in Path(pattern).parts:
+            raise ValueError(
+                "OpenNeuro exclusion patterns must not contain a parent "
+                f"directory component, but got {pattern!r}."
+            )
 
 
 def check_dependencies() -> None:
@@ -825,19 +853,26 @@ def retrieve_content_once(
     config: DownloadConfig,
     runner: CommandRunner,
 ) -> None:
-    """Retrieve all annexed dataset content exactly once."""
+    """Retrieve selected annexed dataset content exactly once."""
 
     command = [
-        "datalad",
+        "git",
         "-C",
         config.destination,
+        "annex",
         "get",
-        "--recursive",
         "--jobs",
         str(config.max_workers),
+        *annex_exclude_arguments(config.exclude_patterns),
         ".",
     ]
     runner(command, subprocess_environment(config))
+
+
+def annex_exclude_arguments(patterns: tuple[str, ...]) -> list[str]:
+    """Build git-annex matching options for excluded relative paths."""
+
+    return [f"--exclude={pattern}" for pattern in patterns]
 
 
 def missing_annex_content(
@@ -854,6 +889,7 @@ def missing_annex_content(
         "find",
         "--not",
         "--in=here",
+        *annex_exclude_arguments(config.exclude_patterns),
     ]
     output = runner(command, subprocess_environment(config))
     return [line for line in output.splitlines() if line.strip()]
@@ -959,6 +995,7 @@ def diagnostic_configuration(config: DownloadConfig) -> dict[str, Any]:
         "destination": config.destination,
         "dry_run": config.dry_run,
         "endpoint": config.endpoint,
+        "exclude_patterns": config.exclude_patterns,
         "max_workers": config.max_workers,
         "provider": "openneuro",
         "proxy_url": config.proxy_url,

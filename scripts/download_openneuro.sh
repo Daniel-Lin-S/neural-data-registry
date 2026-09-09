@@ -9,8 +9,8 @@ set -Eeuo pipefail
 #     --repo ID_OR_VERSION_URL --dest /ABSOLUTE/DESTINATION [OPTIONS]
 #
 # Options include --mirror, proxy or --no-proxy, --max-workers, --timeout,
-# retry controls, Mihomo controls, and --dry-run. Run with --help for complete
-# argument details.
+# retry controls, Mihomo controls, repeatable --exclude GLOB filters, and
+# --dry-run. Run with --help for complete argument details.
 
 readonly PROVIDER_LABEL="OpenNeuro"
 readonly PROVIDER_DEFAULT_ENDPOINT="https://github.com/OpenNeuroDatasets"
@@ -18,6 +18,7 @@ readonly PROVIDER_REPO_HELP="OpenNeuro dataset ID, dataset URL, or version URL."
 readonly PROVIDER_RESUME_MESSAGE="Interrupted DataLad downloads resume "\
 "in the same dataset."
 readonly PROVIDER_PYTHON_MODULE="download_openneuro.py"
+readonly PROVIDER_SUPPORTS_EXCLUDE="1"
 PROVIDER_SCRIPT_DIR="$(
     cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P
 )"

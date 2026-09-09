@@ -38,6 +38,7 @@ MIHOMO_SPEED_TEST_URL=""
 MIHOMO_PROBE_TIMEOUT="${DEFAULT_MIHOMO_PROBE_TIMEOUT}"
 MIHOMO_ENABLED=0
 DRY_RUN=0
+EXCLUDE_PATTERNS=()
 
 
 show_help()
@@ -119,8 +120,26 @@ Optional:
   --dry-run
         Show pending content without downloading.
 
+EOF
+
+    if [[ "${PROVIDER_SUPPORTS_EXCLUDE-0}" == "1" ]]; then
+        cat <<EOF
+  --exclude GLOB
+        Skip annex content matching a repository-relative git-annex glob.
+        Repeat this option for multiple patterns. Tracked paths remain in the
+        dataset and can be retrieved by a later run without exclusions.
+
+EOF
+    fi
+
+    cat <<EOF
   -h, --help
         Show this message.
+
+Environment:
+
+  DOWNLOAD_PYTHON
+        Python 3 interpreter containing the downloader dependencies.
 
 EOF
 }
@@ -262,6 +281,9 @@ print_configuration()
             printf '%s\n' 'Node filter   : all direct nodes'
         fi
     fi
+    for pattern in "${EXCLUDE_PATTERNS[@]}"; do
+        printf 'Exclude       : %s\n' "${pattern}"
+    done
     printf '\n%s\n\n' "${PROVIDER_RESUME_MESSAGE}"
 }
 
@@ -292,6 +314,17 @@ while [[ $# -gt 0 ]]; do
                 --mihomo-speed-test-url) MIHOMO_SPEED_TEST_URL="$2" ;;
                 --mihomo-probe-timeout) MIHOMO_PROBE_TIMEOUT="$2" ;;
             esac
+            shift 2
+            ;;
+        --exclude)
+            if [[ "${PROVIDER_SUPPORTS_EXCLUDE-0}" != "1" ]]; then
+                fail "--exclude is not supported by ${PROVIDER_LABEL}."
+            fi
+            require_option_value "$1" "${2-}"
+            if [[ "$2" == *$'\n'* ]]; then
+                fail "--exclude must not contain a newline."
+            fi
+            EXCLUDE_PATTERNS+=("$2")
             shift 2
             ;;
         --no-proxy)
@@ -332,9 +365,29 @@ export DOWNLOAD_MIHOMO_GROUP="${MIHOMO_GROUP}"
 export DOWNLOAD_MIHOMO_NODE_MARKER="${MIHOMO_NODE_MARKER}"
 export DOWNLOAD_MIHOMO_SPEED_TEST_URL="${MIHOMO_SPEED_TEST_URL}"
 export DOWNLOAD_MIHOMO_PROBE_TIMEOUT="${MIHOMO_PROBE_TIMEOUT}"
+DOWNLOAD_EXCLUDE_PATTERNS=""
+if (( ${#EXCLUDE_PATTERNS[@]} > 0 )); then
+    printf -v DOWNLOAD_EXCLUDE_PATTERNS '%s\n' \
+        "${EXCLUDE_PATTERNS[@]}"
+fi
+export DOWNLOAD_EXCLUDE_PATTERNS
 
 readonly PROVIDER_REPOSITORY_ROOT="$({
     cd -- "${PROVIDER_SCRIPT_DIR}/.." && pwd -P
 })"
-python \
+if [[ -n "${DOWNLOAD_PYTHON-}" ]]; then
+    if [[ ! -x "${DOWNLOAD_PYTHON}" ]]; then
+        fail "DOWNLOAD_PYTHON is not executable: ${DOWNLOAD_PYTHON}"
+    fi
+    PROVIDER_PYTHON_COMMAND="${DOWNLOAD_PYTHON}"
+elif command -v python >/dev/null 2>&1; then
+    PROVIDER_PYTHON_COMMAND="python"
+elif command -v python3 >/dev/null 2>&1; then
+    PROVIDER_PYTHON_COMMAND="python3"
+else
+    fail "Python 3 is required, but neither python nor python3 was found."
+fi
+readonly PROVIDER_PYTHON_COMMAND
+
+"${PROVIDER_PYTHON_COMMAND}" \
     "${PROVIDER_REPOSITORY_ROOT}/download_helpers/${PROVIDER_PYTHON_MODULE}"

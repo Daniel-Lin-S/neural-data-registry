@@ -59,6 +59,7 @@ def make_config(
         retry_max_delay=300.0,
         proxy_url=None,
         mihomo=None,
+        exclude_patterns=(),
     )
 
 
@@ -123,12 +124,15 @@ def run_script(
     )
 
 
-def python_stub_environment(tmp_path: Path) -> dict[str, str]:
+def python_stub_environment(
+    tmp_path: Path,
+    command_name: str = "python",
+) -> dict[str, str]:
     """Return an environment whose Python prints exported proxy state."""
 
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    python_stub = bin_dir / "python"
+    python_stub = bin_dir / command_name
     python_stub.write_text(
         "#!/usr/bin/env bash\n"
         "printf 'stub:%s|%s\\n' \"$DOWNLOAD_PROXY_URL\" "
@@ -139,6 +143,57 @@ def python_stub_environment(tmp_path: Path) -> dict[str, str]:
     environment = os.environ.copy()
     environment["PATH"] = f"{bin_dir}:{environment['PATH']}"
     return environment
+
+
+def test_shell_wrapper_falls_back_to_python3(tmp_path: Path) -> None:
+    """Use python3 when the unversioned Python command is unavailable."""
+
+    environment = python_stub_environment(
+        tmp_path,
+        command_name="python3",
+    )
+    environment["PATH"] = (
+        f"{tmp_path / 'bin'}:/usr/bin:/bin"
+    )
+
+    result = run_script(
+        "--repo",
+        "ds005261",
+        "--dest",
+        str((tmp_path / "dataset").resolve()),
+        "--no-proxy",
+        env=environment,
+    )
+
+    assert result.returncode == 0
+    assert "stub:|unset" in result.stdout
+
+
+def test_shell_wrapper_honors_explicit_python(
+    tmp_path: Path,
+) -> None:
+    """Use the configured environment instead of an unrelated python3."""
+
+    environment = python_stub_environment(
+        tmp_path,
+        command_name="provider-python",
+    )
+    environment["DOWNLOAD_PYTHON"] = str(
+        tmp_path / "bin" / "provider-python"
+    )
+    environment["PATH"] = "/usr/bin:/bin"
+
+    result = run_script(
+        "--repo",
+        "ds005261",
+        "--dest",
+        str((tmp_path / "dataset").resolve()),
+        "--no-proxy",
+        env=environment,
+    )
+
+    assert result.returncode == 0
+    assert "stub:|unset" in result.stdout
 
 
 @pytest.mark.parametrize(
@@ -185,6 +240,42 @@ def test_parse_repository_rejects_invalid_values(value: str) -> None:
 
     with pytest.raises(ValueError):
         downloader.parse_repository(value)
+
+
+def test_load_exclude_patterns_preserves_each_glob(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Decode the shell's newline-delimited exclusion transport."""
+
+    monkeypatch.setenv(
+        "DOWNLOAD_EXCLUDE_PATTERNS",
+        "derivatives/**\ncode/**\nsub-*/func/**\n",
+    )
+
+    assert downloader.load_exclude_patterns() == (
+        "derivatives/**",
+        "code/**",
+        "sub-*/func/**",
+    )
+
+
+@pytest.mark.parametrize(
+    "pattern",
+    ["/derivatives/**", "sub-01/../code/**"],
+)
+def test_validate_config_rejects_non_relative_exclusion(
+    pattern: str,
+    tmp_path: Path,
+) -> None:
+    """Reject exclusion patterns that escape repository-relative matching."""
+
+    config = replace(
+        make_config(tmp_path),
+        exclude_patterns=(pattern,),
+    )
+
+    with pytest.raises(ValueError, match="exclusion patterns"):
+        downloader.validate_config(config)
 
 
 def test_repository_url_uses_configured_mirror(tmp_path: Path) -> None:
@@ -408,7 +499,7 @@ def test_atomic_promotion_does_not_replace_empty_destination(
 
 
 def test_retrieve_content_passes_worker_count(tmp_path: Path) -> None:
-    """Forward common worker configuration to DataLad get."""
+    """Forward common worker configuration to git-annex get."""
 
     config = make_config(tmp_path)
     calls: list[tuple[list[str], dict[str, str]]] = []
@@ -423,15 +514,49 @@ def test_retrieve_content_passes_worker_count(tmp_path: Path) -> None:
     downloader.retrieve_content_once(config, runner)
 
     assert calls[0][0] == [
-        "datalad",
+        "git",
         "-C",
         config.destination,
+        "annex",
         "get",
-        "--recursive",
         "--jobs",
         "2",
         ".",
     ]
+
+
+def test_retrieval_and_verification_share_exclusions(
+    tmp_path: Path,
+) -> None:
+    """Apply the same annex filters to transfer and completeness checks."""
+
+    config = replace(
+        make_config(tmp_path),
+        exclude_patterns=(
+            "derivatives/**",
+            "code/**",
+            "sub-*/func/**",
+        ),
+    )
+    calls: list[list[str]] = []
+
+    def runner(
+        command: Sequence[str],
+        environment: dict[str, str],
+    ) -> str:
+        del environment
+        calls.append(list(command))
+        return ""
+
+    downloader.retrieve_and_verify_content_once(config, runner)
+
+    expected_options = [
+        "--exclude=derivatives/**",
+        "--exclude=code/**",
+        "--exclude=sub-*/func/**",
+    ]
+    assert calls[0][-4:] == [*expected_options, "."]
+    assert calls[1][-3:] == expected_options
 
 
 def test_proxy_environment_is_explicit_and_complete(tmp_path: Path) -> None:
@@ -647,8 +772,40 @@ def test_help_uses_shared_hugging_face_interface() -> None:
     assert "--proxy-port PORT" in result.stdout
     assert "--retry-max-delay SEC" in result.stdout
     assert "--mihomo-controller URL" in result.stdout
+    assert "--exclude GLOB" in result.stdout
     assert "--transport" not in result.stdout
     assert "--xet-range-concurrency" not in result.stdout
+
+
+def test_shell_exports_repeatable_exclusions(tmp_path: Path) -> None:
+    """Preserve each OpenNeuro exclusion as one provider pattern."""
+
+    environment = python_stub_environment(tmp_path)
+    stub = tmp_path / "bin" / "python"
+    stub.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf '%s' \"$DOWNLOAD_EXCLUDE_PATTERNS\"\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+
+    result = run_script(
+        "--repo",
+        "ds004078",
+        "--dest",
+        str((tmp_path / "dataset").resolve()),
+        "--exclude",
+        "derivatives/**",
+        "--exclude",
+        "sub-*/func/**",
+        "--no-proxy",
+        env=environment,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout.endswith(
+        "derivatives/**\nsub-*/func/**\n"
+    )
 
 
 def test_explicit_proxy_is_exported_to_provider(tmp_path: Path) -> None:

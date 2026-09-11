@@ -517,6 +517,8 @@ def test_retrieve_content_passes_worker_count(tmp_path: Path) -> None:
         "git",
         "-C",
         config.destination,
+        "-c",
+        "annex.stalldetection-download=1KB/300s",
         "annex",
         "get",
         "--jobs",
@@ -557,6 +559,16 @@ def test_retrieval_and_verification_share_exclusions(
     ]
     assert calls[0][-4:] == [*expected_options, "."]
     assert calls[1][-3:] == expected_options
+
+
+def test_annex_stall_detection_uses_download_timeout(
+    tmp_path: Path,
+) -> None:
+    """Cancel annex downloads that make no useful progress in time."""
+
+    config = replace(make_config(tmp_path), timeout=45.9)
+
+    assert downloader.annex_stall_detection(config) == "1KB/45s"
 
 
 def test_proxy_environment_is_explicit_and_complete(tmp_path: Path) -> None:

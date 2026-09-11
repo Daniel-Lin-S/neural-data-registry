@@ -47,6 +47,7 @@ from download_retry import (
 from mihomo_ranker import MihomoConfig, MihomoNodeManager
 
 DEFAULT_MIHOMO_PROBE_TIMEOUT = 8.0
+MINIMUM_STALL_PROGRESS = "1KB"
 DATASET_ID_PATTERN = re.compile(r"^ds[0-9]+$")
 VERSION_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 DEFAULT_URL_PORTS = {"http": 80, "https": 443}
@@ -158,7 +159,7 @@ class DownloadConfig:
     max_workers : int
         Number of concurrent DataLad jobs.
     timeout : float
-        HTTP low-speed timeout in seconds.
+        HTTP low-speed and annex download-stall timeout in seconds.
     dry_run : bool
         Whether to inspect pending state without network mutation.
     retry_attempts : int
@@ -849,6 +850,13 @@ def install_dataset_once(
     promote_staged_dataset(workspace)
 
 
+def annex_stall_detection(config: DownloadConfig) -> str:
+    """Return the minimum annex download progress per timeout window."""
+
+    timeout_seconds = max(1, int(config.timeout))
+    return f"{MINIMUM_STALL_PROGRESS}/{timeout_seconds}s"
+
+
 def retrieve_content_once(
     config: DownloadConfig,
     runner: CommandRunner,
@@ -859,6 +867,11 @@ def retrieve_content_once(
         "git",
         "-C",
         config.destination,
+        "-c",
+        (
+            "annex.stalldetection-download="
+            f"{annex_stall_detection(config)}"
+        ),
         "annex",
         "get",
         "--jobs",

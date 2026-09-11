@@ -9,6 +9,7 @@ class Provider(str, Enum):
     OPENNEURO = "openneuro"
     OSF = "osf"
     ZENODO = "zenodo"
+    HUGGINGFACE = "huggingface"
     DANDI = "dandi"
     PHYSIONET = "physionet"
     KAGGLE = "kaggle"

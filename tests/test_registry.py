@@ -1749,6 +1749,14 @@ def test_failed_download_remains_in_incoming(config, monkeypatch):
         ("https://zenodo.org/records/583331", Provider.ZENODO),
         ("https://sandbox.zenodo.org/records/123", Provider.ZENODO),
         ("https://doi.org/10.5281/zenodo.583331", Provider.ZENODO),
+        (
+            "https://huggingface.co/datasets/example/dataset",
+            Provider.HUGGINGFACE,
+        ),
+        (
+            "https://huggingface.co/api/datasets/example/dataset",
+            Provider.HUGGINGFACE,
+        ),
     ],
 )
 def test_new_providers_are_recognized_but_not_downloaded(url, provider):
@@ -1766,6 +1774,9 @@ def test_new_providers_are_recognized_but_not_downloaded(url, provider):
         "https://zenodo.org/",
         "https://zenodo.org/communities/neuroscience/",
         "https://zenodo.org/records/not-a-record-id",
+        "https://huggingface.co/",
+        "https://huggingface.co/models/example/model",
+        "https://huggingface.co/api/models/example/model",
     ],
 )
 def test_provider_extraction_rejects_non_dataset_osf_and_zenodo_urls(
@@ -1838,6 +1849,23 @@ def test_ingest_local_detects_osf_and_zenodo_provider_from_url(
     )
 
     assert item.provider is provider
+    assert item.version == "unknown"
+
+
+def test_ingest_local_detects_huggingface_provider_from_url(config, tmp_path):
+    """A local registration takes the provider from a dataset URL."""
+
+    item = ingest_local(
+        mock_dataset(tmp_path, "huggingface-local"),
+        "Hugging Face local",
+        Provider.OPENNEURO,
+        "https://huggingface.co/datasets/example/dataset",
+        None,
+        ["eeg"],
+        config,
+    )
+
+    assert item.provider is Provider.HUGGINGFACE
     assert item.version == "unknown"
 
 

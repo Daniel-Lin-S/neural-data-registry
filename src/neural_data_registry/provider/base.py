@@ -16,6 +16,7 @@ HEAD_FALLBACK_STATUS_CODES = frozenset({405, 501})
 HTTP_SCHEMES = frozenset({"http", "https"})
 OSF_NODE_PATTERN = re.compile(r"^[a-z0-9]{5}$", re.IGNORECASE)
 ZENODO_RECORD_PATTERN = re.compile(r"^[0-9]+$")
+HUGGINGFACE_HOSTS = frozenset({"hf.co", "huggingface.co"})
 ZENODO_DOI_PATTERN = re.compile(
     r"^10\.(?:5281|5072)/zenodo\.[0-9]+$", re.IGNORECASE
 )
@@ -108,6 +109,24 @@ def _is_zenodo_record_url(host: str, path: str) -> bool:
     )
 
 
+def _is_huggingface_dataset_url(host: str, path: str) -> bool:
+    """Return whether a Hugging Face URL identifies a dataset repository."""
+
+    is_huggingface_host = host in HUGGINGFACE_HOSTS or host.endswith(
+        ".huggingface.co"
+    )
+    if not is_huggingface_host:
+        return False
+    segments = _path_segments(path)
+    if segments[:1] == ["datasets"]:
+        repository_start = 1
+    elif segments[:2] == ["api", "datasets"]:
+        repository_start = 2
+    else:
+        return False
+    return len(segments) >= repository_start + 2
+
+
 def provider_for_url(url: str) -> Provider:
     """Identify a provider from a valid dataset URL, defaulting to ``other``."""
 
@@ -117,6 +136,8 @@ def provider_for_url(url: str) -> Provider:
         return Provider.OSF
     if _is_zenodo_record_url(host, parsed.path):
         return Provider.ZENODO
+    if _is_huggingface_dataset_url(host, parsed.path):
+        return Provider.HUGGINGFACE
     providers = {
         "openneuro.org": Provider.OPENNEURO,
         "dandiarchive.org": Provider.DANDI,

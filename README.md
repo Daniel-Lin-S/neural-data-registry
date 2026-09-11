@@ -247,7 +247,7 @@ brainctl list --query THINGS_MEG  # searches canonical names and aliases
 
 `--modality` accepts a value such as `MEG`, `EEG`, or `fMRI`;
 `--provider` accepts
-`openneuro`, `dandi`, `nemar`, `physionet`, `neurovault`, `kaggle`, `synapse`, or `other`.
+`openneuro`, `huggingface`, `dandi`, `nemar`, `physionet`, `neurovault`, `kaggle`, `synapse`, or `other`.
 Missing and broken datasets are hidden by default; use `brainctl list --show-all`
 to include every status. The summary includes dataset ID, name, provider, version,
 modalities, size, and status.
@@ -294,7 +294,7 @@ brainctl ingest-local /path/to/things-meg \
 ```
 
 `SOURCE` must be an existing directory. `--name` and `--version` are required.
-`--provider` accepts `openneuro`, `dandi`, `nemar`, `physionet`, `neurovault`, `kaggle`, `synapse`, or `other`; it defaults to `other`. URLs automatically determine the provider and, where present, the version.
+`--provider` accepts `openneuro`, `huggingface`, `dandi`, `nemar`, `physionet`, `neurovault`, `kaggle`, `synapse`, or `other`; it defaults to `other`. URLs automatically determine the provider and, where present, the version.
 `--url` records the canonical remote URL when one exists.
 Repeat `--modality` to register multiple modalities. Repeat `--alias` to
 register searchable alternate names alongside the canonical `--name`.
@@ -419,6 +419,7 @@ Common providers for neural data are included:
 - `physionet`: EEG, sleep PSG, ECG, ICU signals. https://physionet.org/content/
 - `neurovault`: https://neurovault.org/ Derived neuroimaging maps: fMRI/PET statistical maps, parcellations, atlases.
 - `kaggle`: Kaggle datasets and competitions, typically downloaded for machine-learning workflows. https://www.kaggle.com/
+- `huggingface`: Hugging Face dataset repositories. https://huggingface.co/datasets
 - `other`: Any other dataset downloaded manually from arbitrary websites or requested from labs.
 
 ## API server and common requests

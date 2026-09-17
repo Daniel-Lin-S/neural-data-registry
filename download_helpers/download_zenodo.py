@@ -120,8 +120,7 @@ def parse_record_id(value: str) -> str:
         parsed = urlparse(candidate)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError(
-                "expected an HTTP or HTTPS Zenodo record URL, but got "
-                f"{value!r}."
+                f"expected an HTTP or HTTPS Zenodo record URL, but got {value!r}."
             )
         parts = [part for part in parsed.path.split("/") if part]
         matches = [
@@ -130,37 +129,28 @@ def parse_record_id(value: str) -> str:
             if part in ZENODO_RECORD_PATH_MARKERS
         ]
         if len(matches) != 1:
-            raise ValueError(
-                f"expected a Zenodo record ID in URL {value!r}."
-            )
+            raise ValueError(f"expected a Zenodo record ID in URL {value!r}.")
         candidate = matches[0]
     if not candidate.isdigit():
-        raise ValueError(
-            f"expected a numeric Zenodo record ID, but got {candidate!r}."
-        )
+        raise ValueError(f"expected a numeric Zenodo record ID, but got {candidate!r}.")
     return candidate
 
 
 def load_mihomo_config() -> MihomoConfig | None:
     """Load optional Mihomo ranking settings exported by the shell."""
 
-    speed_test_url = optional_environment(
-        "DOWNLOAD_MIHOMO_SPEED_TEST_URL"
-    )
+    speed_test_url = optional_environment("DOWNLOAD_MIHOMO_SPEED_TEST_URL")
     if speed_test_url is None:
         return None
     controller = optional_environment("DOWNLOAD_MIHOMO_CONTROLLER")
     if controller is None:
         raise ValueError(
-            "Mihomo ranking requires --mihomo-controller or "
-            "MIHOMO_CONTROLLER."
+            "Mihomo ranking requires --mihomo-controller or MIHOMO_CONTROLLER."
         )
     return MihomoConfig(
         controller_url=controller,
         group_name=optional_environment("DOWNLOAD_MIHOMO_GROUP"),
-        node_marker=(
-            optional_environment("DOWNLOAD_MIHOMO_NODE_MARKER") or ""
-        ),
+        node_marker=(optional_environment("DOWNLOAD_MIHOMO_NODE_MARKER") or ""),
         speed_test_url=speed_test_url,
         probe_timeout=float(
             optional_environment("DOWNLOAD_MIHOMO_PROBE_TIMEOUT")
@@ -168,6 +158,20 @@ def load_mihomo_config() -> MihomoConfig | None:
         ),
         secret=optional_environment("MIHOMO_SECRET"),
     )
+
+
+def load_log_directory() -> Path | None:
+    """Load an optional absolute directory for this invocation's log."""
+    value = optional_environment("DOWNLOAD_LOG_DIRECTORY")
+    if value is None:
+        return None
+    directory = Path(value)
+    if not directory.is_absolute():
+        raise ValueError(
+            "expected DOWNLOAD_LOG_DIRECTORY to be an absolute path, but "
+            f"got {value!r}."
+        )
+    return directory
 
 
 def load_config_from_environment() -> DownloadConfig:
@@ -181,9 +185,7 @@ def load_config_from_environment() -> DownloadConfig:
         timeout=float(os.environ["DOWNLOAD_TIMEOUT"]),
         dry_run=os.environ["DOWNLOAD_DRY_RUN"] == "1",
         retry_attempts=int(os.environ["DOWNLOAD_RETRY_ATTEMPTS"]),
-        retry_base_delay=float(
-            os.environ["DOWNLOAD_RETRY_BASE_DELAY"]
-        ),
+        retry_base_delay=float(os.environ["DOWNLOAD_RETRY_BASE_DELAY"]),
         retry_max_delay=float(os.environ["DOWNLOAD_RETRY_MAX_DELAY"]),
         proxy_url=optional_environment("DOWNLOAD_PROXY_URL"),
         token=optional_environment("ZENODO_TOKEN"),
@@ -198,8 +200,7 @@ def validate_config(config: DownloadConfig) -> None:
 
     if not os.path.isabs(config.destination):
         raise ValueError(
-            "expected an absolute destination path, but got "
-            f"{config.destination!r}."
+            f"expected an absolute destination path, but got {config.destination!r}."
         )
     parsed_api = urlparse(config.api_base)
     if parsed_api.scheme not in {"http", "https"} or not parsed_api.netloc:
@@ -215,18 +216,14 @@ def validate_config(config: DownloadConfig) -> None:
     }
     for name, value in positive_values.items():
         if value <= 0:
-            raise ValueError(
-                f"expected {name} to be positive, but got {value}."
-            )
+            raise ValueError(f"expected {name} to be positive, but got {value}.")
     if config.retry_attempts < 0:
         raise ValueError(
             "expected retry_attempts to be non-negative, but got "
             f"{config.retry_attempts}."
         )
     if config.mihomo is not None and config.proxy_url is None:
-        raise ValueError(
-            "Mihomo ranking requires an explicit local proxy URL."
-        )
+        raise ValueError("Mihomo ranking requires an explicit local proxy URL.")
     if config.mihomo is not None and config.max_workers != 1:
         raise ValueError(
             "Mihomo ranking requires max_workers=1 so node failover does "
@@ -293,14 +290,10 @@ def file_items(payload: dict[str, Any]) -> list[dict[str, Any]]:
     elif isinstance(files, dict):
         entries = files.get("entries")
         if not isinstance(entries, dict):
-            raise TypeError(
-                "expected Zenodo files.entries to be an object."
-            )
+            raise TypeError("expected Zenodo files.entries to be an object.")
         items = list(entries.values())
     else:
-        raise TypeError(
-            "expected Zenodo files to be a list or entries object."
-        )
+        raise TypeError("expected Zenodo files to be a list or entries object.")
     if not all(isinstance(item, dict) for item in items):
         raise TypeError("expected every Zenodo file to be an object.")
     return items
@@ -314,14 +307,11 @@ def file_from_item(item: dict[str, Any]) -> HTTPFile:
     size = item.get("size")
     if isinstance(size, bool) or not isinstance(size, int) or size < 0:
         raise ValueError(
-            f"expected a non-negative size for {relative_path}, but got "
-            f"{size!r}."
+            f"expected a non-negative size for {relative_path}, but got {size!r}."
         )
     links = item.get("links")
     if not isinstance(links, dict):
-        raise TypeError(
-            f"expected links for Zenodo file {relative_path}."
-        )
+        raise TypeError(f"expected links for Zenodo file {relative_path}.")
     download_url = validate_download_url(
         links.get("content") or links.get("self"),
         relative_path,
@@ -343,8 +333,7 @@ def collect_manifest_once(
         record = file_from_item(item)
         if record.relative_path in manifest:
             raise ValueError(
-                "Zenodo advertised duplicate path "
-                f"{record.relative_path!r}."
+                f"Zenodo advertised duplicate path {record.relative_path!r}."
             )
         manifest[record.relative_path] = record
     if not manifest:
@@ -457,6 +446,7 @@ def main() -> int:
         log_path = configure_diagnostics(
             "zenodo",
             diagnostic_configuration(config),
+            load_log_directory(),
         )
         print(f"Debug log     : {log_path}")
         run(config)

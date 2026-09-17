@@ -86,8 +86,6 @@ class DownloadInterrupted(KeyboardInterrupt):
     """Represent a process signal recorded by the diagnostic logger."""
 
 
-
-
 def sanitize_url(value: str) -> str:
     """Remove credentials, query parameters, and fragments from one URL."""
 
@@ -118,6 +116,7 @@ def sanitize_text(value: Any) -> str:
 
 def sanitized_configuration(
     configuration: Mapping[str, Any],
+    log_directory: Path | None = None,
 ) -> dict[str, str]:
     """Return allow-listed, redacted configuration values for logging."""
 
@@ -146,24 +145,27 @@ def repository_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
-def create_log_path(provider: str) -> Path:
-    """Create the ignored download-log directory and unique log path."""
-
-    log_directory = repository_root().joinpath(*LOG_DIRECTORY_PARTS)
-    log_directory.mkdir(parents=True, exist_ok=True)
+def create_log_path(
+    provider: str,
+    log_directory: Path | None = None,
+) -> Path:
+    """Create a unique log path in the selected download-log directory."""
+    directory = log_directory or repository_root().joinpath(*LOG_DIRECTORY_PARTS)
+    directory.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
-    return log_directory / f"{provider}-{timestamp}-{os.getpid()}.log"
+    return directory / f"{provider}-{timestamp}-{os.getpid()}.log"
 
 
 def configure_diagnostics(
     provider: str,
     configuration: Mapping[str, Any],
+    log_directory: Path | None = None,
 ) -> Path:
     """Configure one flushed file logger and process signal handlers."""
 
     global _logger, _log_path
     with _state_lock:
-        path = create_log_path(provider).resolve()
+        path = create_log_path(provider, log_directory).resolve()
         logger = logging.getLogger(LOGGER_NAME)
         for existing_handler in logger.handlers:
             existing_handler.close()
@@ -204,7 +206,8 @@ def log_event(event: str, **fields: Any) -> None:
     if _logger is None:
         return
     rendered = " ".join(
-        f"{key}=" + (
+        f"{key}="
+        + (
             "<redacted>"
             if key.lower() in SENSITIVE_FIELD_KEYS
             else sanitize_text(value)

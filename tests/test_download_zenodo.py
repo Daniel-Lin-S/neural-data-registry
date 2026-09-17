@@ -29,9 +29,7 @@ def load_module() -> Any:
         MODULE_PATH,
     )
     if spec is None or spec.loader is None:
-        raise RuntimeError(
-            f"could not load Zenodo downloader from {MODULE_PATH}."
-        )
+        raise RuntimeError(f"could not load Zenodo downloader from {MODULE_PATH}.")
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
@@ -97,7 +95,7 @@ def python_stub_environment(tmp_path: Path) -> dict[str, str]:
     python_stub.write_text(
         "#!/usr/bin/env bash\n"
         "printf 'stub:%s|%s\\n' \"$DOWNLOAD_PROXY_URL\" "
-        "\"${HTTPS_PROXY-unset}\"\n",
+        '"${HTTPS_PROXY-unset}"\n',
         encoding="utf-8",
     )
     python_stub.chmod(0o755)
@@ -186,9 +184,7 @@ def test_manifest_supports_legacy_entries_layout(tmp_path: Path) -> None:
                         "README": {
                             "filename": "README",
                             "size": 2,
-                            "links": {
-                                "self": "https://files.zenodo.org/readme"
-                            },
+                            "links": {"self": "https://files.zenodo.org/readme"},
                         }
                     }
                 }
@@ -275,9 +271,7 @@ def test_checksum_mismatch_never_publishes_file(tmp_path: Path) -> None:
         download_http_manifest.download_file_once(
             config,
             record,
-            client_factory(
-                lambda request: httpx.Response(200, content=b"abc")
-            ),
+            client_factory(lambda request: httpx.Response(200, content=b"abc")),
             "Zenodo",
         )
 

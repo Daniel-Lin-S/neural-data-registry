@@ -73,6 +73,25 @@ def test_log_path_is_unique_absolute_and_under_ignored_directory(
     assert second.is_file()
 
 
+def test_existing_log_path_is_reused_without_creating_a_new_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Append delegated downloader events to the controller log."""
+    path = configure_at(monkeypatch, tmp_path)
+    before = set(path.parent.iterdir())
+
+    configured = diagnostics.configure_diagnostics(
+        "zenodo",
+        {"repo": "1486147"},
+        log_path=path,
+    )
+
+    assert configured == path
+    assert set(path.parent.iterdir()) == before
+    assert "provider=zenodo" in path.read_text(encoding="utf-8")
+
+
 def test_log_redacts_credentials_and_signed_queries(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

@@ -174,6 +174,20 @@ def load_log_directory() -> Path | None:
     return directory
 
 
+def load_log_path() -> Path | None:
+    """Load an optional existing absolute log file for this invocation."""
+    value = optional_environment("DOWNLOAD_LOG_PATH")
+    if value is None:
+        return None
+    path = Path(value)
+    if not path.is_absolute():
+        raise ValueError(
+            "expected DOWNLOAD_LOG_PATH to be an absolute path, but got "
+            f"{value!r}."
+        )
+    return path
+
+
 def load_config_from_environment() -> DownloadConfig:
     """Load and validate downloader configuration from the environment."""
 
@@ -447,6 +461,7 @@ def main() -> int:
             "zenodo",
             diagnostic_configuration(config),
             load_log_directory(),
+            load_log_path(),
         )
         print(f"Debug log     : {log_path}")
         run(config)

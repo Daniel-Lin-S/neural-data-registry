@@ -160,12 +160,47 @@ def configure_diagnostics(
     provider: str,
     configuration: Mapping[str, Any],
     log_directory: Path | None = None,
+    log_path: Path | None = None,
 ) -> Path:
-    """Configure one flushed file logger and process signal handlers."""
+    """Configure one flushed file logger and process signal handlers.
+
+    Parameters
+    ----------
+    provider : str
+        Provider name included in the initial structured event.
+    configuration : Mapping[str, Any]
+        Configuration values to sanitize and record.
+    log_directory : pathlib.Path, optional
+        Directory for a newly created log file. Defaults to the repository
+        download-log directory.
+    log_path : pathlib.Path, optional
+        Existing absolute regular log file to append to. Mutually exclusive
+        with ``log_directory``.
+
+    Returns
+    -------
+    pathlib.Path
+        Absolute path of the configured log file.
+    """
 
     global _logger, _log_path
     with _state_lock:
-        path = create_log_path(provider, log_directory).resolve()
+        if log_path is not None and log_directory is not None:
+            raise ValueError("Specify log_path or log_directory, not both.")
+        if log_path is None:
+            path = create_log_path(provider, log_directory).resolve()
+        else:
+            if not log_path.is_absolute():
+                raise ValueError(
+                    "expected an absolute diagnostic log path, but got "
+                    f"{log_path!s}."
+                )
+            if not log_path.is_file():
+                raise ValueError(
+                    "expected an existing regular diagnostic log file, but "
+                    f"got {log_path!s}."
+                )
+            path = log_path.resolve()
         logger = logging.getLogger(LOGGER_NAME)
         for existing_handler in logger.handlers:
             existing_handler.close()

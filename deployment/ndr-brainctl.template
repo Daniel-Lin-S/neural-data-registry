@@ -5,10 +5,12 @@ umask 027
 
 cd @SERVICE_HOME@
 
-if [ "${1-}" = "ingest-local" ]; then
-    printf "Use the protected public brainctl wrapper for ingest-local.\n" >&2
-    exit 2
-fi
+case "${1-}" in
+    ingest-local|unregister|reregister)
+        printf "Use the protected public brainctl wrapper for %s.\n" "$1" >&2
+        exit 2
+        ;;
+esac
 
 exec @ENV_PATH@ -i \
     HOME=@SERVICE_HOME@ \

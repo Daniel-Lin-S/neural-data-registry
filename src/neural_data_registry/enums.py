@@ -28,6 +28,7 @@ class DatasetStatus(str, Enum):
     BROKEN = "broken"
     QUARANTINED = "quarantined"
     DEPRECATED = "deprecated"
+    UNREGISTERED = "unregistered"
 
 
 class JobStatus(str, Enum):

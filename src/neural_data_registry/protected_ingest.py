@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+import errno
 import os
 from pathlib import Path
 import pwd
@@ -19,12 +20,21 @@ from typing import Iterator, Sequence
 
 from neural_data_registry.config import Settings
 from neural_data_registry.db.models import Dataset
-from neural_data_registry.enums import Modality, Provider, StorageMode
+from neural_data_registry.enums import (
+    DatasetStatus,
+    Modality,
+    Provider,
+    StorageMode,
+)
 from neural_data_registry.service import (
     LocalIngestionRequest,
+    commit_reregistration,
     commit_local_ingestion_request,
     preflight_local_ingestion_request,
     prepare_local_ingestion_request,
+    resolve_dataset,
+    session,
+    unregister_moved_dataset,
     validate_privileged_source,
 )
 from neural_data_registry.storage import (
@@ -306,4 +316,176 @@ def coordinate_protected_ingestion(
 
     if prepared.staging_root is not None:
         prepared.staging_root.rmdir()
+    return item, prepared.warning
+
+
+def coordinate_protected_unregistration(
+    identifier: str,
+    restore_to: Path,
+    config: Settings,
+) -> tuple[Dataset, str]:
+    """Restore one moved dataset to the invoking user's source tree.
+
+    Parameters
+    ----------
+    identifier : str
+        Dataset ID, name, alias, or source URL.
+    restore_to : pathlib.Path
+        Destination below an approved source root.
+    config : neural_data_registry.config.Settings
+        Protected deployment settings.
+
+    Returns
+    -------
+    tuple[neural_data_registry.db.models.Dataset, str]
+        Preserved inactive record and a permissions warning.
+    """
+    if os.geteuid() != 0:
+        raise RuntimeError(
+            "Protected unregistration coordinator must run as root"
+        )
+    if not config.service_user:
+        raise RuntimeError(
+            "NDR_SERVICE_USER is required for protected unregistration"
+        )
+
+    caller = caller_identity_from_sudo()
+    service = _identity_for_account(config.service_user)
+    destination = restore_to.expanduser()
+    if not destination.is_absolute():
+        raise ValueError(
+            f"Restore destination must be an absolute path: {destination}"
+        )
+    if destination.exists():
+        raise ValueError(
+            f"Restore destination already exists: {destination}"
+        )
+    parent = destination.parent.resolve(strict=True)
+    resolved_destination = parent / destination.name
+    if not any(
+        resolved_destination.is_relative_to(root)
+        for root in config.privileged_source_root_paths
+    ):
+        allowed_roots = ", ".join(
+            str(root) for root in config.privileged_source_root_paths
+        )
+        raise ValueError(
+            "Restore destination must be below an allowed source root: "
+            f"{allowed_roots}"
+        )
+    with effective_identity(caller):
+        if not os.access(parent, os.W_OK | os.X_OK):
+            raise PermissionError(
+                errno.EACCES,
+                "Caller cannot write to the restore destination parent",
+                str(parent),
+            )
+
+    item = unregister_moved_dataset(
+        identifier,
+        resolved_destination,
+        caller.uid,
+        caller.gid,
+        config,
+        managed_owner_uid=service.uid,
+        managed_owner_gid=service.gid,
+    )
+    warning = (
+        "The original per-entry modes and ACLs were not recorded by this "
+        "registration. Ownership was restored to "
+        f"{caller.name}; managed file and directory modes were retained."
+    )
+    return item, warning
+
+
+def coordinate_protected_reregistration(
+    identifier: str,
+    config: Settings,
+) -> tuple[Dataset, str | None]:
+    """Re-register an inactive moved dataset through caller staging.
+
+    Parameters
+    ----------
+    identifier : str
+        Dataset ID, name, alias, or source URL.
+    config : neural_data_registry.config.Settings
+        Protected deployment settings.
+
+    Returns
+    -------
+    tuple[neural_data_registry.db.models.Dataset, str or None]
+        Reactivated dataset and an optional size warning.
+    """
+    if os.geteuid() != 0:
+        raise RuntimeError(
+            "Protected re-registration coordinator must run as root"
+        )
+    if not config.service_user:
+        raise RuntimeError(
+            "NDR_SERVICE_USER is required for protected re-registration"
+        )
+
+    caller = caller_identity_from_sudo()
+    service = _identity_for_account(config.service_user)
+    with effective_identity(service):
+        with session(config) as db:
+            item = resolve_dataset(db, identifier)
+        if item is None:
+            raise ValueError(
+                "No dataset matched the supplied ID, name, alias, or URL"
+            )
+        if item.status is not DatasetStatus.UNREGISTERED:
+            raise RuntimeError(
+                "Only an unregistered dataset can be re-registered"
+            )
+        if item.storage_mode is not StorageMode.REFERENCE:
+            raise RuntimeError(
+                "Unregistered dataset must reference its restored source"
+            )
+        if item.storage_path is None:
+            raise ValueError("Unregistered dataset has no restored source path")
+        source = validate_privileged_source(Path(item.storage_path), config)
+        request = LocalIngestionRequest(
+            source=source,
+            name=item.name,
+            provider=item.provider,
+            source_reference=item.source_url or source.as_uri(),
+            version=item.version,
+            modalities=tuple(
+                value
+                for value in item.modalities.split(",")
+                if value
+            ),
+            storage_mode=StorageMode.MOVE,
+            has_remote_url=item.source_url is not None,
+            name_aliases=(),
+        )
+        with ingestion_lock("registry-intake", config):
+            with effective_identity(UnixIdentity("root", 0, 0, (0,))):
+                prepared = _stage_source_as_caller(
+                    request,
+                    config,
+                    caller,
+                    service,
+                )
+            try:
+                item = commit_reregistration(
+                    identifier,
+                    config,
+                    prepared_source=prepared.source,
+                    prepared_access_normalized=True,
+                    size_bytes=prepared.size_bytes,
+                    managed_owner_uid=service.uid,
+                    managed_owner_gid=service.gid,
+                )
+            except Exception as exc:
+                if prepared.source.exists():
+                    raise RuntimeError(
+                        "Re-registration failed; staged data was retained at "
+                        f"{prepared.staging_root}: {exc}"
+                    ) from exc
+                raise
+
+    assert prepared.staging_root is not None
+    prepared.staging_root.rmdir()
     return item, prepared.warning

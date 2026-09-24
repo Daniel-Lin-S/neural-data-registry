@@ -1,5 +1,6 @@
 from __future__ import annotations
 import json
+import os
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -14,7 +15,12 @@ from neural_data_registry.health import (
     request_health_check,
     run_health_checks,
 )
-from neural_data_registry.enums import Modality, Provider, StorageMode
+from neural_data_registry.enums import (
+    DatasetStatus,
+    Modality,
+    Provider,
+    StorageMode,
+)
 from neural_data_registry.service import (
     add_name_aliases,
     check_download_connectivity,
@@ -24,8 +30,10 @@ from neural_data_registry.service import (
     download as download_dataset,
     find_datasets,
     ingest_local,
+    reregister_moved_dataset,
     resolve_dataset,
     session,
+    unregister_moved_dataset,
     update_dataset_metadata,
 )
 
@@ -173,9 +181,10 @@ def query(
             console.print("[red]Enter one of the displayed canonical names.[/red]")
     else:
         item = matches[0]
-    report = request_health_check(item.id)
-    if report.warning:
-        typer.echo(f"Warning: {report.warning}", err=True)
+    if item.status is not DatasetStatus.UNREGISTERED:
+        report = request_health_check(item.id)
+        if report.warning:
+            typer.echo(f"Warning: {report.warning}", err=True)
     if field:
         data = dataset_query_dict(item)
         available_fields = sorted(data)
@@ -408,6 +417,105 @@ def download(
     console.print_json(data=dataset_dict(item))
 
 
+@app.command("unregister")
+def unregister_command(
+    dataset: Annotated[
+        str,
+        typer.Argument(help="Dataset ID, name, alias, or source URL."),
+    ],
+    restore_to: Path = typer.Option(
+        ...,
+        "--restore-to",
+        help="Absolute path where the moved dataset will be restored.",
+    ),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        help="Confirm the unregister and restore operation.",
+    ),
+) -> None:
+    """Undo a move registration while preserving its audit record."""
+    if not yes and not typer.confirm(
+        "Restore the dataset and mark its registry record unregistered?",
+        default=False,
+    ):
+        console.print("Unregistration cancelled; no changes were made.")
+        raise typer.Abort()
+
+    config = get_settings()
+    warning = None
+    try:
+        if config.protected_coordinator:
+            from neural_data_registry.protected_ingest import (
+                coordinate_protected_unregistration,
+            )
+
+            item, warning = coordinate_protected_unregistration(
+                dataset,
+                restore_to,
+                config,
+            )
+        else:
+            item = unregister_moved_dataset(
+                dataset,
+                restore_to,
+                os.geteuid(),
+                os.getegid(),
+                config,
+            )
+    except (OSError, RuntimeError, ValueError, LookupError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if warning:
+        console.print(f"[yellow]Warning: {warning}[/yellow]")
+    console.print_json(data=dataset_dict(item))
+
+
+@app.command("reregister")
+def reregister_command(
+    dataset: Annotated[
+        str,
+        typer.Argument(help="Unregistered dataset ID, name, alias, or URL."),
+    ],
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        help="Confirm moving the restored dataset back into managed storage.",
+    ),
+) -> None:
+    """Reactivate an unregistered dataset's preserved registry record."""
+    if not yes and not typer.confirm(
+        "Move the restored dataset into managed storage and re-register it?",
+        default=False,
+    ):
+        console.print("Re-registration cancelled; no changes were made.")
+        raise typer.Abort()
+
+    config = get_settings()
+    warning = None
+    try:
+        if config.protected_coordinator:
+            from neural_data_registry.protected_ingest import (
+                coordinate_protected_reregistration,
+            )
+
+            item, warning = coordinate_protected_reregistration(
+                dataset,
+                config,
+            )
+        else:
+            item = reregister_moved_dataset(
+                dataset,
+                config,
+                restore_owner_uid=os.geteuid(),
+                restore_owner_gid=os.getegid(),
+            )
+    except (OSError, RuntimeError, ValueError, LookupError) as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if warning:
+        console.print(f"[yellow]Warning: {warning}[/yellow]")
+    console.print_json(data=dataset_dict(item))
+
+
 @app.command("alias")
 def add_alias_command(
     dataset: Annotated[str, typer.Argument(help="Dataset ID, canonical name, existing alias, or source URL.")],
@@ -480,6 +588,10 @@ def health_check_command(
             item = resolve_dataset(db, dataset)
         if item is None:
             raise typer.BadParameter("No dataset matched the supplied identifier")
+        if item.status is DatasetStatus.UNREGISTERED:
+            raise typer.BadParameter(
+                "Unregistered datasets do not receive health checks"
+            )
         dataset_ids = [item.id]
     else:
         with session() as db:

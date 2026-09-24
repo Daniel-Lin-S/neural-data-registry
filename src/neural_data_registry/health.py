@@ -658,7 +658,14 @@ def run_health_checks(
         if dataset_ids is None:
             db = get_session_factory(config.resolved_database_url)()
             try:
-                dataset_ids = list(db.scalars(select(Dataset.id)))
+                dataset_ids = list(
+                    db.scalars(
+                        select(Dataset.id).where(
+                            Dataset.status
+                            != DatasetStatus.UNREGISTERED
+                        )
+                    )
+                )
             finally:
                 db.close()
 

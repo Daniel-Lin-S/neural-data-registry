@@ -23,4 +23,4 @@ exec @ENV_PATH@ -i \
     NDR_PRIVILEGED_SOURCE_ROOTS=@SOURCE_ROOTS@ \
     NDR_PROTECTED_COORDINATOR=true \
     NDR_STARTUP_HEALTH_CHECK_ENABLED=false \
-    @CLI_PATH@ ingest-local "$@"
+    @CLI_PATH@ "$@"

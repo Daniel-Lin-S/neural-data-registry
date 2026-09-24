@@ -12,7 +12,12 @@ from starlette.responses import JSONResponse
 from neural_data_registry.config import Settings
 from neural_data_registry.health import request_health_check
 from neural_data_registry.db.models import Dataset
-from neural_data_registry.enums import Modality, Provider, StorageMode
+from neural_data_registry.enums import (
+    DatasetStatus,
+    Modality,
+    Provider,
+    StorageMode,
+)
 from neural_data_registry.service import (
     DatasetConflictError,
     check_download_connectivity,
@@ -110,13 +115,15 @@ def create_app(config: Settings | None = None) -> FastAPI:
             item = db.get(Dataset, dataset_id)
             if not item:
                 raise HTTPException(status_code=404, detail="Dataset not found")
-        report = request_health_check(dataset_id, config)
+        report = None
+        if item.status is not DatasetStatus.UNREGISTERED:
+            report = request_health_check(dataset_id, config)
         with session(config) as db:
             item = db.get(Dataset, dataset_id)
             data = dataset_dict(item)
-        if report.warning:
+        if report is not None and report.warning:
             data["health_warning"] = report.warning
-        if report.repair_in_progress:
+        if report is not None and report.repair_in_progress:
             data["repair_in_progress"] = True
         return data
 

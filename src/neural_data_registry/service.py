@@ -27,6 +27,7 @@ from neural_data_registry.storage import (
     move_into_managed_storage,
     normalize_managed_dataset_access,
     normalize_reference_dataset_access,
+    restore_dataset_ownership,
     safe_component,
 )
 
@@ -127,7 +128,13 @@ def find_datasets(db: Session, query: str | None = None, url: str | None = None,
     stmt = select(Dataset).options(selectinload(Dataset.aliases)).order_by(Dataset.created_at.desc())
     if not show_all:
         stmt = stmt.where(
-            Dataset.status.notin_((DatasetStatus.MISSING, DatasetStatus.BROKEN))
+            Dataset.status.notin_(
+                (
+                    DatasetStatus.MISSING,
+                    DatasetStatus.BROKEN,
+                    DatasetStatus.UNREGISTERED,
+                )
+            )
         )
     if query:
         needle = f"%{query}%"
@@ -925,6 +932,359 @@ def transition_reference_storage(
             raise
         finally:
             db.close()
+
+
+def unregister_moved_dataset(
+    identifier: str,
+    restore_to: Path,
+    owner_uid: int,
+    owner_gid: int,
+    config: Settings | None = None,
+    *,
+    managed_owner_uid: int | None = None,
+    managed_owner_gid: int | None = None,
+) -> Dataset:
+    """Restore a moved dataset and retain an inactive audit record.
+
+    Parameters
+    ----------
+    identifier : str
+        Dataset ID, canonical name, alias, or source URL.
+    restore_to : pathlib.Path
+        Absolute destination for the restored dataset directory.
+    owner_uid : int
+        UID that will own the restored tree.
+    owner_gid : int
+        GID that will own the restored tree.
+    config : Settings or None, optional
+        Registry configuration, by default None.
+    managed_owner_uid : int or None, optional
+        UID restored if the database update must be rolled back.
+    managed_owner_gid : int or None, optional
+        GID restored if the database update must be rolled back.
+
+    Returns
+    -------
+    Dataset
+        Preserved registry row in the unregistered state.
+
+    Raises
+    ------
+    DatasetNotFoundError
+        If no dataset matches the supplied identifier.
+    DatasetConflictError
+        If the record is not an active move registration.
+    ValueError
+        If either filesystem path is unsafe or unavailable.
+    """
+    if (managed_owner_uid is None) != (managed_owner_gid is None):
+        raise ValueError(
+            "Managed rollback ownership requires both UID and GID"
+        )
+    config = config or get_settings()
+    destination = restore_to.expanduser()
+    if not destination.is_absolute():
+        raise ValueError(
+            f"Restore destination must be an absolute path: {destination}"
+        )
+    destination = destination.resolve(strict=False)
+    if destination.exists():
+        raise ValueError(
+            f"Restore destination already exists: {destination}"
+        )
+    if not destination.parent.is_dir():
+        raise ValueError(
+            "Restore destination parent is not an existing directory: "
+            f"{destination.parent}"
+        )
+
+    with ingestion_lock("registry-intake", config):
+        ensure_layout(config)
+        create_database(config)
+        db = get_session_factory(config.resolved_database_url)()
+        source: Path | None = None
+        moved = False
+        try:
+            item = resolve_dataset(db, identifier)
+            if item is None:
+                raise DatasetNotFoundError(
+                    "No dataset matched the supplied ID, name, alias, or URL"
+                )
+            if item.status is DatasetStatus.UNREGISTERED:
+                raise DatasetConflictError(
+                    f"Dataset is already unregistered: {item.id}"
+                )
+            if item.storage_mode is not StorageMode.MOVE:
+                raise DatasetConflictError(
+                    "Only a dataset registered with storage mode 'move' can "
+                    "be restored by unregister"
+                )
+            if item.storage_path is None:
+                raise ValueError("Registered dataset has no storage path")
+            source = Path(item.storage_path).expanduser().resolve()
+            datasets_root = config.datasets_dir.expanduser().resolve()
+            if not source.is_relative_to(datasets_root):
+                raise ValueError(
+                    "Registered move source is outside managed dataset "
+                    f"storage: {source}"
+                )
+            if not source.is_dir():
+                raise ValueError(
+                    f"Registered dataset path is not a directory: {source}"
+                )
+
+            job = IngestionJob(
+                dataset_id=item.id,
+                mode="unregister-restore",
+                status=JobStatus.RUNNING,
+                message=f"Restoring dataset to {destination}",
+            )
+            db.add(job)
+            move_into_managed_storage(source, destination)
+            moved = True
+            restore_dataset_ownership(destination, owner_uid, owner_gid)
+
+            item.status = DatasetStatus.UNREGISTERED
+            item.storage_path = str(destination)
+            item.storage_mode = StorageMode.REFERENCE
+            job.status = JobStatus.SUCCEEDED
+            job.message = f"Dataset restored to {destination}"
+            db.commit()
+            db.refresh(item)
+            list(item.aliases)
+            (config.registry_dir / f"{item.id}.json").write_text(
+                json.dumps(dataset_dict(item), indent=2),
+                encoding="utf-8",
+            )
+            return item
+        except Exception as exc:
+            db.rollback()
+            if moved and source is not None and destination.exists():
+                try:
+                    move_into_managed_storage(destination, source)
+                    if managed_owner_uid is not None:
+                        normalize_managed_dataset_access(
+                            source,
+                            owner_uid=managed_owner_uid,
+                            owner_gid=managed_owner_gid,
+                        )
+                except Exception as restore_exc:
+                    raise RuntimeError(
+                        "Unregistration failed and the dataset could not be "
+                        f"returned to {source}; data remains at "
+                        f"{destination}: {restore_exc}"
+                    ) from exc
+            raise
+        finally:
+            db.close()
+
+
+def _set_reregistered_size(
+    item: Dataset,
+    path: Path,
+    size_bytes: int | None | object,
+) -> None:
+    """Set one reactivated dataset's known or unknown logical size."""
+    if size_bytes is _SIZE_NOT_MEASURED:
+        item.size_bytes = directory_size(path)
+        item.size_bytes_known = True
+        return
+    if size_bytes is None:
+        item.size_bytes = UNKNOWN_SIZE_BYTES
+        item.size_bytes_known = False
+        return
+    measured_size = int(size_bytes)
+    if measured_size < 0:
+        raise ValueError(
+            f"Dataset size must be non-negative, got {measured_size}"
+        )
+    item.size_bytes = measured_size
+    item.size_bytes_known = True
+
+
+def commit_reregistration(
+    identifier: str,
+    config: Settings,
+    *,
+    prepared_source: Path | None = None,
+    prepared_access_normalized: bool = False,
+    size_bytes: int | None | object = _SIZE_NOT_MEASURED,
+    managed_owner_uid: int | None = None,
+    managed_owner_gid: int | None = None,
+    restore_owner_uid: int | None = None,
+    restore_owner_gid: int | None = None,
+) -> Dataset:
+    """Reactivate an unregistered move record while holding the intake lock.
+
+    Parameters
+    ----------
+    identifier : str
+        Dataset ID, canonical name, alias, or source URL.
+    config : Settings
+        Registry configuration.
+    prepared_source : pathlib.Path or None, optional
+        Caller-staged source below the incoming workspace, by default None.
+    prepared_access_normalized : bool, optional
+        Whether the staged tree already has managed ownership and modes.
+    size_bytes : int, None, or object, optional
+        Caller-measured logical size, unknown size marker, or an internal
+        sentinel requesting a service-side measurement.
+    managed_owner_uid : int or None, optional
+        Service-account UID for managed storage.
+    managed_owner_gid : int or None, optional
+        Service-account GID for managed storage.
+    restore_owner_uid : int or None, optional
+        Caller UID used only when a direct move must be rolled back.
+    restore_owner_gid : int or None, optional
+        Caller GID used only when a direct move must be rolled back.
+
+    Returns
+    -------
+    Dataset
+        Reactivated registry row.
+    """
+    if (managed_owner_uid is None) != (managed_owner_gid is None):
+        raise ValueError(
+            "Managed ownership requires both UID and GID"
+        )
+    if (restore_owner_uid is None) != (restore_owner_gid is None):
+        raise ValueError(
+            "Restore ownership requires both UID and GID"
+        )
+    if prepared_access_normalized and prepared_source is None:
+        raise ValueError(
+            "Prepared access can be normalized only when a prepared source "
+            "is supplied"
+        )
+
+    ensure_layout(config)
+    create_database(config)
+    db = get_session_factory(config.resolved_database_url)()
+    source: Path | None = None
+    destination: Path | None = None
+    moved = False
+    try:
+        item = resolve_dataset(db, identifier)
+        if item is None:
+            raise DatasetNotFoundError(
+                "No dataset matched the supplied ID, name, alias, or URL"
+            )
+        if item.status is not DatasetStatus.UNREGISTERED:
+            raise DatasetConflictError(
+                "Only an unregistered dataset can be re-registered"
+            )
+        if item.storage_mode is not StorageMode.REFERENCE:
+            raise DatasetConflictError(
+                "Unregistered dataset must reference its restored source"
+            )
+        if item.storage_path is None:
+            raise ValueError("Unregistered dataset has no restored source path")
+        source = Path(item.storage_path).expanduser().resolve()
+        datasets_root = config.datasets_dir.expanduser().resolve()
+        if source.is_relative_to(datasets_root):
+            raise ValueError(
+                "Unregistered dataset source must be outside managed storage: "
+                f"{source}"
+            )
+        if prepared_source is None and not source.is_dir():
+            raise ValueError(
+                f"Unregistered dataset source is not a directory: {source}"
+            )
+        if prepared_source is not None and not prepared_source.is_dir():
+            raise ValueError(
+                "Prepared re-registration source is not a directory: "
+                f"{prepared_source}"
+            )
+        destination = dataset_destination(
+            item.id,
+            item.name,
+            item.version,
+            config,
+        )
+        if destination.exists():
+            raise DatasetConflictError(
+                f"Managed destination already exists: {destination}"
+            )
+
+        job = IngestionJob(
+            dataset_id=item.id,
+            mode="reregister-move",
+            status=JobStatus.RUNNING,
+            message=f"Re-registering dataset from {source}",
+        )
+        db.add(job)
+        move_into_managed_storage(prepared_source or source, destination)
+        moved = True
+        if not prepared_access_normalized:
+            normalize_managed_dataset_access(
+                destination,
+                owner_uid=managed_owner_uid,
+                owner_gid=managed_owner_gid,
+            )
+
+        item.status = DatasetStatus.AVAILABLE
+        item.storage_path = str(destination)
+        item.storage_mode = StorageMode.MOVE
+        _set_reregistered_size(item, destination, size_bytes)
+        job.status = JobStatus.SUCCEEDED
+        job.message = f"Dataset re-registered at {destination}"
+        db.commit()
+        db.refresh(item)
+        list(item.aliases)
+        (config.registry_dir / f"{item.id}.json").write_text(
+            json.dumps(dataset_dict(item), indent=2),
+            encoding="utf-8",
+        )
+        return item
+    except Exception as exc:
+        db.rollback()
+        moved_source = prepared_source or source
+        if (
+            moved
+            and destination is not None
+            and destination.exists()
+            and moved_source is not None
+            and not moved_source.exists()
+        ):
+            try:
+                move_into_managed_storage(destination, moved_source)
+                if prepared_source is None and restore_owner_uid is not None:
+                    restore_dataset_ownership(
+                        moved_source,
+                        restore_owner_uid,
+                        restore_owner_gid,
+                    )
+            except Exception as restore_exc:
+                raise RuntimeError(
+                    "Re-registration failed and the dataset could not be "
+                    f"returned to {moved_source}; data remains at "
+                    f"{destination}: {restore_exc}"
+                ) from exc
+        raise
+    finally:
+        db.close()
+
+
+def reregister_moved_dataset(
+    identifier: str,
+    config: Settings | None = None,
+    *,
+    managed_owner_uid: int | None = None,
+    managed_owner_gid: int | None = None,
+    restore_owner_uid: int | None = None,
+    restore_owner_gid: int | None = None,
+) -> Dataset:
+    """Reactivate a restored dataset through the normal intake lock."""
+    config = config or get_settings()
+    with ingestion_lock("registry-intake", config):
+        return commit_reregistration(
+            identifier,
+            config,
+            managed_owner_uid=managed_owner_uid,
+            managed_owner_gid=managed_owner_gid,
+            restore_owner_uid=restore_owner_uid,
+            restore_owner_gid=restore_owner_gid,
+        )
 
 
 def infer_url_version(url: str) -> str | None:

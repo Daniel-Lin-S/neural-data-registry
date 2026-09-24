@@ -399,6 +399,41 @@ be added with `--url`; its provider is detected from the URL. Existing provider
 and version values are protected unless `--force-replace` is supplied. A
 canonical source URL is never replaced.
 
+### `brainctl unregister`
+
+Undo a local registration created with `--storage-mode move` and restore the
+dataset to a caller-owned source path:
+
+```bash
+brainctl unregister DATASET \
+  --restore-to /ABSOLUTE/PATH/TO/DATASET
+```
+
+The destination parent must already exist, the destination itself must not
+exist, and protected deployments require the destination to be below an
+approved source root. The command returns ownership to the invoking user and
+marks the registry record `unregistered`; it does not delete the record or its
+metadata. Unregistered records are hidden from normal listings and remain
+visible with `brainctl list --show-all`.
+
+Registrations created before permission snapshots are supported cannot recover
+the exact earlier modes or ACLs. For those records, the command retains the
+managed modes and reports this limitation while restoring caller ownership.
+
+### `brainctl reregister`
+
+After the restored transfer is complete, reactivate that same audit record:
+
+```bash
+brainctl reregister DATASET
+```
+
+The command moves the dataset from its restored source path back into managed
+storage, restores managed access, recalculates its logical size, and records a
+new job. It reuses the existing dataset ID and metadata, so it cannot create a
+duplicate canonical name or source URL. Only records created by `unregister`
+are eligible.
+
 ## API
 
 Run the API service:

@@ -2,10 +2,13 @@
 
 set -eu
 
-if [ "${1-}" = "ingest-local" ]; then
-    shift
-    exec @SUDO_PATH@ -n -- @HELPER_PATH@ "$@"
-fi
+case "${1-}" in
+    ingest-local|unregister|reregister)
+        command_name=$1
+        shift
+        exec @SUDO_PATH@ -n -- @HELPER_PATH@ "$command_name" "$@"
+        ;;
+esac
 
 exec @SUDO_PATH@ -n -u @SERVICE_USER@ -- \
     @COMMAND_HELPER_PATH@ "$@"

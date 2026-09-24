@@ -36,8 +36,10 @@ from neural_data_registry.service import (
     commit_local_ingestion_request,
     download as download_dataset,
     prepare_local_ingestion_request,
+    reregister_moved_dataset,
     resolve_dataset,
     resolve_download_version,
+    unregister_moved_dataset,
     validate_privileged_source,
     infer_url_version,
 )
@@ -617,6 +619,48 @@ def test_caller_scoped_staging_failure_preserves_partial_data(
     assert source.is_dir()
 
 
+def test_protected_reregister_reactivates_the_restored_dataset(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Stage restored caller data before reactivating the original record."""
+    config = _caller_scoped_config(tmp_path)
+    source = mock_dataset(tmp_path / "data", "protected-reregister-source")
+    _mock_caller_scoped_identities(monkeypatch)
+    item, warning = protected_ingest.coordinate_protected_ingestion(
+        source,
+        "Protected reregister",
+        Provider.OTHER,
+        None,
+        "1",
+        ["meg"],
+        StorageMode.MOVE,
+        [],
+        config,
+    )
+    assert warning is None
+    restored_path = tmp_path / "data" / "protected-reregister-restored"
+    unregister_moved_dataset(
+        item.id,
+        restored_path,
+        os.getuid(),
+        os.getgid(),
+        config,
+    )
+
+    reregistered, warning = (
+        protected_ingest.coordinate_protected_reregistration(item.id, config)
+    )
+
+    assert warning is None
+    assert reregistered.id == item.id
+    assert reregistered.status is DatasetStatus.AVAILABLE
+    assert reregistered.storage_mode is StorageMode.MOVE
+    assert Path(reregistered.storage_path).is_relative_to(config.datasets_dir)
+    assert not restored_path.exists()
+    assert list(config.incoming_dir.iterdir()) == []
+
+
 def test_prepared_ingestion_restores_staging_before_failed_commit(
     config: Settings,
     tmp_path: Path,
@@ -667,7 +711,9 @@ def test_protected_installer_never_traverses_source_roots() -> None:
 
     assert '@COMMAND_HELPER_PATH@ "$@"' in wrapper
     assert '@CLI_PATH@ "$@"' in command_helper
-    assert '"${1-}" = "ingest-local"' in command_helper
+    assert 'ingest-local|unregister|reregister)' in wrapper
+    assert 'ingest-local|unregister|reregister)' in command_helper
+    assert '@CLI_PATH@ "$@"' in helper
     assert 'find "$source_root"' not in installer
     assert 'chown -R "$source_root"' not in installer
     assert 'chmod -R "$source_root"' not in installer
@@ -779,6 +825,185 @@ def test_local_ingestion_can_move_mock_dataset(config, tmp_path):
     assert not source.exists()
     assert Path(item.storage_path).is_relative_to(config.datasets_dir)
     assert (Path(item.storage_path) / "meg.fif").is_file()
+
+
+def test_unregister_restores_move_and_preserves_audit_record(
+    config: Settings,
+    tmp_path: Path,
+) -> None:
+    """Restore moved files while retaining inactive metadata and a job."""
+    source = mock_dataset(tmp_path, "unregister-source")
+    item = ingest_local(
+        source,
+        "Unregister MEG",
+        Provider.OTHER,
+        None,
+        "1.0.0",
+        ["meg"],
+        config,
+        storage_mode=StorageMode.MOVE,
+    )
+    managed_path = Path(item.storage_path)
+    restored_path = tmp_path / "restored-source"
+
+    restored = unregister_moved_dataset(
+        item.id,
+        restored_path,
+        os.getuid(),
+        os.getgid(),
+        config,
+    )
+
+    assert not managed_path.exists()
+    assert Path(restored.storage_path) == restored_path
+    assert restored.status is DatasetStatus.UNREGISTERED
+    assert restored.storage_mode is StorageMode.REFERENCE
+    assert Path(restored_path, "meg.fif").is_file()
+    with session(config) as db:
+        stored = db.get(Dataset, item.id)
+        assert stored is not None
+        assert stored.name == "Unregister MEG"
+        assert find_datasets(db) == []
+        assert [row.id for row in find_datasets(db, show_all=True)] == [
+            item.id
+        ]
+        job = (
+            db.query(IngestionJob)
+            .filter(
+                IngestionJob.dataset_id == item.id,
+                IngestionJob.mode == "unregister-restore",
+            )
+            .first()
+        )
+        assert job is not None
+        assert job.status.value == "succeeded"
+
+
+def test_unregister_rejects_unsafe_or_inapplicable_requests(
+    config: Settings,
+    tmp_path: Path,
+) -> None:
+    """Leave data untouched when unregister preconditions are not met."""
+    referenced_source = mock_dataset(tmp_path, "reference-source")
+    referenced = ingest_local(
+        referenced_source,
+        "Referenced MEG",
+        Provider.OTHER,
+        None,
+        "1",
+        ["meg"],
+        config,
+    )
+    with pytest.raises(RuntimeError, match="storage mode 'move'"):
+        unregister_moved_dataset(
+            referenced.id,
+            tmp_path / "reference-restored",
+            os.getuid(),
+            os.getgid(),
+            config,
+        )
+    assert referenced_source.is_dir()
+
+    move_source = mock_dataset(tmp_path, "second-move-source")
+    moved = ingest_local(
+        move_source,
+        "Second move",
+        Provider.OTHER,
+        None,
+        "1",
+        ["meg"],
+        config,
+        storage_mode=StorageMode.MOVE,
+    )
+    occupied = mock_dataset(tmp_path, "occupied")
+    with pytest.raises(ValueError, match="already exists"):
+        unregister_moved_dataset(
+            moved.id,
+            occupied,
+            os.getuid(),
+            os.getgid(),
+            config,
+        )
+    assert Path(moved.storage_path).is_dir()
+
+
+def test_reregister_reactivates_the_preserved_record(
+    config: Settings,
+    tmp_path: Path,
+) -> None:
+    """Return a restored dataset to managed storage without duplicating it."""
+    source = mock_dataset(tmp_path, "reregister-source")
+    item = ingest_local(
+        source,
+        "Reregister MEG",
+        Provider.OTHER,
+        None,
+        "1.0.0",
+        ["meg"],
+        config,
+        storage_mode=StorageMode.MOVE,
+    )
+    restored_path = tmp_path / "reregister-restored"
+    unregistered = unregister_moved_dataset(
+        item.id,
+        restored_path,
+        os.getuid(),
+        os.getgid(),
+        config,
+    )
+
+    reregistered = reregister_moved_dataset(
+        unregistered.id,
+        config,
+        restore_owner_uid=os.getuid(),
+        restore_owner_gid=os.getgid(),
+    )
+
+    expected_path = dataset_destination(
+        item.id,
+        item.name,
+        item.version,
+        config,
+    )
+    assert reregistered.id == item.id
+    assert reregistered.status is DatasetStatus.AVAILABLE
+    assert reregistered.storage_mode is StorageMode.MOVE
+    assert Path(reregistered.storage_path) == expected_path
+    assert expected_path.is_dir()
+    assert not restored_path.exists()
+    with session(config) as db:
+        assert [row.id for row in find_datasets(db)] == [item.id]
+        job = (
+            db.query(IngestionJob)
+            .filter(
+                IngestionJob.dataset_id == item.id,
+                IngestionJob.mode == "reregister-move",
+            )
+            .first()
+        )
+        assert job is not None
+        assert job.status.value == "succeeded"
+
+
+def test_reregister_rejects_an_active_dataset(
+    config: Settings,
+    tmp_path: Path,
+) -> None:
+    """Reject re-registration before moving data from an active record."""
+    source = mock_dataset(tmp_path, "active-reregister-source")
+    item = ingest_local(
+        source,
+        "Active reregister MEG",
+        Provider.OTHER,
+        None,
+        "1",
+        ["meg"],
+        config,
+        storage_mode=StorageMode.MOVE,
+    )
+    with pytest.raises(RuntimeError, match="unregistered dataset"):
+        reregister_moved_dataset(item.id, config)
+    assert Path(item.storage_path).is_dir()
 
 
 def test_storage_transition_api_moves_reference_and_preserves_metadata(config, tmp_path):

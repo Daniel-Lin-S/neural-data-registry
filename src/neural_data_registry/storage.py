@@ -145,6 +145,10 @@ def _resolve_dataset_root(path: Path) -> Path:
             "Dataset root must not be a symbolic link: "
             f"{requested_path.absolute()}"
         )
+    if not requested_path.exists():
+        raise ValueError(
+            f"Dataset root is not a directory: {requested_path.absolute()}"
+        )
     try:
         root = requested_path.resolve(strict=True)
     except OSError as exc:
@@ -295,6 +299,45 @@ def normalize_managed_dataset_access(
             owner_gid,
         )
         report_progress(entry_path)
+
+
+def restore_dataset_ownership(
+    path: Path,
+    owner_uid: int,
+    owner_gid: int,
+) -> None:
+    """Return a dataset tree to one Unix account without following links.
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        Dataset directory whose ownership will be restored.
+    owner_uid : int
+        UID that will own every entry.
+    owner_gid : int
+        GID that will own every entry.
+
+    Raises
+    ------
+    ValueError
+        If the dataset root is invalid.
+    OSError
+        If an entry cannot be inspected or updated.
+
+    Notes
+    -----
+    Existing modes are retained. Managed ingestion may have removed prior
+    ACLs, so registrations created before access snapshots exist cannot
+    recover those ACLs.
+    """
+    root = _resolve_dataset_root(path)
+    for entry_path, _ in _iter_dataset_entries(root):
+        os.chown(
+            entry_path,
+            owner_uid,
+            owner_gid,
+            follow_symlinks=False,
+        )
 
 
 def safe_component(value: str) -> str: return re.sub(r"[^a-zA-Z0-9._-]+", "-", value).strip(".-").lower() or "dataset"

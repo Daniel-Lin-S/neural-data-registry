@@ -44,6 +44,7 @@ class LocalIngestionRequest(BaseModel):
     modalities: list[Modality] = Field(default_factory=list)
     aliases: list[str] = Field(default_factory=list)
     storage_mode: StorageMode = StorageMode.REFERENCE
+    exclude_subfolders: list[str] = Field(default_factory=list)
 
 
 class DownloadRequest(BaseModel):
@@ -181,6 +182,7 @@ def create_app(config: Settings | None = None) -> FastAPI:
                 request.source, request.name, request.provider, request.url,
                 request.version, request.modalities, config, request.storage_mode,
                 name_aliases=request.aliases,
+                excluded_subfolders=request.exclude_subfolders,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc

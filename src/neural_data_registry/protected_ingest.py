@@ -38,8 +38,10 @@ from neural_data_registry.service import (
     validate_privileged_source,
 )
 from neural_data_registry.storage import (
+    copy_into_managed_storage,
     directory_size,
     ingestion_lock,
+    move_into_managed_storage,
     normalize_managed_dataset_access,
     normalize_reference_dataset_access,
 )
@@ -147,15 +149,29 @@ def _stage_source_as_caller(
     try:
         with effective_identity(caller):
             if request.storage_mode is StorageMode.COPY:
-                shutil.copytree(request.source, payload)
+                copy_into_managed_storage(
+                    request.source,
+                    payload,
+                    request.excluded_subfolders,
+                )
             elif request.storage_mode is StorageMode.MOVE:
-                shutil.move(str(request.source), str(payload))
+                move_into_managed_storage(
+                    request.source,
+                    payload,
+                    request.excluded_subfolders,
+                )
             else:
                 raise ValueError(
                     "Caller staging requires copy or move storage mode"
                 )
             try:
-                size_bytes = directory_size(payload)
+                if request.excluded_subfolders:
+                    size_bytes = directory_size(
+                        payload,
+                        request.excluded_subfolders,
+                    )
+                else:
+                    size_bytes = directory_size(payload)
             except OSError as exc:
                 size_bytes = None
                 warning = (
@@ -193,7 +209,13 @@ def _prepare_reference_as_caller(
     """Publish and measure one reference using caller permissions."""
     try:
         with effective_identity(caller):
-            normalize_reference_dataset_access(request.source)
+            if request.excluded_subfolders:
+                normalize_reference_dataset_access(
+                    request.source,
+                    request.excluded_subfolders,
+                )
+            else:
+                normalize_reference_dataset_access(request.source)
     except OSError as exc:
         failed_path = exc.filename or str(request.source)
         raise RuntimeError(
@@ -202,7 +224,13 @@ def _prepare_reference_as_caller(
         ) from exc
     try:
         with effective_identity(caller):
-            size_bytes = directory_size(request.source)
+            if request.excluded_subfolders:
+                size_bytes = directory_size(
+                    request.source,
+                    request.excluded_subfolders,
+                )
+            else:
+                size_bytes = directory_size(request.source)
     except OSError as exc:
         warning = (
             "Dataset size could not be measured with caller permissions; "
@@ -222,6 +250,7 @@ def coordinate_protected_ingestion(
     storage_mode: StorageMode,
     name_aliases: Sequence[str],
     config: Settings,
+    excluded_subfolders: Sequence[str] = (),
 ) -> tuple[Dataset, str | None]:
     """Run source work as the caller and registry work as the service.
 
@@ -270,6 +299,7 @@ def coordinate_protected_ingestion(
         modalities,
         storage_mode,
         name_aliases,
+        excluded_subfolders,
     )
 
     with effective_identity(service):
@@ -459,6 +489,7 @@ def coordinate_protected_reregistration(
             storage_mode=StorageMode.MOVE,
             has_remote_url=item.source_url is not None,
             name_aliases=(),
+            excluded_subfolders=(),
         )
         with ingestion_lock("registry-intake", config):
             with effective_identity(UnixIdentity("root", 0, 0, (0,))):

@@ -20,6 +20,9 @@ HUGGINGFACE_HOSTS = frozenset({"hf.co", "huggingface.co"})
 ZENODO_DOI_PATTERN = re.compile(
     r"^10\.(?:5281|5072)/zenodo\.[0-9]+$", re.IGNORECASE
 )
+DANDI_DOI_PATTERN = re.compile(
+    r"^10\.48324/dandi\.[0-9]+(?:/|$)", re.IGNORECASE
+)
 
 
 class ProviderDownloadError(RuntimeError):
@@ -109,6 +112,13 @@ def _is_zenodo_record_url(host: str, path: str) -> bool:
     )
 
 
+def _is_dandi_doi_url(host: str, path: str) -> bool:
+    """Recognize a Dandiset DOI without accepting unrelated DOI records."""
+    return host == "doi.org" and bool(
+        DANDI_DOI_PATTERN.match(path.lstrip("/"))
+    )
+
+
 def _is_huggingface_dataset_url(host: str, path: str) -> bool:
     """Return whether a Hugging Face URL identifies a dataset repository."""
 
@@ -136,6 +146,8 @@ def provider_for_url(url: str) -> Provider:
         return Provider.OSF
     if _is_zenodo_record_url(host, parsed.path):
         return Provider.ZENODO
+    if _is_dandi_doi_url(host, parsed.path):
+        return Provider.DANDI
     if _is_huggingface_dataset_url(host, parsed.path):
         return Provider.HUGGINGFACE
     providers = {

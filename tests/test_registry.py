@@ -1975,6 +1975,10 @@ def test_failed_download_remains_in_incoming(config, monkeypatch):
         ("https://sandbox.zenodo.org/records/123", Provider.ZENODO),
         ("https://doi.org/10.5281/zenodo.583331", Provider.ZENODO),
         (
+            "https://doi.org/10.48324/dandi.000055/0.220127.0436",
+            Provider.DANDI,
+        ),
+        (
             "https://huggingface.co/datasets/example/dataset",
             Provider.HUGGINGFACE,
         ),
@@ -1999,6 +2003,7 @@ def test_new_providers_are_recognized_but_not_downloaded(url, provider):
         "https://zenodo.org/",
         "https://zenodo.org/communities/neuroscience/",
         "https://zenodo.org/records/not-a-record-id",
+        "https://doi.org/10.48324/other.000055/0.220127.0436",
         "https://huggingface.co/",
         "https://huggingface.co/models/example/model",
         "https://huggingface.co/api/models/example/model",
@@ -2094,6 +2099,36 @@ def test_ingest_local_detects_huggingface_provider_from_url(config, tmp_path):
     assert item.version == "unknown"
 
 
+def test_ingest_local_cli_detects_dandi_doi_version(
+    config: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The CLI accepts DANDI and derives its published DOI version."""
+    source = mock_dataset(tmp_path, "dandi-doi-local")
+    monkeypatch.setattr(cli, "get_settings", lambda: config)
+    monkeypatch.setattr(cli, "maybe_launch_cooldown_check", lambda: None)
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "ingest-local",
+            str(source),
+            "--name", "DANDI DOI local",
+            "--url", "https://doi.org/10.48324/dandi.000055/0.220127.0436",
+            "--provider", "dandi",
+            "--modality", "ieeg",
+            "--storage-mode", "copy",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    with session(config) as db:
+        item = db.query(Dataset).filter_by(name="DANDI DOI local").one()
+        assert item.provider is Provider.DANDI
+        assert item.version == "0.220127.0436"
+
+
 def test_ingest_local_uses_other_for_unknown_url(config, tmp_path):
     item = ingest_local(
         mock_dataset(tmp_path, "unknown-url"),
@@ -2133,8 +2168,17 @@ def test_download_version_is_inferred_or_required():
     assert resolve_download_version(
         "https://www.physionet.org/content/eegmmidb/1.0.0/"
     ) == "1.0.0"
+    assert resolve_download_version(
+        "https://dandiarchive.org/dandiset/000001/1.0.0"
+    ) == "1.0.0"
+    assert resolve_download_version(
+        "https://doi.org/10.48324/dandi.000055/0.220127.0436"
+    ) == "0.220127.0436"
+    assert infer_url_version(
+        "https://doi.org/10.48324/dandi.000055"
+    ) is None
     with pytest.raises(ValueError, match="version is required"):
-        resolve_download_version("https://dandiarchive.org/dandiset/000001/1.0.0")
+        resolve_download_version("https://dandiarchive.org/dandiset/000001")
 
 def test_datalad_resume_skips_clone(tmp_path, monkeypatch):
     """Resume an existing DataLad workspace with get instead of cloning again."""

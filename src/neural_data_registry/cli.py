@@ -278,6 +278,14 @@ def ingest_local_command(
         "--storage-mode",
         help="Reference, move, or copy the source dataset.",
     ),
+    exclude_subfolder: list[str] = typer.Option(
+        [],
+        "--exclude-subfolder",
+        help=(
+            "Dataset-relative subfolder to leave untouched and exclude "
+            "from size; repeat for multiple paths."
+        ),
+    ),
 ) -> None:
     """Register an already-downloaded local dataset.
 
@@ -328,6 +336,7 @@ def ingest_local_command(
                 storage_mode,
                 alias,
                 config,
+                excluded_subfolders=exclude_subfolder,
             )
         else:
             item = ingest_local(
@@ -340,6 +349,7 @@ def ingest_local_command(
                 config=config,
                 storage_mode=storage_mode,
                 name_aliases=alias,
+                excluded_subfolders=exclude_subfolder,
             )
     except (RuntimeError, ValueError) as exc:
         raise typer.BadParameter(str(exc), param_hint="SOURCE") from exc

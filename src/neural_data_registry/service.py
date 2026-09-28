@@ -40,6 +40,11 @@ PATH_ALIAS_KIND = "path"
 
 UNKNOWN_SIZE_BYTES = 0
 _SIZE_NOT_MEASURED = object()
+DANDI_VERSION_PATTERN = re.compile(
+    r"/(?:dandi\.[0-9]+|dandiset/[0-9]+|versions)/"
+    r"([0-9]+(?:\.[0-9]+)+)(?=/|$)",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -55,6 +60,7 @@ class LocalIngestionRequest:
     storage_mode: StorageMode
     has_remote_url: bool
     name_aliases: tuple[str, ...]
+    excluded_subfolders: tuple[str, ...] = ()
 
 
 def _remote_url_identity(url: str | None) -> tuple[str, str, int | None, str] | None:
@@ -540,6 +546,7 @@ def prepare_local_ingestion_request(
     modalities: Sequence[str | Modality],
     storage_mode: StorageMode,
     name_aliases: Sequence[str],
+    excluded_subfolders: Sequence[str] = (),
 ) -> LocalIngestionRequest:
     """Normalize a local ingestion request without reading dataset contents."""
     normalized_name = name.strip()
@@ -566,6 +573,7 @@ def prepare_local_ingestion_request(
         storage_mode=StorageMode(storage_mode),
         has_remote_url=has_remote_url,
         name_aliases=normalized_aliases,
+        excluded_subfolders=tuple(excluded_subfolders),
     )
 
 
@@ -671,9 +679,17 @@ def _ingest_local_locked(
             if prepared_source is not None:
                 move_into_managed_storage(prepared_source, managed_path)
             elif request.storage_mode is StorageMode.MOVE:
-                move_into_managed_storage(request.source, managed_path)
+                move_into_managed_storage(
+                    request.source,
+                    managed_path,
+                    request.excluded_subfolders,
+                )
             elif request.storage_mode is StorageMode.COPY:
-                copy_into_managed_storage(request.source, managed_path)
+                copy_into_managed_storage(
+                    request.source,
+                    managed_path,
+                    request.excluded_subfolders,
+                )
             else:
                 raise ValueError(
                     f"Unsupported storage mode: {request.storage_mode}"
@@ -682,7 +698,13 @@ def _ingest_local_locked(
                 normalize_managed_dataset_access(managed_path)
         item.storage_path = str(managed_path)
         if size_bytes is _SIZE_NOT_MEASURED:
-            item.size_bytes = directory_size(managed_path)
+            if request.excluded_subfolders:
+                item.size_bytes = directory_size(
+                    managed_path,
+                    request.excluded_subfolders,
+                )
+            else:
+                item.size_bytes = directory_size(managed_path)
             item.size_bytes_known = True
         elif size_bytes is None:
             item.size_bytes = UNKNOWN_SIZE_BYTES
@@ -840,6 +862,7 @@ def ingest_local(
     storage_mode: StorageMode = StorageMode.REFERENCE,
     *,
     name_aliases: Sequence[str] = (),
+    excluded_subfolders: Sequence[str] = (),
 ) -> Dataset:
     """Register a local dataset after identity preflight and under intake lock."""
     config = config or get_settings()
@@ -852,6 +875,7 @@ def ingest_local(
         modalities,
         storage_mode,
         name_aliases,
+        excluded_subfolders,
     )
     preflight_local_ingestion_request(request, config)
     if config.privileged_ingest_only:
@@ -861,7 +885,13 @@ def ingest_local(
         preflight_local_ingestion_request(request, config)
         if request.storage_mode is StorageMode.REFERENCE:
             try:
-                normalize_reference_dataset_access(request.source)
+                if request.excluded_subfolders:
+                    normalize_reference_dataset_access(
+                        request.source,
+                        request.excluded_subfolders,
+                    )
+                else:
+                    normalize_reference_dataset_access(request.source)
             except OSError as exc:
                 failed_path = exc.filename or str(request.source)
                 raise RuntimeError(
@@ -1293,6 +1323,8 @@ def infer_url_version(url: str) -> str | None:
     path = urlparse(url).path
     if provider is Provider.OPENNEURO:
         match = re.search(r"/versions/([0-9]+(?:\.[0-9]+)*)", path)
+    elif provider is Provider.DANDI:
+        match = DANDI_VERSION_PATTERN.search(path)
     elif provider is Provider.PHYSIONET:
         # PhysioNet content URLs use /content/<dataset>/<version>/.
         match = re.search(r"/content/[^/]+/([0-9]+(?:\.[0-9]+)+)(?:/|$)", path)

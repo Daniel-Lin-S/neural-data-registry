@@ -44,14 +44,40 @@ def ensure_layout(config: Settings | None = None) -> None:
     config = config or get_settings()
     for path in (config.datasets_dir, config.incoming_dir, config.quarantine_dir, config.registry_dir, config.logs_dir, config.ingestion_lock_dir, config.health_cooldown_dir): path.mkdir(parents=True, exist_ok=True)
 
-def directory_size(path: Path) -> int:
+def _excluded_subfolder_set(
+    excluded_subfolders: tuple[str, ...] | list[str],
+) -> set[Path]:
+    """Return validated dataset-relative subfolder paths."""
+    excluded: set[Path] = set()
+    for value in excluded_subfolders:
+        candidate = Path(value)
+        if (
+            not value
+            or candidate == Path(".")
+            or candidate.is_absolute()
+            or any(part in {"", ".", ".."} for part in value.split("/"))
+        ):
+            raise ValueError(
+                "Excluded subfolders must be non-empty relative paths "
+                f"without '.' or '..': {value!r}"
+            )
+        excluded.add(candidate)
+    return excluded
+
+
+def directory_size(
+    path: Path,
+    excluded_subfolders: tuple[str, ...] | list[str] = (),
+) -> int:
     """Return logical file bytes below *path*, counting each inode once.
 
     ``Path.stat`` follows file symlinks, which lets a DataLad checkout count
     annexed content as payload. Tracking the resolved device/inode prevents
     that content from being counted again through both its working-tree link
     and its ``.git/annex/objects`` path. Dangling links are not payload.
+    Excluded subfolder paths are relative to *path* and are not traversed.
     """
+    excluded = _excluded_subfolder_set(excluded_subfolders)
     total = 0
     seen: set[tuple[int, int]] = set()
 
@@ -60,10 +86,17 @@ def directory_size(path: Path) -> int:
 
     for current_root, directory_names, file_names in os.walk(
         path,
+        topdown=True,
         followlinks=False,
         onerror=raise_walk_error,
     ):
         current = Path(current_root)
+        relative_root = current.relative_to(path)
+        directory_names[:] = [
+            name
+            for name in directory_names
+            if relative_root / name not in excluded
+        ]
         for name in (*directory_names, *file_names):
             item = current / name
             try:
@@ -163,8 +196,10 @@ def _resolve_dataset_root(path: Path) -> Path:
 
 def _iter_dataset_entries(
     path: Path,
+    excluded_subfolders: tuple[str, ...] | list[str] = (),
 ) -> Iterator[tuple[Path, os.stat_result]]:
     """Yield dataset entries without following symbolic links."""
+    excluded = _excluded_subfolder_set(excluded_subfolders)
     pending = [path]
     while pending:
         current = pending.pop()
@@ -173,6 +208,8 @@ def _iter_dataset_entries(
         with os.scandir(current) as entries:
             for entry in entries:
                 entry_path = Path(entry.path)
+                if entry_path.relative_to(path) in excluded:
+                    continue
                 entry_stat = entry.stat(follow_symlinks=False)
                 if stat.S_ISDIR(entry_stat.st_mode):
                     pending.append(entry_path)
@@ -190,10 +227,16 @@ def _reference_public_mode(entry_mode: int) -> int | None:
     return current_mode | REFERENCE_FILE_PUBLIC_MODE
 
 
-def _validate_reference_publication_access(root: Path) -> None:
+def _validate_reference_publication_access(
+    root: Path,
+    excluded_subfolders: tuple[str, ...] | list[str] = (),
+) -> None:
     """Reject a reference whose public permissions cannot be changed."""
     effective_uid = os.geteuid()
-    for entry_path, entry_stat in _iter_dataset_entries(root):
+    for entry_path, entry_stat in _iter_dataset_entries(
+        root,
+        excluded_subfolders,
+    ):
         public_mode = _reference_public_mode(entry_stat.st_mode)
         if public_mode is None:
             continue
@@ -209,7 +252,10 @@ def _validate_reference_publication_access(root: Path) -> None:
         )
 
 
-def normalize_reference_dataset_access(path: Path) -> None:
+def normalize_reference_dataset_access(
+    path: Path,
+    excluded_subfolders: tuple[str, ...] | list[str] = (),
+) -> None:
     """Publish a reference tree without changing ownership or existing rights.
 
     Directories gain missing other-read and other-execute permissions. Files
@@ -221,6 +267,8 @@ def normalize_reference_dataset_access(path: Path) -> None:
     ----------
     path : pathlib.Path
         Referenced dataset directory.
+    excluded_subfolders : sequence of str, optional
+        Dataset-relative directories to leave untouched.
 
     Raises
     ------
@@ -233,8 +281,11 @@ def normalize_reference_dataset_access(path: Path) -> None:
         If an entry cannot be inspected or its permissions cannot be updated.
     """
     root = _resolve_dataset_root(path)
-    _validate_reference_publication_access(root)
-    for entry_path, entry_stat in _iter_dataset_entries(root):
+    _validate_reference_publication_access(root, excluded_subfolders)
+    for entry_path, entry_stat in _iter_dataset_entries(
+        root,
+        excluded_subfolders,
+    ):
         public_mode = _reference_public_mode(entry_stat.st_mode)
         if public_mode is None:
             continue
@@ -374,14 +425,91 @@ def dataset_destination(dataset_id: str, name: str, version: str, config: Settin
     """Build the managed storage path for a dataset without creating it."""
     config = config or get_settings()
     return config.datasets_dir / f"{safe_component(name)}-{safe_component(version)}-{dataset_id}"
-def copy_into_managed_storage(source: Path, destination: Path) -> None:
-    """Copy a source directory into managed storage, preserving the source."""
-    if destination.exists(): raise IngestionConflictError(f"Managed destination already exists: {destination}")
-    if not source.is_dir(): raise ValueError(f"Source must be an existing directory: {source}")
-    destination.parent.mkdir(parents=True, exist_ok=True); shutil.copytree(source, destination)
+def _copy_ignore_callback(
+    source: Path,
+    excluded: set[Path],
+) -> Callable[[str, list[str]], set[str]]:
+    """Build a copytree callback that prunes selected relative directories."""
+    def ignore(current: str, names: list[str]) -> set[str]:
+        relative = Path(current).relative_to(source)
+        return {name for name in names if relative / name in excluded}
 
-def move_into_managed_storage(source: Path, destination: Path) -> None:
-    """Explicitly move a source directory into managed storage."""
-    if destination.exists(): raise IngestionConflictError(f"Managed destination already exists: {destination}")
-    if not source.is_dir(): raise ValueError(f"Source must be an existing directory: {source}")
-    destination.parent.mkdir(parents=True, exist_ok=True); shutil.move(str(source), str(destination))
+    return ignore
+
+
+def copy_into_managed_storage(
+    source: Path,
+    destination: Path,
+    excluded_subfolders: tuple[str, ...] | list[str] = (),
+) -> None:
+    """Copy a source directory into managed storage, preserving the source."""
+    if destination.exists():
+        raise IngestionConflictError(
+            f"Managed destination already exists: {destination}"
+        )
+    if not source.is_dir():
+        raise ValueError(f"Source must be an existing directory: {source}")
+    excluded = _excluded_subfolder_set(excluded_subfolders)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(
+        source,
+        destination,
+        ignore=_copy_ignore_callback(source, excluded),
+    )
+
+
+def move_into_managed_storage(
+    source: Path,
+    destination: Path,
+    excluded_subfolders: tuple[str, ...] | list[str] = (),
+) -> None:
+    """Move selected source entries into managed storage."""
+    if destination.exists():
+        raise IngestionConflictError(
+            f"Managed destination already exists: {destination}"
+        )
+    if not source.is_dir():
+        raise ValueError(f"Source must be an existing directory: {source}")
+    excluded = _excluded_subfolder_set(excluded_subfolders)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if not excluded:
+        shutil.move(str(source), str(destination))
+        return
+    destination.mkdir()
+    visited_directories = []
+    for current, directory_names, file_names in os.walk(source, topdown=True):
+        current_path = Path(current)
+        visited_directories.append(current_path)
+        relative = current_path.relative_to(source)
+        kept_directories = []
+        for name in directory_names:
+            relative_child = relative / name
+            if relative_child in excluded:
+                continue
+            source_child = current_path / name
+            target = destination / relative_child
+            if source_child.is_symlink():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(source_child), str(target))
+                continue
+            target.mkdir(parents=True, exist_ok=True)
+            kept_directories.append(name)
+        directory_names[:] = kept_directories
+        for name in file_names:
+            relative_file = relative / name
+            if relative_file in excluded:
+                continue
+            target = destination / relative_file
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(current_path / name), str(target))
+    for current_path in reversed(visited_directories):
+        if current_path == source:
+            continue
+        try:
+            current_path.rmdir()
+        except OSError:
+            pass
+    try:
+        source.rmdir()
+    except OSError:
+        pass

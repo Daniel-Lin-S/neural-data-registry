@@ -42,9 +42,12 @@ from download_http_manifest import (
     validate_relative_path,
 )
 from download_retry import run_with_retries
-from mihomo_ranker import MihomoConfig, MihomoNodeManager
+from mihomo_ranker import (
+    MihomoConfig,
+    MihomoNodeManager,
+    load_mihomo_config,
+)
 
-DEFAULT_MIHOMO_PROBE_TIMEOUT = 8.0
 ZENODO_RECORD_PATH_MARKERS = frozenset({"record", "records"})
 
 ClientFactory = Callable[[], httpx.Client]
@@ -134,30 +137,6 @@ def parse_record_id(value: str) -> str:
     if not candidate.isdigit():
         raise ValueError(f"expected a numeric Zenodo record ID, but got {candidate!r}.")
     return candidate
-
-
-def load_mihomo_config() -> MihomoConfig | None:
-    """Load optional Mihomo ranking settings exported by the shell."""
-
-    speed_test_url = optional_environment("DOWNLOAD_MIHOMO_SPEED_TEST_URL")
-    if speed_test_url is None:
-        return None
-    controller = optional_environment("DOWNLOAD_MIHOMO_CONTROLLER")
-    if controller is None:
-        raise ValueError(
-            "Mihomo ranking requires --mihomo-controller or MIHOMO_CONTROLLER."
-        )
-    return MihomoConfig(
-        controller_url=controller,
-        group_name=optional_environment("DOWNLOAD_MIHOMO_GROUP"),
-        node_marker=(optional_environment("DOWNLOAD_MIHOMO_NODE_MARKER") or ""),
-        speed_test_url=speed_test_url,
-        probe_timeout=float(
-            optional_environment("DOWNLOAD_MIHOMO_PROBE_TIMEOUT")
-            or DEFAULT_MIHOMO_PROBE_TIMEOUT
-        ),
-        secret=optional_environment("MIHOMO_SECRET"),
-    )
 
 
 def load_log_directory() -> Path | None:

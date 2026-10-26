@@ -13,7 +13,7 @@ readonly DEFAULT_PROXY_HOST="127.0.0.1"
 readonly DEFAULT_PROXY_SCHEME="http"
 readonly DEFAULT_MAX_WORKERS="1"
 readonly DEFAULT_TIMEOUT="300"
-readonly DEFAULT_RETRY_ATTEMPTS="8"
+readonly DEFAULT_RETRY_ATTEMPTS="${PROVIDER_DEFAULT_RETRY_ATTEMPTS-8}"
 readonly DEFAULT_RETRY_BASE_DELAY="5"
 readonly DEFAULT_RETRY_MAX_DELAY="300"
 readonly DEFAULT_MIHOMO_PROBE_TIMEOUT="8"
@@ -37,7 +37,9 @@ MIHOMO_NODE_MARKER=""
 MIHOMO_SPEED_TEST_URL=""
 MIHOMO_PROBE_TIMEOUT="${DEFAULT_MIHOMO_PROBE_TIMEOUT}"
 MIHOMO_ENABLED=0
+MIHOMO_ALLOW_UNRESTRICTED_FALLBACK=0
 DRY_RUN=0
+STANDALONE=0
 EXCLUDE_PATTERNS=()
 
 
@@ -121,6 +123,24 @@ Optional:
         Show pending content without downloading.
 
 EOF
+
+    if [[ "${PROVIDER_SUPPORTS_MIHOMO_FALLBACK-0}" == "1" ]]; then
+        cat <<EOF
+  --mihomo-allow-unrestricted-fallback
+        Try nodes matching --mihomo-node-marker first; broaden to all direct
+        nodes if filtered candidates fail probes or enter cooldown.
+
+EOF
+    fi
+
+    if [[ "${PROVIDER_SUPPORTS_STANDALONE-0}" == "1" ]]; then
+        cat <<EOF
+  --standalone
+        Explicitly permit read-only registry checks with separate process
+        locks instead of the registry intake lock.
+
+EOF
+    fi
 
     if [[ "${PROVIDER_SUPPORTS_EXCLUDE-0}" == "1" ]]; then
         cat <<EOF
@@ -211,6 +231,11 @@ validate_configuration()
         || fail "--retry-base-delay must be a positive integer."
     is_positive_integer "${RETRY_MAX_DELAY}" \
         || fail "--retry-max-delay must be a positive integer."
+
+    if [[ "${MIHOMO_ALLOW_UNRESTRICTED_FALLBACK}" == "1" ]]; then
+        [[ -n "${MIHOMO_NODE_MARKER}" && -n "${MIHOMO_SPEED_TEST_URL}" ]] \
+            || fail "Unrestricted fallback requires a marker and speed URL."
+    fi
 
     if [[ -n "${MIHOMO_SPEED_TEST_URL}" ]]; then
         [[ "${USE_PROXY}" == "1" ]] \
@@ -332,6 +357,18 @@ while [[ $# -gt 0 ]]; do
             PROXY_PORT=""
             shift
             ;;
+        --mihomo-allow-unrestricted-fallback)
+            [[ "${PROVIDER_SUPPORTS_MIHOMO_FALLBACK-0}" == "1" ]] \
+                || fail "Mihomo fallback is not supported by this provider."
+            MIHOMO_ALLOW_UNRESTRICTED_FALLBACK=1
+            shift
+            ;;
+        --standalone)
+            [[ "${PROVIDER_SUPPORTS_STANDALONE-0}" == "1" ]] \
+                || fail "--standalone is not supported by ${PROVIDER_LABEL}."
+            STANDALONE=1
+            shift
+            ;;
         --dry-run)
             DRY_RUN=1
             shift
@@ -355,11 +392,14 @@ export DOWNLOAD_DEST="${DEST}"
 export DOWNLOAD_ENDPOINT="${ENDPOINT}"
 export DOWNLOAD_MAX_WORKERS="${MAX_WORKERS}"
 export DOWNLOAD_TIMEOUT="${TIMEOUT}"
+export DOWNLOAD_STANDALONE="${STANDALONE}"
 export DOWNLOAD_DRY_RUN="${DRY_RUN}"
 export DOWNLOAD_RETRY_ATTEMPTS="${RETRY_ATTEMPTS}"
 export DOWNLOAD_RETRY_BASE_DELAY="${RETRY_BASE_DELAY}"
 export DOWNLOAD_RETRY_MAX_DELAY="${RETRY_MAX_DELAY}"
 export DOWNLOAD_PROXY_URL="${PROXY_URL}"
+export DOWNLOAD_MIHOMO_ALLOW_UNRESTRICTED_FALLBACK=\
+"${MIHOMO_ALLOW_UNRESTRICTED_FALLBACK}"
 export DOWNLOAD_MIHOMO_CONTROLLER="${MIHOMO_CONTROLLER}"
 export DOWNLOAD_MIHOMO_GROUP="${MIHOMO_GROUP}"
 export DOWNLOAD_MIHOMO_NODE_MARKER="${MIHOMO_NODE_MARKER}"

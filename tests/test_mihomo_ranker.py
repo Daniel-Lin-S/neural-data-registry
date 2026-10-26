@@ -632,3 +632,51 @@ def test_failover_uses_real_transfer_without_controller_delay() -> None:
 
     assert manager.failover() == "next"
     assert controller.selected == "next"
+
+
+@pytest.mark.parametrize("allow_fallback", [False, True])
+def test_unrestricted_fallback_requires_permission(allow_fallback):
+    """Unrestricted nodes are tested only after filtered throughput fails."""
+    config = ranker.MihomoConfig(
+        "http://127.0.0.1:9091", "download", "0.1倍",
+        "https://example.com/file", 8.0, None, allow_fallback,
+    )
+    controller = FakeController(["cheap-0.1倍", "other"])
+    probes = []
+
+    def throughput(*args):
+        probes.append(controller.selected)
+        if "0.1倍" in controller.selected:
+            raise TimeoutError("filtered node is unstable")
+        return 1.0
+
+    manager = ranker.MihomoNodeManager(
+        config, "http://127.0.0.1:7893", "https://example.com/probe",
+        controller=controller, throughput_fn=throughput,
+    )
+    if allow_fallback:
+        assert manager.prepare_attempt() == "other"
+        assert probes[0] == "cheap-0.1倍"
+        assert manager.config.node_marker == ""
+    else:
+        with pytest.raises(ranker.MihomoUnavailableError):
+            manager.prepare_attempt()
+        assert "other" not in probes
+
+
+def test_unrestricted_fallback_after_filtered_node_cooldown():
+    """A network failure exhausts the cheap tier before broadening."""
+    config = ranker.MihomoConfig(
+        "http://127.0.0.1:9091", "download", "0.1倍",
+        "https://example.com/file", 8.0, None, True,
+    )
+    controller = FakeController(["cheap-0.1倍", "other"])
+    manager = ranker.MihomoNodeManager(
+        config, "http://127.0.0.1:7893", "https://example.com/probe",
+        controller=controller, throughput_fn=lambda *args: 1.0,
+    )
+    assert manager.prepare_attempt() == "cheap-0.1倍"
+    assert "other" not in controller.selections
+    manager.failover()
+    assert manager.prepare_attempt() == "other"
+    assert not manager._available("cheap-0.1倍")

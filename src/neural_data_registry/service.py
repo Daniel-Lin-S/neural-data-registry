@@ -1,4 +1,6 @@
 from __future__ import annotations
+from contextlib import contextmanager
+from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import Enum
@@ -521,6 +523,62 @@ def update_dataset_metadata(
             db.close()
 
 
+
+def _figshare_identity(value: str | None) -> str | None:
+    """Return the article identity shared by Figshare landing and API URLs."""
+    if not value:
+        return None
+    parsed = urlparse(value)
+    host = parsed.hostname or ""
+    if not (host == "figshare.com" or host.endswith(".figshare.com")):
+        return None
+    match = re.fullmatch(
+        r"/(?:v2/)?articles/(?:[A-Za-z_]+/[^/]+/)?"
+        r"([0-9]+)(?:/(?:versions/)?[0-9]+)?/?",
+        parsed.path,
+    )
+    return str(int(match[1])) if match else None
+
+
+@contextmanager
+def external_download_intake(
+    name: str,
+    url: str,
+    destination: Path,
+    config: Settings,
+) -> Iterator[None]:
+    """Guard a standalone transfer using the registry's shared preflight.
+
+    Parameters
+    ----------
+    name : str
+        Canonical dataset name, normally the destination basename.
+    url : str
+        Canonical source URL or public Figshare article ID.
+    destination : pathlib.Path
+        Absolute output directory, also checked as a registered identity.
+    config : Settings
+        Registry database and lock configuration.
+
+    Yields
+    ------
+    None
+        The caller may perform network and file work while holding the
+        registry intake lock. No dataset or ingestion job is registered.
+    """
+    if not name.strip() or not destination.is_absolute():
+        raise ValueError("Expected a dataset name and absolute destination.")
+    if url.isascii() and url.isdigit():
+        url = f"https://api.figshare.com/v2/articles/{int(url)}"
+    references = (url, str(destination.resolve()))
+    for reference in references:
+        _preflight_dataset_identity(name, reference, config)
+    with ingestion_lock("registry-intake", config):
+        for reference in references:
+            _preflight_dataset_identity(name, reference, config)
+        yield
+
+
 def _preflight_dataset_identity(
     name: str,
     source_reference: str | None,
@@ -531,7 +589,30 @@ def _preflight_dataset_identity(
     create_database(config)
     db = get_session_factory(config.resolved_database_url)()
     try:
-        _raise_if_dataset_identity_conflicts(db, name, source_reference, name_aliases)
+        _raise_if_dataset_identity_conflicts(
+            db, name, source_reference, name_aliases
+        )
+        figshare_id = _figshare_identity(source_reference)
+        if figshare_id is not None or (
+            source_reference and source_reference.startswith("/")
+        ):
+            for item in db.scalars(
+                select(Dataset).options(selectinload(Dataset.aliases))
+            ):
+                references = [item.source_url] + [
+                    alias.value for alias in item.aliases
+                    if alias.kind in (URL_ALIAS_KIND, PATH_ALIAS_KIND)
+                ]
+                if figshare_id is not None and any(
+                    _figshare_identity(value) == figshare_id
+                    for value in references
+                ):
+                    _raise_dataset_conflict(item, "Figshare article")
+                if figshare_id is None and item.storage_path and (
+                    Path(item.storage_path).resolve()
+                    == Path(source_reference).resolve()
+                ):
+                    _raise_dataset_conflict(item, "storage path")
     finally:
         db.close()
 

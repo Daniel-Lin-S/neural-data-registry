@@ -183,6 +183,39 @@ Existing files are verified against Zenodo metadata and interrupted transfers
 resume from sibling `.part` files. `--dry-run`, unlimited retries, and optional
 Mihomo ranking behave as in the OSF downloader.
 
+## Figshare dataset downloads
+
+Download public Figshare articles, including institutional Figshare URLs:
+
+```bash
+/ABSOLUTE/PATH/TO/REPOSITORY/scripts/download_figshare.sh \
+  --repo https://janelia.figshare.com/articles/dataset/Whole-brain_light-sheet_imaging_data/7272617 \
+  --dest /data/lyh/neural_data/ephys/zebrafish_Ahrens \
+  --no-proxy
+```
+
+Network failures retry without a limit by default (`--retry-attempts 0`).
+Interrupted files resume from `.part` files and are verified by size and MD5.
+The first download pins article metadata for subsequent restarts. Existing
+conflicting files and invalid metadata cause an explicit error.
+
+Use `--dry-run` to inspect the file list. Direct access ignores ambient proxy
+variables; `--proxy-port` enables an explicit proxy. The shared
+`--mihomo-controller`, `--mihomo-group`, `--mihomo-node-marker` and
+`--mihomo-speed-test-url` options enable node ranking and automatic failover.
+Use one worker and an HTTPS file URL for the bounded throughput test.
+To prefer cheaper nodes, pass `--mihomo-node-marker '0.1倍'`.
+Add `--mihomo-allow-unrestricted-fallback` to permit other nodes only after
+filtered candidates fail probes or enter cooldown. Without that flag the
+filter remains strict.
+The destination basename supplies the dataset name for
+registry duplicate checks. The configured registry must be accessible and its
+intake lock is held during the transfer; downloading does not register data.
+When explicitly authorised to use a standalone transfer, add `--standalone`.
+This checks the protected registry through `brainctl` and reserves the article,
+dataset name and destination with separate process locks. These locks prevent
+concurrent standalone downloads but do not serialize registry ingestion.
+
 ## OpenNeuro dataset downloads
 
 Install the `download` extra, then pass an accession number, dataset URL, or

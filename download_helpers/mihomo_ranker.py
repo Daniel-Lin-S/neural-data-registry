@@ -16,8 +16,9 @@ after deterministic stability, throughput, and latency ranking.
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
+import os
 import ssl
 import statistics
 import sys
@@ -28,6 +29,7 @@ from urllib.parse import quote, urlparse
 import httpx
 
 
+DEFAULT_MIHOMO_PROBE_TIMEOUT = 8.0
 LATENCY_PROBE_COUNT = 2
 LATENCY_PROBE_WORKERS = 8
 SHORTLIST_SIZE = 3
@@ -78,6 +80,9 @@ class MihomoConfig:
         Timeout in seconds for controller and throughput probes.
     secret : str or None
         Mihomo controller secret, optional.
+    allow_unrestricted_fallback : bool, optional
+        If True, remove the node marker after restricted candidates fail
+        probing or enter cooldown. Default False preserves strict filtering.
     """
 
     controller_url: str
@@ -86,6 +91,43 @@ class MihomoConfig:
     speed_test_url: str
     probe_timeout: float
     secret: str | None
+    allow_unrestricted_fallback: bool = False
+
+
+def load_mihomo_config() -> MihomoConfig | None:
+    """Load optional ranking settings exported by the downloader interface.
+
+    Returns
+    -------
+    MihomoConfig or None
+        Explicit controller and probe settings, or None when no throughput
+        URL is supplied. The controller secret is inherited from the
+        MIHOMO_SECRET environment variable and must not be logged.
+    """
+    speed_test_url = os.environ.get("DOWNLOAD_MIHOMO_SPEED_TEST_URL")
+    if not speed_test_url:
+        return None
+    controller = os.environ.get("DOWNLOAD_MIHOMO_CONTROLLER")
+    if not controller:
+        raise ValueError(
+            "Mihomo ranking requires --mihomo-controller or MIHOMO_CONTROLLER."
+        )
+    timeout = float(os.environ.get("DOWNLOAD_MIHOMO_PROBE_TIMEOUT")
+                    or DEFAULT_MIHOMO_PROBE_TIMEOUT)
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("Expected a finite positive Mihomo probe timeout.")
+    return MihomoConfig(
+        controller_url=controller,
+        group_name=os.environ.get("DOWNLOAD_MIHOMO_GROUP") or None,
+        node_marker=os.environ.get("DOWNLOAD_MIHOMO_NODE_MARKER") or "",
+        speed_test_url=speed_test_url,
+        probe_timeout=timeout,
+        secret=os.environ.get("MIHOMO_SECRET") or None,
+        allow_unrestricted_fallback=(
+            os.environ.get("DOWNLOAD_MIHOMO_ALLOW_UNRESTRICTED_FALLBACK")
+            == "1"
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -705,7 +747,27 @@ class MihomoNodeManager:
         return tuple(samples)
 
     def benchmark(self) -> NodeScore:
-        """Benchmark all eligible nodes and select the best candidate."""
+        """Prefer filtered nodes, broadening only after authorised failure."""
+        try:
+            return self._benchmark_candidates()
+        except MihomoUnavailableError:
+            if not (
+                self.config.node_marker
+                and self.config.allow_unrestricted_fallback
+            ):
+                raise
+            print(
+                "WARNING: filtered Mihomo nodes are unavailable; "
+                "trying unrestricted nodes as authorised.",
+                file=sys.stderr,
+            )
+            self.config = replace(self.config, node_marker="")
+            self.ranked_nodes = []
+            self.ranked_at = None
+            return self._benchmark_candidates()
+
+    def _benchmark_candidates(self) -> NodeScore:
+        """Benchmark eligible nodes outside cooldown and select a winner."""
 
         candidates = [
             name for name in self.eligible_nodes() if self._available(name)

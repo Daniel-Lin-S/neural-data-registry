@@ -72,11 +72,12 @@ class StorageTransitionRequest(BaseModel):
 
 
 class DatasetUpdateRequest(BaseModel):
-    """Metadata fields that may enrich an existing dataset."""
+    """Metadata fields that may update an existing dataset."""
     url: str | None = None
     provider: Provider | None = None
     version: str | None = None
     modalities: list[Modality] = Field(default_factory=list)
+    replace_modalities: bool = False
     aliases: list[str] = Field(default_factory=list)
     force_replace: bool = False
 
@@ -138,6 +139,7 @@ def create_app(config: Settings | None = None) -> FastAPI:
                     provider=request.provider,
                     version=request.version,
                     modalities=request.modalities,
+                    replace_modalities=request.replace_modalities,
                     aliases=request.aliases,
                     force_replace=request.force_replace,
                     config=config,

@@ -415,21 +415,30 @@ def update_dataset_metadata(
     provider: Provider | str | None = None,
     version: str | None = None,
     modalities: Sequence[str | Modality] = (),
+    replace_modalities: bool = False,
     aliases: Sequence[str] = (),
     force_replace: bool = False,
     config: Settings | None = None,
 ) -> Dataset:
-    """Enrich registered metadata without changing dataset files or identity.
+    """Update registered metadata without changing files or identity.
 
     URLs can be added only to datasets without a canonical remote URL. Provider
     and version may replace non-missing values only with ``force_replace``.
-    Modalities and aliases are append-only.
+    Modalities append unless ``replace_modalities`` explicitly replaces
+    the full nonempty list. Aliases are append-only.
     """
-    if not any((url is not None, provider is not None, version is not None, modalities, aliases)):
+    if not any((
+        url is not None, provider is not None, version is not None,
+        modalities, aliases, replace_modalities,
+    )):
         raise ValueError("Provide at least one metadata field to update")
     config = config or get_settings()
     normalized_aliases = _normalize_name_aliases(aliases)
     normalized_modalities = normalize_modalities(modalities)
+    if replace_modalities and not normalized_modalities:
+        raise ValueError(
+            "At least one modality is required when replacing modalities"
+        )
     normalized_url = url.strip() if url is not None else None
     if normalized_url == "":
         raise ValueError("Source URL cannot be blank")
@@ -494,10 +503,13 @@ def update_dataset_metadata(
                     force_replace=force_replace,
                 )
 
-            merged_modalities = sorted(
-                set(filter(None, item.modalities.split(","))) | set(normalized_modalities)
-            )
-            item.modalities = ",".join(merged_modalities)
+            current_modalities = set()
+            if not replace_modalities:
+                current_modalities = set(
+                    filter(None, item.modalities.split(","))
+                )
+            current_modalities.update(normalized_modalities)
+            item.modalities = ",".join(sorted(current_modalities))
             aliases_to_add = _normalize_name_aliases(normalized_aliases, item.name)
             _raise_if_name_aliases_conflict(db, aliases_to_add, dataset_id=item.id)
             existing_aliases = {

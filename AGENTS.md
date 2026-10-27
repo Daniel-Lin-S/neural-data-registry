@@ -1,5 +1,11 @@
 # Project constraints
 
+## FIRST PRINCIPLE -- GRILL ME
+
+You should always grill me on ALL technical details and design choices rather than making guessworks or silently setting default values by yourself.
+
+Anti-example: I asked you to redesign the artifact figures, and you silently designed the content of one or several figures without checking details like x-y axis meanings, axis ticks, legends, plot timing, colours, etc. with me.
+
 ## Dataset intake idempotency
 
 Before `ingest_local`, `download`, or any future dataset-intake action performs provider/network work, creates an incoming workspace, reads dataset contents, moves files, or records a job, it must check for both canonical-name and canonical-URL/path conflicts. A conflict must abort the action and report the existing dataset and storage path; duplicate datasets must never be processed again. Repeat this check while holding the registry intake lock so concurrent requests cannot bypass it. New intake routes must reuse the shared service preflight rather than implementing their own duplicate handling.

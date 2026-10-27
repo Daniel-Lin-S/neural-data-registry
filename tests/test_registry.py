@@ -2748,6 +2748,62 @@ def test_update_metadata_cli_and_api_statuses(config, tmp_path, monkeypatch):
     assert response.json()["aliases"] == ["API alias", "CLI alias"]
 
 
+def test_replace_modalities_requires_values_and_updates_cli_and_api(
+    config: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit replacement changes only the registered modality list."""
+    item = ingest_local(
+        mock_dataset(tmp_path, "replace-modalities"),
+        "Replace modalities",
+        Provider.OTHER,
+        None,
+        "4",
+        ["other"],
+        config,
+    )
+    initial = dataset_dict(item)
+    client = TestClient(create_app(config))
+    empty = client.patch(
+        f"/datasets/{item.id}",
+        json={"modalities": [], "replace_modalities": True},
+    )
+    assert empty.status_code == 400
+    assert "At least one modality" in empty.json()["detail"]
+
+    response = client.patch(
+        f"/datasets/{item.id}",
+        json={"modalities": ["eeg"], "replace_modalities": True},
+    )
+    assert response.status_code == 200
+    assert response.json()["modalities"] == ["eeg"]
+
+    monkeypatch.setattr(
+        cli,
+        "update_dataset_metadata",
+        lambda identifier, **kwargs: update_dataset_metadata(
+            identifier, config=config, **kwargs
+        ),
+    )
+    monkeypatch.setattr(cli, "maybe_launch_cooldown_check", lambda: False)
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "update", "Replace modalities", "--modality", "calcium_imaging",
+            "--replace-modalities",
+        ],
+    )
+    assert result.exit_code == 0
+    updated = json.loads(result.output)
+    assert updated["modalities"] == ["calcium_imaging"]
+    assert updated["source_url"] == initial["source_url"]
+    assert updated["version"] == initial["version"]
+    assert updated["provider"] == initial["provider"]
+    manifest = config.registry_dir / f"{item.id}.json"
+    assert json.loads(manifest.read_text()) == updated
+
+
 def test_update_cli_accepts_osf_provider(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

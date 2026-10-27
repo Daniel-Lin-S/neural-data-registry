@@ -278,7 +278,7 @@ brainctl list --provider openneuro
 brainctl list --query THINGS_MEG  # searches canonical names and aliases
 ```
 
-`--modality` accepts a value such as `MEG`, `EEG`, or `fMRI`;
+`--modality` accepts a value such as `MEG`, `EEG`, or `calcium_imaging`;
 `--provider` accepts
 `openneuro`, `huggingface`, `dandi`, `nemar`, `physionet`, `neurovault`, `kaggle`, `synapse`, or `other`.
 Missing and broken datasets are hidden by default; use `brainctl list --show-all`
@@ -421,15 +421,18 @@ Use `--proxy https://proxy.example:8080` to configure a download proxy. Use `--m
 
 ### `brainctl update`
 
-Add metadata to a dataset already registered in the registry:
+Update metadata in a dataset already registered in the registry:
 
 ```bash
 brainctl update THINGS-MEG --version 3.0.0 --modality meg --alias THINGS_MEG
 ```
 
-Repeat `--modality` and `--alias` to append values. A missing canonical URL can
-be added with `--url`; its provider is detected from the URL. Existing provider
-and version values are protected unless `--force-replace` is supplied. A
+Repeat `--modality` and `--alias` to append values. Use
+`--replace-modalities` with one or more `--modality` values to replace the
+full modality list. The PATCH API accepts `replace_modalities: true` with a
+nonempty `modalities` list. A missing canonical URL can be added with `--url`;
+its provider is detected from the URL. Existing provider and version values
+are protected unless `--force-replace` is supplied. A
 canonical source URL is never replaced.
 
 ### `brainctl unregister`

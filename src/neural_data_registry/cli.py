@@ -546,13 +546,19 @@ def update_command(
     provider: Provider | None = typer.Option(None, "--provider", help="Dataset provider; a supplied URL determines this value."),
     version: str | None = typer.Option(None, "--version", help="Dataset version to add or replace."),
     modality: list[Modality] = typer.Option([], "--modality", help="Dataset modality to append; repeat for multiple modalities."),
+    replace_modalities: bool = typer.Option(
+        False,
+        "--replace-modalities",
+        help="Replace the full modality list with --modality values.",
+    ),
     alias: list[str] = typer.Option([], "--alias", help="Searchable alternate dataset name to append; repeat for multiple aliases."),
     force_replace: bool = typer.Option(False, "--force-replace", help="Allow replacement of an existing provider or version."),
 ):
-    """Add missing metadata to a registered dataset.
+    """Update metadata for a registered dataset.
 
-    Modalities and aliases are appended. Existing provider or version values
-    require --force-replace; an existing canonical source URL cannot change.
+    Modalities append unless --replace-modalities replaces the full list.
+    Aliases append. Existing provider or version values require
+    --force-replace; an existing canonical source URL cannot change.
     """
     try:
         item = update_dataset_metadata(
@@ -561,6 +567,7 @@ def update_command(
             provider=provider,
             version=version,
             modalities=[item.value for item in modality],
+            replace_modalities=replace_modalities,
             aliases=alias,
             force_replace=force_replace,
         )

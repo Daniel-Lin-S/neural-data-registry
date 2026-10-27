@@ -61,6 +61,7 @@ class Modality(str, Enum):
 
     Notes
     -----
+    ``calcium_imaging`` means optical calcium imaging;
     ``ephys`` means electrophysiology;
     ``fnris`` means functional
     near-infrared spectroscopy.
@@ -74,6 +75,7 @@ class Modality(str, Enum):
     SMRI = "smri"
     DMRI = "dmri"
     EPHYS = "ephys"
+    CALCIUM_IMAGING = "calcium_imaging"
     OTHER = "other"
 
 
